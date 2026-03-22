@@ -90,17 +90,16 @@ export const init_command = new Command("init")
       if (install_it) {
         spin.start("Installing Claude Code...");
         const { exec_command } = await import("../lib/process.js");
-        // Try without sudo first, fall back to sudo
-        let result = await exec_command("npm install -g @anthropic-ai/claude-code");
-        if (result.exitCode !== 0 && result.stderr.includes("EACCES")) {
-          spin.message("Retrying with sudo...");
-          result = await exec_command("sudo npm install -g @anthropic-ai/claude-code");
-        }
+        // Use Claude's official install script
+        const result = await exec_command("curl -fsSL https://claude.ai/install.sh | bash");
         if (result.exitCode === 0) {
+          // Add ~/.local/bin to PATH for this session
+          const home = process.env["HOME"] ?? "";
+          process.env["PATH"] = `${home}/.local/bin:${process.env["PATH"] ?? ""}`;
           spin.stop("Claude Code installed successfully");
         } else {
           spin.stop("Claude Code installation failed");
-          p.log.warning(`Install manually: sudo npm install -g @anthropic-ai/claude-code\n${result.stderr}`);
+          p.log.warning(`Install manually: curl -fsSL https://claude.ai/install.sh | bash\n${result.stderr}`);
         }
       } else {
         p.log.warning("Continuing without Claude Code. Install it before starting the daemon.");

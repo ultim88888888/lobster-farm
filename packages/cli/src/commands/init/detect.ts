@@ -49,8 +49,17 @@ export interface ClaudeCodeCheckResult {
 
 /** Check if Claude Code CLI is installed. */
 export async function check_claude_code(): Promise<ClaudeCodeCheckResult> {
-  const { exitCode, stdout } = await exec_command("claude --version 2>/dev/null");
+  // Check PATH first, then common install locations
+  const check_cmd = 'claude --version 2>/dev/null || ~/.local/bin/claude --version 2>/dev/null || /usr/local/bin/claude --version 2>/dev/null';
+  const { exitCode, stdout } = await exec_command(check_cmd);
   if (exitCode === 0 && stdout.trim()) {
+    // If found in ~/.local/bin but not in PATH, fix PATH
+    const { exitCode: path_check } = await exec_command("which claude 2>/dev/null");
+    if (path_check !== 0) {
+      // Add to PATH for this session and suggest permanent fix
+      const home = process.env["HOME"] ?? "";
+      process.env["PATH"] = `${home}/.local/bin:${process.env["PATH"] ?? ""}`;
+    }
     return {
       installed: true,
       version: stdout.trim(),
