@@ -180,15 +180,21 @@ export const init_command = new Command("init")
       if (p.isCancel(op_token)) { p.cancel("Setup cancelled."); process.exit(0); }
 
       if (op_token && op_token.trim()) {
-        // Write to .zshrc for persistence
-        const { appendFile } = await import("node:fs/promises");
+        // Write to .lobsterfarm/.env (mode 0600) — more secure than .zshrc
+        const { appendFile, mkdir: mkdirFs } = await import("node:fs/promises");
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const env_dir = lf_dir(path_overrides);
+        await mkdirFs(env_dir, { recursive: true });
+        const env_path = `${env_dir}/.env`;
+        await appendFile(env_path, `OP_SERVICE_ACCOUNT_TOKEN=${op_token.trim()}\n`);
+        // Also add to .zshrc so it's available in shell sessions
         const home = process.env["HOME"] ?? "";
         await appendFile(`${home}/.zshrc`, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
         // Set for current process
         process.env["OP_SERVICE_ACCOUNT_TOKEN"] = op_token.trim();
         op.token_configured = true;
         op.status = "op CLI installed, service account token configured";
-        p.log.success("1Password token saved to ~/.zshrc");
+        p.log.success("1Password token saved to .env and ~/.zshrc");
       }
     }
 
