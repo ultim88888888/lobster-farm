@@ -201,7 +201,7 @@ describe("TemplateVariablesSchema", () => {
     expect(vars.USER_NAME).toBe("Jax");
     expect(vars.PLANNER_NAME).toBe("Gary");
     expect(vars.PLANNER_NAME_LOWER).toBe("gary");
-    expect(vars.PROJECTS_DIR).toBe("~/projects");
+    expect(vars.PROJECTS_DIR).toBe("~/entities");
     expect(vars.SHARED_SERVICES).toBe("");
   });
 
