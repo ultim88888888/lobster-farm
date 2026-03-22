@@ -1,4 +1,7 @@
 import { execFile } from "node:child_process";
+import { writeFile, unlink } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
@@ -81,12 +84,16 @@ export async function ask_commander(
 
   const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
 
+  // Write system prompt to temp file (avoids shell escaping issues with long prompts)
+  const prompt_file = join(tmpdir(), `lf-commander-${Date.now()}.txt`);
+  await writeFile(prompt_file, system_prompt, "utf-8");
+
   try {
     const { stdout } = await exec(claude_bin, [
       "-p",
       "--model", "claude-opus-4-6",
       "--no-session-persistence",
-      "--system-prompt", system_prompt,
+      "--system-prompt-file", prompt_file,
       "--print",
       message,
     ], { timeout: 120_000, maxBuffer: 1024 * 1024 });
@@ -116,6 +123,8 @@ export async function ask_commander(
       response: `Commander error: ${msg}`,
       actions: [],
     };
+  } finally {
+    await unlink(prompt_file).catch(() => {});
   }
 }
 
