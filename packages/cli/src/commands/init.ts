@@ -379,6 +379,6 @@ export const init_command = new Command("init")
     p.note(summary_lines.join("\n"), "Setup Complete");
 
     p.outro(
-      "Run `lobsterfarm start` to launch the daemon. Happy building!",
+      "Run `lf start` to launch the daemon. Happy building!",
     );
   });

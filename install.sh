@@ -31,6 +31,12 @@ fi
 echo "Building..."
 pnpm install && pnpm build
 
+# Link CLI globally so `lf` command works from anywhere
+echo "Linking CLI..."
+cd packages/cli
+npm link 2>/dev/null || sudo npm link 2>/dev/null || true
+cd "$INSTALL_DIR"
+
 # Run setup wizard
 echo ""
-node packages/cli/dist/index.js init
+lf init 2>/dev/null || node packages/cli/dist/index.js init

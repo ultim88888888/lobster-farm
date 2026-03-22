@@ -6,8 +6,8 @@ import { status_command } from "./commands/status.js";
 import { entity_command } from "./commands/entity.js";
 
 const program = new Command()
-  .name("lobsterfarm")
-  .description("LobsterFarm — Autonomous Software Consultancy CLI")
+  .name("lf")
+  .description("LobsterFarm — Autonomous Orchestration Platform")
   .version("0.1.0");
 
 program.addCommand(init_command);

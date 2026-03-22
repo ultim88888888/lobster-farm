@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
+    "lf": "./dist/index.js",
     "lobsterfarm": "./dist/index.js"
   },
   "scripts": {
