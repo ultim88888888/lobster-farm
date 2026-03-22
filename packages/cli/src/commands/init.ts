@@ -170,7 +170,35 @@ export const init_command = new Command("init")
       );
     }
 
-    // ── Step 7-9: Prompts (skipped in non-interactive mode) ──
+    // ── Step 7: macOS permissions guide ──
+    if (machine.platform === "darwin" && !non_interactive) {
+      // Try to detect if Full Disk Access is missing by testing a protected path
+      const { exec_command } = await import("../lib/process.js");
+      const fda_check = await exec_command("ls ~/Library/Mail/ 2>&1");
+      const likely_missing = fda_check.exitCode !== 0 && fda_check.stderr.includes("Operation not permitted");
+
+      if (likely_missing) {
+        p.note(
+          "LobsterFarm needs Full Disk Access for Terminal, Node.js, and tmux.\n\n" +
+            "Open System Settings → Privacy & Security → Full Disk Access\n" +
+            "and enable these apps:\n\n" +
+            "  • Terminal (or iTerm2 / your terminal app)\n" +
+            "  • node (usually at /opt/homebrew/bin/node or /usr/local/bin/node)\n" +
+            "  • tmux (if installed, usually at /opt/homebrew/bin/tmux)\n\n" +
+            "You may also want to enable:\n" +
+            "  • Screen Recording (for Peekaboo UI automation)\n" +
+            "  • Accessibility (for Peekaboo)",
+          "macOS Permissions Required",
+        );
+        const ack = await p.confirm({ message: "Continue setup? (you can configure permissions later)" });
+        if (p.isCancel(ack) || !ack) {
+          p.cancel("Configure permissions, then re-run `lobsterfarm init`.");
+          process.exit(0);
+        }
+      }
+    }
+
+    // ── Step 8-10: Prompts (skipped in non-interactive mode) ──
     const discord_setup = non_interactive ? undefined : await prompt_discord();
     const github = non_interactive ? { username: "" } : await prompt_github();
     const projects_dir = non_interactive
