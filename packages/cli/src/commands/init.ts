@@ -106,6 +106,27 @@ export const init_command = new Command("init")
       }
     }
 
+    // Check if Claude Code is logged in
+    if (claude.installed || !non_interactive) {
+      const { exec_command } = await import("../lib/process.js");
+      const auth_check = await exec_command("claude --version 2>&1");
+      // Try a quick auth test
+      const auth_test = await exec_command("echo 'test' | claude -p --print --no-session-persistence 2>&1");
+      if (auth_test.stderr.includes("login") || auth_test.stderr.includes("Not logged in") || auth_test.stdout.includes("Not logged in")) {
+        const do_login = await p.confirm({
+          message: "Claude Code is not logged in. Log in now? (opens browser)",
+          initialValue: true,
+        });
+        if (p.isCancel(do_login)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+        if (do_login) {
+          p.log.info("Opening browser for Claude Code login...");
+          const { spawnSync } = await import("node:child_process");
+          spawnSync("claude", ["/login"], { stdio: "inherit" });
+        }
+      }
+    }
+
     // ── Step 5: Sudo check ──
     spin.start("Checking sudo access...");
     const sudo = await check_sudo();
