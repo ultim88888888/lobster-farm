@@ -34,7 +34,13 @@ pnpm install && pnpm build
 # Link CLI globally so `lf` command works from anywhere
 echo "Linking CLI..."
 cd packages/cli
-npm link 2>/dev/null || sudo npm link 2>/dev/null || true
+set +e
+npm link 2>/dev/null
+if [ $? -ne 0 ]; then
+  echo "Needs sudo to link globally..."
+  sudo npm link
+fi
+set -e
 cd "$INSTALL_DIR"
 
 # Run setup wizard
