@@ -416,9 +416,33 @@ export class DiscordBot extends EventEmitter {
     // Ignore bot messages
     if (message.author.bot) return;
 
-    // Look up channel
+    // Look up channel in entity map
     const entry = this.channel_map.get(message.channelId);
-    if (!entry) return; // Message not in a mapped channel
+
+    // If not in entity map, still handle !lf commands from any channel
+    // (including GLOBAL channels like #command-center)
+    if (!entry) {
+      if (message.content.trim().startsWith("!lf")) {
+        const routed: RoutedMessage = {
+          entity_id: "_global",
+          channel_type: "general",
+          content: message.content,
+          author: message.author.tag,
+          channel_id: message.channelId,
+        };
+        const { parse_command } = await import("./router.js");
+        const cmd = parse_command(message.content);
+        if (cmd) {
+          try {
+            await this.handle_command(cmd.name, cmd.args, routed, message);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await this.reply(message, `Error: ${msg}`);
+          }
+        }
+      }
+      return;
+    }
 
     const routed: RoutedMessage = {
       entity_id: entry.entity_id,
