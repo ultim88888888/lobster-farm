@@ -134,21 +134,27 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
       PreToolUse: [
         {
           matcher: "Edit|Write",
-          hook: "branch_protection",
-          command:
-            'bash -c \'BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi\'',
+          hooks: [{
+            type: "command",
+            command: 'bash -c \'BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi\'',
+          }],
         },
         {
           matcher: "Edit|Write",
-          hook: "secrets_detection",
-          command:
-            "bash -c 'if echo \"$TOOL_INPUT\" | grep -qiE \"(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)\"; then echo \"BLOCK: Detected potential hardcoded secret in tool input.\" >&2; exit 2; fi'",
+          hooks: [{
+            type: "command",
+            command: "bash -c 'if echo \"$TOOL_INPUT\" | grep -qiE \"(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)\"; then echo \"BLOCK: Detected potential hardcoded secret in tool input.\" >&2; exit 2; fi'",
+          }],
         },
       ],
       Stop: [
         {
-          hook: "memory_extraction",
-          command: "curl -s -X POST http://localhost:7749/hooks/stop -H 'Content-Type: application/json' -d '{\"session_id\": \"'\"$CLAUDE_SESSION_ID\"'\", \"working_dir\": \"'\"$(pwd)\"'\"}' || true",
+          matcher: "",
+          hooks: [{
+            type: "command",
+            command: "curl -s -X POST http://localhost:7749/hooks/stop -H 'Content-Type: application/json' -d '{\"session_id\": \"'\"$CLAUDE_SESSION_ID\"'\", \"working_dir\": \"'\"$(pwd)\"'\"}' || true",
+            timeout: 10,
+          }],
         },
       ],
     },
