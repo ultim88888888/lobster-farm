@@ -119,18 +119,21 @@ export const init_command = new Command("init")
       if (p.isCancel(setup_sudo)) { p.cancel("Setup cancelled."); process.exit(0); }
 
       if (setup_sudo) {
-        spin.start("Configuring passwordless sudo (may prompt for password)...");
-        const { exec_command } = await import("../lib/process.js");
-        const user = process.env["USER"] ?? "$(whoami)";
-        const result = await exec_command(
-          `echo "${user} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/lobsterfarm > /dev/null`,
-        );
-        if (result.exitCode === 0) {
+        const user = process.env["USER"] ?? "unknown";
+        p.log.info(`Enter your password when prompted to configure sudo for "${user}"...`);
+
+        // Use spawnSync with inherited stdio so the password prompt is visible
+        const { spawnSync } = await import("node:child_process");
+        const result = spawnSync("sudo", ["sh", "-c", `echo '${user} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/lobsterfarm`], {
+          stdio: "inherit",
+        });
+
+        if (result.status === 0) {
           sudo.has_passwordless_sudo = true;
           sudo.status = "passwordless sudo configured";
-          spin.stop("Passwordless sudo configured");
+          p.log.success("Passwordless sudo configured");
         } else {
-          spin.stop("Sudo setup failed — configure manually");
+          p.log.warning("Sudo setup failed — configure manually");
         }
       }
     }
