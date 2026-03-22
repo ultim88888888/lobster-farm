@@ -127,16 +127,16 @@ export async function prompt_github(): Promise<{
   };
 }
 
-/** Prompt for projects directory. */
+/** Prompt for entities directory (where entity repos live on disk). */
 export async function prompt_projects_dir(): Promise<string> {
   const dir = await p.text({
-    message: "Projects directory:",
-    placeholder: "~/projects",
-    defaultValue: "~/projects",
+    message: "Entities directory (where entity repos will live on disk):",
+    placeholder: "~/entities",
+    defaultValue: "~/entities",
   });
   if (p.isCancel(dir)) {
     p.cancel("Setup cancelled.");
     process.exit(0);
   }
-  return (dir ?? "~/projects").trim();
+  return (dir ?? "~/entities").trim();
 }
