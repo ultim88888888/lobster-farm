@@ -12,9 +12,69 @@ import {
   entity_memory_path,
   write_yaml,
 } from "@lobster-farm/shared";
+import { readdir } from "node:fs/promises";
+import { parse } from "yaml";
+import { readFile } from "node:fs/promises";
 
 export const entity_command = new Command("entity")
   .description("Manage LobsterFarm entities");
+
+entity_command
+  .command("list")
+  .description("List all configured entities")
+  .option("--prefix <dir>", "Use a custom prefix directory instead of ~/")
+  .action(async (options: { prefix?: string }) => {
+    const path_overrides: Partial<PathConfig> | undefined = options.prefix
+      ? { lobsterfarm_dir: `${options.prefix}/.lobsterfarm` }
+      : undefined;
+
+    const ent_dir = join(
+      path_overrides?.lobsterfarm_dir
+        ? `${options.prefix!}/.lobsterfarm`
+        : entity_dir(undefined, "").replace(/\/[^/]*$/, ""),
+      "",
+    );
+
+    // Simpler: just scan the entities directory
+    const entities_base = join(
+      options.prefix ? `${options.prefix}/.lobsterfarm` : `${process.env["HOME"] ?? "~"}/.lobsterfarm`,
+      "entities",
+    );
+
+    try {
+      const entries = await readdir(entities_base, { withFileTypes: true });
+      const entities: Array<{ id: string; name: string; status: string }> = [];
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const config_file = join(entities_base, entry.name, "config.yaml");
+        try {
+          const content = await readFile(config_file, "utf-8");
+          const data = parse(content) as { entity?: { id?: string; name?: string; status?: string } };
+          entities.push({
+            id: data.entity?.id ?? entry.name,
+            name: data.entity?.name ?? "Unknown",
+            status: data.entity?.status ?? "unknown",
+          });
+        } catch {
+          entities.push({ id: entry.name, name: "(invalid config)", status: "error" });
+        }
+      }
+
+      if (entities.length === 0) {
+        console.log("No entities configured. Create one with: lobsterfarm entity create");
+        return;
+      }
+
+      console.log("Entities:");
+      for (const e of entities) {
+        const status_icon = e.status === "active" ? "●" : e.status === "paused" ? "◌" : "○";
+        console.log(`  ${status_icon} ${e.id} — ${e.name} (${e.status})`);
+      }
+    } catch {
+      console.log("No entities directory found. Run `lobsterfarm init` first.");
+    }
+  });
 
 entity_command
   .command("create")

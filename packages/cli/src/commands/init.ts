@@ -139,9 +139,13 @@ export const init_command = new Command("init")
     });
 
     // ── Build LobsterFarmConfig ──
+    const config_paths: Record<string, string> = { projects_dir };
+    if (path_overrides?.lobsterfarm_dir) config_paths["lobsterfarm_dir"] = path_overrides.lobsterfarm_dir;
+    if (path_overrides?.claude_dir) config_paths["claude_dir"] = path_overrides.claude_dir;
+
     const config_input: Record<string, unknown> = {
       version: 1,
-      paths: { projects_dir },
+      paths: config_paths,
       user: { name: user_name },
       machine: { name: machine.name, hardware: machine.hardware },
       agents: {
