@@ -22,6 +22,33 @@ import {
   write_global_config,
 } from "./init/generate.js";
 
+async function prompt_and_save_op_token(_path_overrides?: Partial<PathConfig>): Promise<void> {
+  const op_token = await p.password({
+    message: "1Password service account token (or press Enter to skip):",
+  });
+  if (p.isCancel(op_token)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+  if (op_token && op_token.trim()) {
+    const { readFile, writeFile: writeF } = await import("node:fs/promises");
+    const home = process.env["HOME"] ?? "";
+    const zshrc_path = `${home}/.zshrc`;
+    try {
+      let content = await readFile(zshrc_path, "utf-8");
+      if (content.includes("OP_SERVICE_ACCOUNT_TOKEN")) {
+        content = content.replace(/export OP_SERVICE_ACCOUNT_TOKEN="[^"]*"/g, `export OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"`);
+      } else {
+        content += `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`;
+      }
+      await writeF(zshrc_path, content);
+    } catch {
+      const { appendFile } = await import("node:fs/promises");
+      await appendFile(zshrc_path, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
+    }
+    process.env["OP_SERVICE_ACCOUNT_TOKEN"] = op_token.trim();
+    p.log.success("1Password token saved to ~/.zshrc");
+  }
+}
+
 export const init_command = new Command("init")
   .description("Initialize LobsterFarm — setup wizard for first-time configuration")
   .option("--prefix <dir>", "Write output to <dir>/.claude/ and <dir>/.lobsterfarm/ instead of ~/")
@@ -186,41 +213,31 @@ export const init_command = new Command("init")
       }
     }
 
-    if (op.cli_installed && !op.token_configured && !non_interactive) {
-      p.note(
-        "Create a service account at https://my.1password.com → Developer → Service Accounts\n\n" +
-          "Grant it:\n" +
-          "  • Create and manage vaults (each entity gets its own vault)\n" +
-          "  • Read/write access to a master \"lobsterfarm\" vault for shared credentials",
-        "1Password Setup",
-      );
-
-      const op_token = await p.password({
-        message: "1Password service account token (or press Enter to skip):",
-      });
-      if (p.isCancel(op_token)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (op_token && op_token.trim()) {
-        const { readFile, writeFile: writeF } = await import("node:fs/promises");
-        const home = process.env["HOME"] ?? "";
-        const zshrc_path = `${home}/.zshrc`;
-        // Replace existing or append
-        try {
-          let content = await readFile(zshrc_path, "utf-8");
-          if (content.includes("OP_SERVICE_ACCOUNT_TOKEN")) {
-            content = content.replace(/export OP_SERVICE_ACCOUNT_TOKEN="[^"]*"/g, `export OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"`);
-          } else {
-            content += `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`;
-          }
-          await writeF(zshrc_path, content);
-        } catch {
-          const { appendFile } = await import("node:fs/promises");
-          await appendFile(zshrc_path, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
+    if (op.cli_installed && !non_interactive) {
+      if (op.token_configured) {
+        const overwrite_op = await p.confirm({
+          message: "1Password service account token already configured. Update it?",
+          initialValue: false,
+        });
+        if (p.isCancel(overwrite_op)) { p.cancel("Setup cancelled."); process.exit(0); }
+        if (!overwrite_op) {
+          p.log.info("Keeping existing 1Password token.");
+        } else {
+          await prompt_and_save_op_token(path_overrides);
+          op.token_configured = true;
+          op.status = "op CLI installed, service account token configured";
         }
-        process.env["OP_SERVICE_ACCOUNT_TOKEN"] = op_token.trim();
+      } else {
+        p.note(
+          "Create a service account at https://my.1password.com → Developer → Service Accounts\n\n" +
+            "Grant it:\n" +
+            "  • Create and manage vaults (each entity gets its own vault)\n" +
+            "  • Read/write access to a master \"lobsterfarm\" vault for shared credentials",
+          "1Password Setup",
+        );
+        await prompt_and_save_op_token(path_overrides);
         op.token_configured = true;
         op.status = "op CLI installed, service account token configured";
-        p.log.success("1Password token saved to ~/.zshrc");
       }
     }
 
@@ -310,7 +327,16 @@ export const init_command = new Command("init")
     }
 
     // ── Step 8-10: Prompts (skipped in non-interactive mode) ──
-    const discord_setup = non_interactive ? undefined : await prompt_discord();
+    // Check if Discord token already exists in .env
+    let has_existing_discord_token = false;
+    try {
+      const { readFile: readF } = await import("node:fs/promises");
+      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+      const env_content = await readF(`${lf_dir(path_overrides)}/.env`, "utf-8");
+      has_existing_discord_token = env_content.includes("DISCORD_BOT_TOKEN");
+    } catch { /* no .env yet */ }
+
+    const discord_setup = non_interactive ? undefined : await prompt_discord(has_existing_discord_token);
     const github = non_interactive ? { username: "" } : await prompt_github();
     const projects_dir = non_interactive
       ? (path_overrides?.projects_dir ?? "~/projects")

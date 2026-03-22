@@ -60,16 +60,25 @@ export interface DiscordSetup {
 }
 
 /** Prompt for Discord setup (optional). Returns server ID + bot token or undefined. */
-export async function prompt_discord(): Promise<DiscordSetup | undefined> {
-  const wants_discord = await p.confirm({
-    message: "Set up Discord integration?",
-    initialValue: true,
-  });
-  if (p.isCancel(wants_discord)) {
-    p.cancel("Setup cancelled.");
-    process.exit(0);
+export async function prompt_discord(existing_token?: boolean): Promise<DiscordSetup | undefined> {
+  if (existing_token) {
+    const overwrite = await p.confirm({
+      message: "Discord bot token already configured. Update it?",
+      initialValue: false,
+    });
+    if (p.isCancel(overwrite)) { p.cancel("Setup cancelled."); process.exit(0); }
+    if (!overwrite) return undefined;
+  } else {
+    const wants_discord = await p.confirm({
+      message: "Set up Discord integration?",
+      initialValue: true,
+    });
+    if (p.isCancel(wants_discord)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+    if (!wants_discord) return undefined;
   }
-  if (!wants_discord) return undefined;
 
   p.note(
     "You need a Discord bot. Create one at https://discord.com/developers/applications\n" +
