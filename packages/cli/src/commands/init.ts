@@ -173,30 +173,87 @@ export const init_command = new Command("init")
       );
     }
 
-    // ── Step 7: macOS permissions guide ──
+    // ── Step 7: macOS Full Disk Access ──
     if (machine.platform === "darwin" && !non_interactive) {
-      // Try to detect if Full Disk Access is missing by testing a protected path
       const { exec_command } = await import("../lib/process.js");
+      const { spawnSync } = await import("node:child_process");
       const fda_check = await exec_command("ls ~/Library/Mail/ 2>&1");
       const likely_missing = fda_check.exitCode !== 0 && fda_check.stderr.includes("Operation not permitted");
 
       if (likely_missing) {
-        p.note(
-          "LobsterFarm needs Full Disk Access for Terminal, Node.js, and tmux.\n\n" +
-            "Open System Settings → Privacy & Security → Full Disk Access\n" +
-            "and enable these apps:\n\n" +
-            "  • Terminal (or iTerm2 / your terminal app)\n" +
-            "  • node (usually at /opt/homebrew/bin/node or /usr/local/bin/node)\n" +
-            "  • tmux (if installed, usually at /opt/homebrew/bin/tmux)\n\n" +
-            "You may also want to enable:\n" +
-            "  • Screen Recording (for Peekaboo UI automation)\n" +
-            "  • Accessibility (for Peekaboo)",
-          "macOS Permissions Required",
-        );
-        const ack = await p.confirm({ message: "Continue setup? (you can configure permissions later)" });
-        if (p.isCancel(ack) || !ack) {
-          p.cancel("Configure permissions, then re-run `lobsterfarm init`.");
-          process.exit(0);
+        const setup_fda = await p.confirm({
+          message: "Full Disk Access is needed for Terminal, node, and tmux. Attempt to configure?",
+          initialValue: true,
+        });
+        if (p.isCancel(setup_fda)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+        if (setup_fda) {
+          // Find paths to the apps we need to grant FDA
+          const apps_to_grant = [
+            { name: "Terminal", bundle: "com.apple.Terminal" },
+            { name: "node", path: null as string | null },
+            { name: "tmux", path: null as string | null },
+          ];
+
+          // Resolve node and tmux paths
+          const node_which = await exec_command("which node");
+          if (node_which.exitCode === 0) apps_to_grant[1]!.path = node_which.stdout.trim();
+          const tmux_which = await exec_command("which tmux");
+          if (tmux_which.exitCode === 0) apps_to_grant[2]!.path = tmux_which.stdout.trim();
+
+          // Attempt TCC database modification (requires sudo)
+          spin.start("Attempting to grant Full Disk Access via TCC database...");
+          const tcc_db = "/Library/Application Support/com.apple.TCC/TCC.db";
+          let tcc_success = true;
+
+          // Grant Terminal by bundle ID
+          const terminal_result = spawnSync("sudo", [
+            "sqlite3", tcc_db,
+            `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceSystemPolicyAllFiles', 'com.apple.Terminal', 0, 2, 4, 1);`,
+          ], { stdio: "inherit" });
+
+          if (terminal_result.status !== 0) {
+            tcc_success = false;
+          }
+
+          // Grant node and tmux by path
+          for (const app of apps_to_grant.slice(1)) {
+            if (!app.path) continue;
+            const result = spawnSync("sudo", [
+              "sqlite3", tcc_db,
+              `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceSystemPolicyAllFiles', '${app.path}', 1, 2, 4, 1);`,
+            ], { stdio: "inherit" });
+            if (result.status !== 0) {
+              tcc_success = false;
+            }
+          }
+
+          if (tcc_success) {
+            spin.stop("Full Disk Access granted via TCC database");
+          } else {
+            spin.stop("TCC database method failed — opening System Settings");
+            p.log.info("Manually enable Full Disk Access for Terminal, node, and tmux.");
+
+            // Fallback: open System Settings to the right page
+            spawnSync("open", [
+              "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+            ]);
+
+            const node_path = apps_to_grant[1]?.path ?? "not found";
+            const tmux_path = apps_to_grant[2]?.path ?? "not installed";
+            p.note(
+              "System Settings has been opened to Full Disk Access.\n\n" +
+                "Click the + button and add:\n" +
+                `  • Terminal (should be listed)\n` +
+                `  • node: ${node_path}\n` +
+                `  • tmux: ${tmux_path}\n\n` +
+                "Tip: In the file picker, press Cmd+Shift+G to type a path directly.",
+              "Manual Setup Required",
+            );
+
+            const ack = await p.confirm({ message: "Done configuring Full Disk Access?" });
+            if (p.isCancel(ack)) { p.cancel("Setup cancelled."); process.exit(0); }
+          }
         }
       }
     }
