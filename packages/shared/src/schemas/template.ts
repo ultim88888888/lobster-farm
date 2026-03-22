@@ -32,7 +32,7 @@ export const TemplateVariablesSchema = z.object({
   COMMANDER_NAME_LOWER: z.string().default("pat"),
 
   // Paths
-  PROJECTS_DIR: z.string().default("~/projects"),
+  PROJECTS_DIR: z.string().default("~/entities"),
 
   // Block content (for {{#BLOCK}}...{{/BLOCK}} regions)
   SHARED_SERVICES: z.string().default(""),

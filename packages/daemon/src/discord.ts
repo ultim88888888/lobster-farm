@@ -891,12 +891,12 @@ export class DiscordBot extends EventEmitter {
 
       // Discord has a 2000 char limit — split if needed
       if (response.length <= 1900) {
-        await this.send_as_agent(message.channelId, response, "system");
+        await this.send_as_agent(message.channelId, response, "commander");
       } else {
         // Split into chunks
         const chunks = response.match(/[\s\S]{1,1900}/g) ?? [response.slice(0, 1900)];
         for (const chunk of chunks) {
-          await this.send_as_agent(message.channelId, chunk, "system");
+          await this.send_as_agent(message.channelId, chunk, "commander");
         }
       }
 

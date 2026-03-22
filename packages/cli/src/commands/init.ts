@@ -201,9 +201,22 @@ export const init_command = new Command("init")
       if (p.isCancel(op_token)) { p.cancel("Setup cancelled."); process.exit(0); }
 
       if (op_token && op_token.trim()) {
-        const { appendFile } = await import("node:fs/promises");
+        const { readFile, writeFile: writeF } = await import("node:fs/promises");
         const home = process.env["HOME"] ?? "";
-        await appendFile(`${home}/.zshrc`, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
+        const zshrc_path = `${home}/.zshrc`;
+        // Replace existing or append
+        try {
+          let content = await readFile(zshrc_path, "utf-8");
+          if (content.includes("OP_SERVICE_ACCOUNT_TOKEN")) {
+            content = content.replace(/export OP_SERVICE_ACCOUNT_TOKEN="[^"]*"/g, `export OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"`);
+          } else {
+            content += `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`;
+          }
+          await writeF(zshrc_path, content);
+        } catch {
+          const { appendFile } = await import("node:fs/promises");
+          await appendFile(zshrc_path, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
+        }
         process.env["OP_SERVICE_ACCOUNT_TOKEN"] = op_token.trim();
         op.token_configured = true;
         op.status = "op CLI installed, service account token configured";
