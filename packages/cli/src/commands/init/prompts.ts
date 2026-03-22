@@ -53,11 +53,16 @@ export async function prompt_agent_names(): Promise<
   return result as Record<"planner" | "designer" | "builder" | "operator", string>;
 }
 
-/** Prompt for Discord setup (optional). Returns server ID or undefined. */
-export async function prompt_discord(): Promise<string | undefined> {
+export interface DiscordSetup {
+  server_id: string;
+  bot_token: string;
+}
+
+/** Prompt for Discord setup (optional). Returns server ID + bot token or undefined. */
+export async function prompt_discord(): Promise<DiscordSetup | undefined> {
   const wants_discord = await p.confirm({
     message: "Set up Discord integration?",
-    initialValue: false,
+    initialValue: true,
   });
   if (p.isCancel(wants_discord)) {
     p.cancel("Setup cancelled.");
@@ -65,11 +70,18 @@ export async function prompt_discord(): Promise<string | undefined> {
   }
   if (!wants_discord) return undefined;
 
+  p.note(
+    "You need a Discord bot. Create one at https://discord.com/developers/applications\n" +
+      "Enable Message Content Intent in the Bot tab.\n" +
+      "Copy the bot token and server ID (right-click server → Copy Server ID).",
+    "Discord Setup",
+  );
+
   const server_id = await p.text({
     message: "Discord server ID:",
     placeholder: "e.g. 1234567890",
     validate: (value) => {
-      if (!value.trim()) return "Server ID is required if enabling Discord.";
+      if (!value.trim()) return "Server ID is required.";
       return undefined;
     },
   });
@@ -77,7 +89,23 @@ export async function prompt_discord(): Promise<string | undefined> {
     p.cancel("Setup cancelled.");
     process.exit(0);
   }
-  return server_id.trim();
+
+  const bot_token = await p.password({
+    message: "Discord bot token:",
+    validate: (value) => {
+      if (!value.trim()) return "Bot token is required.";
+      return undefined;
+    },
+  });
+  if (p.isCancel(bot_token)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+
+  return {
+    server_id: server_id.trim(),
+    bot_token: bot_token.trim(),
+  };
 }
 
 /** Prompt for GitHub configuration. */

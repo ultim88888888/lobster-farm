@@ -103,8 +103,8 @@ export const init_command = new Command("init")
     const op = await check_onepassword();
     spin.stop(`1Password: ${op.status}`);
 
-    // ── Step 6-8: Prompts (skipped in non-interactive mode) ──
-    const discord_server_id = non_interactive ? undefined : await prompt_discord();
+    // ── Step 7-9: Prompts (skipped in non-interactive mode) ──
+    const discord_setup = non_interactive ? undefined : await prompt_discord();
     const github = non_interactive ? { username: "", org: "" } : await prompt_github();
     const projects_dir = non_interactive
       ? (path_overrides?.projects_dir ?? "~/projects")
@@ -156,8 +156,8 @@ export const init_command = new Command("init")
       },
     };
 
-    if (discord_server_id) {
-      config_input["discord"] = { server_id: discord_server_id };
+    if (discord_setup) {
+      config_input["discord"] = { server_id: discord_setup.server_id };
     }
 
     const config: LobsterFarmConfig = LobsterFarmConfigSchema.parse(config_input);
@@ -171,7 +171,19 @@ export const init_command = new Command("init")
     const config_path = await write_global_config(config, path_overrides);
     const files = await generate_config_files(vars, agent_names, path_overrides);
     const settings_path = await generate_settings(path_overrides);
-    spin.stop(`Wrote ${files.length + 2} configuration files`);
+
+    // Write .env with secrets (bot token)
+    if (discord_setup?.bot_token) {
+      const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
+      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+      const env_dir = lf_dir(path_overrides);
+      await mkdirFs(env_dir, { recursive: true });
+      const env_path = `${env_dir}/.env`;
+      await writeFile(env_path, `DISCORD_BOT_TOKEN=${discord_setup.bot_token}\n`, { mode: 0o600 });
+      files.push(env_path);
+    }
+
+    spin.stop(`Wrote ${String(files.length + 2)} configuration files`);
 
     // ── Summary ──
     const summary_lines = [
@@ -184,8 +196,8 @@ export const init_command = new Command("init")
       `1Password:  ${op.status}`,
     ];
 
-    if (discord_server_id) {
-      summary_lines.push(`Discord:    server ${discord_server_id}`);
+    if (discord_setup) {
+      summary_lines.push(`Discord:    server ${discord_setup.server_id} (token saved)`);
     }
 
     if (github.username) {

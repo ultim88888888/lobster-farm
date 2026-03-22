@@ -850,7 +850,11 @@ export class DiscordBot extends EventEmitter {
 
 // ── Token resolution ──
 
-/** Resolve the Discord bot token from env or 1Password. */
+/** Resolve the Discord bot token. Resolution order:
+ * 1. DISCORD_BOT_TOKEN env var
+ * 2. ~/.lobsterfarm/.env file (written by setup wizard)
+ * 3. 1Password reference (if configured)
+ */
 export async function resolve_bot_token(
   config: LobsterFarmConfig,
 ): Promise<string | null> {
@@ -861,7 +865,22 @@ export async function resolve_bot_token(
     return env_token;
   }
 
-  // 2. 1Password reference
+  // 2. .env file in lobsterfarm dir
+  try {
+    const { lobsterfarm_dir } = await import("@lobster-farm/shared");
+    const { readFile } = await import("node:fs/promises");
+    const env_path = `${lobsterfarm_dir(config.paths)}/.env`;
+    const env_content = await readFile(env_path, "utf-8");
+    const match = env_content.match(/^DISCORD_BOT_TOKEN=(.+)$/m);
+    if (match?.[1]) {
+      console.log("[discord] Using bot token from .env file");
+      return match[1].trim();
+    }
+  } catch {
+    // .env file doesn't exist — continue
+  }
+
+  // 3. 1Password reference
   const op_ref = config.discord?.bot_token_ref;
   if (op_ref) {
     try {
