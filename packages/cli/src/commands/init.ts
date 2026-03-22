@@ -5,6 +5,7 @@ import {
   TemplateVariablesSchema,
   type LobsterFarmConfig,
   type TemplateVariables,
+  type PathConfig,
 } from "@lobster-farm/shared";
 import { detect_machine, check_sudo, check_onepassword } from "./init/detect.js";
 import {
@@ -23,24 +24,50 @@ import {
 
 export const init_command = new Command("init")
   .description("Initialize LobsterFarm — setup wizard for first-time configuration")
-  .action(async () => {
+  .option("--prefix <dir>", "Write output to <dir>/.claude/ and <dir>/.lobsterfarm/ instead of ~/")
+  .option("--name <name>", "User name (skips interactive prompt)")
+  .option("--non-interactive", "Use defaults for all prompts (requires --name)")
+  .action(async (options: { prefix?: string; name?: string; nonInteractive?: boolean }) => {
+    const prefix = options.prefix;
+    const non_interactive = options.nonInteractive ?? false;
+    const path_overrides: Partial<PathConfig> | undefined = prefix
+      ? {
+          lobsterfarm_dir: `${prefix}/.lobsterfarm`,
+          claude_dir: `${prefix}/.claude`,
+          projects_dir: `${prefix}/projects`,
+        }
+      : undefined;
+
+    if (prefix) {
+      p.log.info(`Using prefix: ${prefix} (files will NOT be written to ~/)`);
+    }
+
+    if (non_interactive && !options.name) {
+      console.error("Error: --non-interactive requires --name");
+      process.exit(1);
+    }
+
     // ── Welcome ──
     p.intro("LobsterFarm — Autonomous Software Consultancy");
 
-    p.note(
-      "LobsterFarm runs a team of specialized Claude agents on your machine.\n" +
-        "Each agent has a role (planner, designer, builder, operator) and works\n" +
-        "autonomously on your projects via a local daemon.\n\n" +
-        "This wizard will configure your machine, name your agents, and set up\n" +
-        "the directory structure and config files.",
-      "Welcome",
-    );
+    if (!non_interactive) {
+      p.note(
+        "LobsterFarm runs a team of specialized Claude agents on your machine.\n" +
+          "Each agent has a role (planner, designer, builder, operator) and works\n" +
+          "autonomously on your projects via a local daemon.\n\n" +
+          "This wizard will configure your machine, name your agents, and set up\n" +
+          "the directory structure and config files.",
+        "Welcome",
+      );
+    }
 
     // ── Step 1: User name ──
-    const user_name = await prompt_user_name();
+    const user_name = non_interactive ? options.name! : await prompt_user_name();
 
     // ── Step 2: Agent names ──
-    const agent_names = await prompt_agent_names();
+    const agent_names = non_interactive
+      ? { planner: "Gary", designer: "Pearl", builder: "Bob", operator: "Ray" }
+      : await prompt_agent_names();
 
     // ── Step 3: Machine detection ──
     const spin = p.spinner();
@@ -58,14 +85,12 @@ export const init_command = new Command("init")
     const op = await check_onepassword();
     spin.stop(`1Password: ${op.status}`);
 
-    // ── Step 6: Discord (optional) ──
-    const discord_server_id = await prompt_discord();
-
-    // ── Step 7: GitHub ──
-    const github = await prompt_github();
-
-    // ── Step 8: Projects directory ──
-    const projects_dir = await prompt_projects_dir();
+    // ── Step 6-8: Prompts (skipped in non-interactive mode) ──
+    const discord_server_id = non_interactive ? undefined : await prompt_discord();
+    const github = non_interactive ? { username: "", org: "" } : await prompt_github();
+    const projects_dir = non_interactive
+      ? (path_overrides?.projects_dir ?? "~/projects")
+      : await prompt_projects_dir();
 
     // ── Build TemplateVariables ──
     const permissions_parts: string[] = [];
@@ -117,13 +142,13 @@ export const init_command = new Command("init")
 
     // ── Generate everything ──
     spin.start("Creating directory structure...");
-    const dirs = await create_directory_structure();
+    const dirs = await create_directory_structure(path_overrides);
     spin.stop(`Created ${dirs.length} directories`);
 
     spin.start("Writing configuration files...");
-    const config_path = await write_global_config(config);
-    const files = await generate_config_files(vars, agent_names);
-    const settings_path = await generate_settings();
+    const config_path = await write_global_config(config, path_overrides);
+    const files = await generate_config_files(vars, agent_names, path_overrides);
+    const settings_path = await generate_settings(path_overrides);
     spin.stop(`Wrote ${files.length + 2} configuration files`);
 
     // ── Summary ──

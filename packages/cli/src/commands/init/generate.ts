@@ -22,6 +22,7 @@ import {
   global_config_path,
   type LobsterFarmConfig,
   type TemplateVariables,
+  type PathConfig,
 } from "@lobster-farm/shared";
 
 /** Resolve the monorepo config/ directory from the CLI source location. */
@@ -62,25 +63,26 @@ const AGENT_TEMPLATE_MAP: Record<string, string> = {
 export async function generate_config_files(
   vars: Partial<TemplateVariables>,
   agent_names: Record<"planner" | "designer" | "builder" | "operator", string>,
+  path_overrides?: Partial<PathConfig>,
 ): Promise<string[]> {
   const created: string[] = [];
   const config_dir = config_templates_dir();
 
   // ── ~/.claude/CLAUDE.md ──
   const claude_template = join(config_dir, "claude", "CLAUDE.md");
-  const claude_out = claude_md_path();
+  const claude_out = claude_md_path(path_overrides);
   await write_resolved(claude_template, claude_out, vars);
   created.push(claude_out);
 
   // ── ~/.lobsterfarm/user.md ──
   const user_template = join(config_dir, "lobsterfarm", "user.md");
-  const user_out = user_md_path();
+  const user_out = user_md_path(path_overrides);
   await write_resolved(user_template, user_out, vars);
   created.push(user_out);
 
   // ── ~/.lobsterfarm/tools.md ──
   const tools_template = join(config_dir, "lobsterfarm", "tools.md");
-  const tools_out = tools_md_path();
+  const tools_out = tools_md_path(path_overrides);
   await write_resolved(tools_template, tools_out, vars);
   created.push(tools_out);
 
@@ -89,14 +91,14 @@ export async function generate_config_files(
     const name = agent_names[role as keyof typeof agent_names];
     const agent_template = join(config_dir, "claude", "agents", template_file);
     const output_filename = `${name.toLowerCase()}.md`;
-    const agent_out = join(agents_dir(), output_filename);
+    const agent_out = join(agents_dir(path_overrides), output_filename);
     await write_resolved(agent_template, agent_out, vars);
     created.push(agent_out);
   }
 
   // ── Reviewer agent (not renamed — always "reviewer") ──
   const reviewer_template = join(config_dir, "claude", "agents", "reviewer.md");
-  const reviewer_out = join(agents_dir(), "reviewer.md");
+  const reviewer_out = join(agents_dir(path_overrides), "reviewer.md");
   await write_resolved(reviewer_template, reviewer_out, vars);
   created.push(reviewer_out);
 
@@ -108,7 +110,7 @@ export async function generate_config_files(
       if (!entry.isDirectory()) continue;
       const skill_name = entry.name;
       const src_skill_file = join(skills_src, skill_name, "SKILL.md");
-      const dest_skill_dir = join(skills_dir(), skill_name);
+      const dest_skill_dir = join(skills_dir(path_overrides), skill_name);
       const dest_skill_file = join(dest_skill_dir, "SKILL.md");
       await mkdir(dest_skill_dir, { recursive: true });
       await copyFile(src_skill_file, dest_skill_file);
@@ -122,7 +124,7 @@ export async function generate_config_files(
 }
 
 /** Generate the ~/.claude/settings.json with bypass permissions and hooks. */
-export async function generate_settings(): Promise<string> {
+export async function generate_settings(path_overrides?: Partial<PathConfig>): Promise<string> {
   const settings = {
     permissions: {
       bypassPermissions: true,
@@ -151,25 +153,25 @@ export async function generate_settings(): Promise<string> {
     },
   };
 
-  const out = claude_settings_path();
+  const out = claude_settings_path(path_overrides);
   await mkdir(dirname(out), { recursive: true });
   await writeFile(out, JSON.stringify(settings, null, 2) + "\n", "utf-8");
   return out;
 }
 
 /** Create the directory structure under ~/.lobsterfarm/. */
-export async function create_directory_structure(): Promise<string[]> {
+export async function create_directory_structure(path_overrides?: Partial<PathConfig>): Promise<string[]> {
   const dirs = [
-    lobsterfarm_dir(),
-    entities_dir(),
-    sop_dir(),
-    queue_dir(),
-    logs_dir(),
-    scripts_dir(),
-    templates_dir(),
-    dna_versions_dir(),
-    agents_dir(),
-    skills_dir(),
+    lobsterfarm_dir(path_overrides),
+    entities_dir(path_overrides),
+    sop_dir(path_overrides),
+    queue_dir(path_overrides),
+    logs_dir(path_overrides),
+    scripts_dir(path_overrides),
+    templates_dir(path_overrides),
+    dna_versions_dir(path_overrides),
+    agents_dir(path_overrides),
+    skills_dir(path_overrides),
   ];
 
   for (const dir of dirs) {
@@ -182,8 +184,9 @@ export async function create_directory_structure(): Promise<string[]> {
 /** Write the global config.yaml. */
 export async function write_global_config(
   config: LobsterFarmConfig,
+  path_overrides?: Partial<PathConfig>,
 ): Promise<string> {
-  const out = global_config_path();
+  const out = global_config_path(path_overrides);
   await write_yaml(out, config);
   return out;
 }
