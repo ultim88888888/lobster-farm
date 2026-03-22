@@ -334,9 +334,12 @@ export class FeatureManager extends EventEmitter {
       }
     } else {
       // Notify that the phase is done and awaiting approval
+      const entity = this.registry.get(feature.entity);
       await actions.notify(
         "alerts",
         `Feature ${feature_id}: ${feature.phase} phase complete. Awaiting approval.`,
+        entity,
+        feature.activeArchetype ?? undefined,
       );
     }
   }
@@ -475,6 +478,7 @@ export class FeatureManager extends EventEmitter {
       "work_log",
       `${feature.id}: entered ${phase} phase`,
       entity,
+      "system",
     );
   }
 
@@ -506,6 +510,7 @@ export class FeatureManager extends EventEmitter {
       "general",
       `Feature #${String(feature.githubIssue)} shipped and merged to main: ${feature.title}`,
       entity,
+      "system",
     );
   }
 }

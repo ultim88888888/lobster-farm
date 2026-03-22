@@ -6,11 +6,12 @@ import {
   GatewayIntentBits,
   type TextChannel,
   type Message,
+  type Webhook,
 } from "discord.js";
 import type {
   LobsterFarmConfig,
   ChannelType,
-  EntityConfig,
+  ArchetypeRole,
 } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
@@ -81,7 +82,7 @@ export class DiscordBot extends EventEmitter {
     return this.connected;
   }
 
-  /** Send a message to a specific channel ID. */
+  /** Send a plain message to a channel (from the bot itself). */
   async send(channel_id: string, content: string): Promise<void> {
     if (!this.connected) {
       console.log(`[discord:offline] Would send to ${channel_id}: ${content}`);
@@ -98,11 +99,46 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  /** Send a message to an entity's channel by type. */
+  /**
+   * Send a message as a specific agent (with custom name + avatar via webhook).
+   * Falls back to regular send if webhook creation fails.
+   */
+  async send_as_agent(
+    channel_id: string,
+    content: string,
+    archetype: ArchetypeRole | "system",
+  ): Promise<void> {
+    if (!this.connected) {
+      console.log(`[discord:offline] [${archetype}] ${content}`);
+      return;
+    }
+
+    const identity = this.resolve_agent_identity(archetype);
+
+    try {
+      const webhook = await this.get_or_create_webhook(channel_id);
+      if (webhook) {
+        await webhook.send({
+          content,
+          username: identity.name,
+          avatarURL: identity.avatar_url,
+        });
+        return;
+      }
+    } catch (err) {
+      console.log(`[discord] Webhook send failed, falling back to bot: ${String(err)}`);
+    }
+
+    // Fallback: send as bot with agent prefix
+    await this.send(channel_id, `**[${identity.name}]** ${content}`);
+  }
+
+  /** Send a message to an entity's channel by type, as a specific agent. */
   async send_to_entity(
     entity_id: string,
     channel_type: ChannelType,
     content: string,
+    archetype?: ArchetypeRole | "system",
   ): Promise<void> {
     const entity_map = this.entity_channels.get(entity_id);
     if (!entity_map) {
@@ -116,7 +152,69 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    await this.send(channel_id, content);
+    if (archetype) {
+      await this.send_as_agent(channel_id, content, archetype);
+    } else {
+      await this.send(channel_id, content);
+    }
+  }
+
+  // ── Agent identity ──
+
+  private resolve_agent_identity(archetype: ArchetypeRole | "system"): { name: string; avatar_url: string | undefined } {
+    if (archetype === "system") {
+      return { name: "LobsterFarm", avatar_url: undefined };
+    }
+
+    const agents = this.config.agents;
+    const names: Record<string, string> = {
+      planner: agents.planner.name,
+      designer: agents.designer.name,
+      builder: agents.builder.name,
+      operator: agents.operator.name,
+      reviewer: "Reviewer",
+    };
+
+    // Emoji-based "avatars" as fallback — Discord webhooks can use avatar URLs
+    // Users can configure real avatar URLs in the future
+    const name = names[archetype] ?? archetype;
+    return { name, avatar_url: undefined };
+  }
+
+  // ── Webhook management ──
+
+  private webhook_cache = new Map<string, Webhook>();
+
+  private async get_or_create_webhook(channel_id: string): Promise<Webhook | null> {
+    // Check cache
+    const cached = this.webhook_cache.get(channel_id);
+    if (cached) return cached;
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return null;
+
+      const text_channel = channel as TextChannel;
+
+      // Look for existing LobsterFarm webhook
+      const webhooks = await text_channel.fetchWebhooks();
+      let webhook = webhooks.find((w) => w.name === "LobsterFarm Agent");
+
+      if (!webhook) {
+        // Create one
+        webhook = await text_channel.createWebhook({
+          name: "LobsterFarm Agent",
+          reason: "LobsterFarm agent identity support",
+        });
+        console.log(`[discord] Created webhook for channel ${channel_id}`);
+      }
+
+      this.webhook_cache.set(channel_id, webhook);
+      return webhook;
+    } catch (err) {
+      console.log(`[discord] Failed to get/create webhook for ${channel_id}: ${String(err)}`);
+      return null;
+    }
   }
 
   /** Rebuild the channel → entity/type index from entity configs. */

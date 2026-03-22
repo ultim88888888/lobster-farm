@@ -164,6 +164,7 @@ export async function notify(
   channel_type: string,
   message: string,
   entity_config?: EntityConfig,
+  archetype?: string,
 ): Promise<void> {
   console.log(`[actions:notify] [${channel_type}] ${message}`);
 
@@ -172,6 +173,7 @@ export async function notify(
       entity_config.entity.id,
       channel_type as ChannelType,
       message,
+      (archetype as import("@lobster-farm/shared").ArchetypeRole) ?? "system",
     );
   }
 }
