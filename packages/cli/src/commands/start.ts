@@ -47,7 +47,7 @@ export const start_command = new Command("start")
     await mkdir(dirname(log_path), { recursive: true });
 
     // Generate and write the plist
-    const plist_content = generate_plist(daemon_path, log_path, working_dir);
+    const plist_content = await generate_plist(daemon_path, log_path, working_dir);
     const plist = plist_path();
     await mkdir(dirname(plist), { recursive: true });
     await writeFile(plist, plist_content, "utf-8");

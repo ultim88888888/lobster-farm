@@ -1,14 +1,56 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { exec_command } from "./process.js";
 import { LAUNCHD_LABEL } from "@lobster-farm/shared";
 
+/** Read env vars from ~/.lobsterfarm/.env for the plist. */
+async function read_env_file(): Promise<Record<string, string>> {
+  const env: Record<string, string> = {};
+  try {
+    const content = await readFile(join(homedir(), ".lobsterfarm", ".env"), "utf-8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq > 0) {
+        env[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
+      }
+    }
+  } catch {
+    // .env doesn't exist — that's fine
+  }
+  return env;
+}
+
 /** Generate a macOS launchd plist XML string for the LobsterFarm daemon. */
-export function generate_plist(
+export async function generate_plist(
   daemon_path: string,
   log_path: string,
   working_dir: string,
-): string {
+): Promise<string> {
+  const home = homedir();
+
+  // Find node binary
+  const { stdout: node_path } = await exec_command("which node");
+  const node = node_path.trim() || "/opt/homebrew/bin/node";
+
+  // Read .env for secrets (bot token, OP token, etc.)
+  const env_vars = await read_env_file();
+
+  // Build environment variables section
+  const env_entries = [
+    `    <key>PATH</key>`,
+    `    <string>/usr/local/bin:/opt/homebrew/bin:${home}/.local/bin:/usr/bin:/bin</string>`,
+    `    <key>HOME</key>`,
+    `    <string>${home}</string>`,
+  ];
+
+  for (const [key, value] of Object.entries(env_vars)) {
+    env_entries.push(`    <key>${key}</key>`);
+    env_entries.push(`    <string>${value}</string>`);
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -17,6 +59,7 @@ export function generate_plist(
   <string>${LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
+    <string>${node}</string>
     <string>${daemon_path}</string>
   </array>
   <key>WorkingDirectory</key>
@@ -31,8 +74,7 @@ export function generate_plist(
   <true/>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+${env_entries.join("\n")}
   </dict>
 </dict>
 </plist>`;
