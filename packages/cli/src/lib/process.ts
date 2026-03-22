@@ -28,8 +28,11 @@ export function is_process_running(pid: number): boolean {
 export function exec_command(
   cmd: string,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  // Use the user's shell (or /bin/zsh on macOS) so PATH includes
+  // homebrew, npm global, etc. Login shell (-l) loads .zshrc/.bashrc.
+  const shell = process.env["SHELL"] ?? "/bin/zsh";
   return new Promise((resolve) => {
-    execFile("/bin/sh", ["-c", cmd], (error, stdout, stderr) => {
+    execFile(shell, ["-l", "-c", cmd], { env: process.env }, (error, stdout, stderr) => {
       const exitCode =
         error && "code" in error && typeof error.code === "number"
           ? error.code
