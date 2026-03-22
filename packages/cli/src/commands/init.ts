@@ -13,7 +13,7 @@ import {
   prompt_agent_names,
   prompt_discord,
   prompt_github,
-  prompt_projects_dir,
+  // prompt_projects_dir removed — always defaults to ~/entities
 } from "./init/prompts.js";
 import {
   generate_config_files,
@@ -280,7 +280,7 @@ export const init_command = new Command("init")
     const github = non_interactive ? { username: "" } : await prompt_github();
     const projects_dir = non_interactive
       ? (path_overrides?.projects_dir ?? "~/projects")
-      : await prompt_projects_dir();
+      : (path_overrides?.projects_dir ?? "~/entities");
 
     // ── Build TemplateVariables ──
     const permissions_parts: string[] = [];
