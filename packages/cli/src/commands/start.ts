@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { writeFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import {
   pid_file_path,
   daemon_log_path,
@@ -15,12 +16,34 @@ import {
 } from "../lib/launchd.js";
 import { read_pid_file, is_process_running } from "../lib/process.js";
 
-/** Resolve the daemon entry point relative to this CLI package. */
+/** Resolve the daemon entry point. */
 function resolve_daemon_path(): string {
+  // Primary: look in ~/.lobsterfarm/src (standard install location)
+  const home = homedir();
+  const standard = join(home, ".lobsterfarm", "src", "packages", "daemon", "dist", "index.js");
+  try {
+    require.resolve(standard);
+    return standard;
+  } catch {
+    // noop
+  }
+
+  // Fallback: resolve relative to this CLI file
   const this_file = fileURLToPath(import.meta.url);
-  // From packages/cli/dist/commands/start.js -> packages/daemon/dist/index.js
-  const cli_dist = dirname(dirname(this_file));
-  return join(dirname(dirname(cli_dist)), "daemon", "dist", "index.js");
+  let dir = dirname(this_file);
+  for (let i = 0; i < 10; i++) {
+    const candidate = join(dir, "packages", "daemon", "dist", "index.js");
+    try {
+      require.resolve(candidate);
+      return candidate;
+    } catch {
+      // noop
+    }
+    dir = dirname(dir);
+  }
+
+  // Last resort
+  return standard;
 }
 
 export const start_command = new Command("start")
