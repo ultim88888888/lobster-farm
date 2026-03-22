@@ -1,0 +1,30 @@
+{
+  "name": "@lobster-farm/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "lobsterfarm": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@lobster-farm/shared": "workspace:*",
+    "commander": "catalog:",
+    "@clack/prompts": "catalog:",
+    "zod": "catalog:",
+    "yaml": "catalog:"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "tsup": "catalog:",
+    "vitest": "catalog:",
+    "@types/node": "catalog:"
+  }
+}
