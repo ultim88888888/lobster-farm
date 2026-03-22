@@ -166,9 +166,12 @@ export const init_command = new Command("init")
     }
 
     if (op.cli_installed && !op.token_configured && !non_interactive) {
-      p.log.info(
-        "1Password service account token not set.\n" +
-          "Create one at https://my.1password.com → Developer → Service Accounts",
+      p.note(
+        "Create a service account at https://my.1password.com → Developer → Service Accounts\n\n" +
+          "Grant it:\n" +
+          "  • Create and manage vaults (each entity gets its own vault)\n" +
+          "  • Read/write access to a master \"lobsterfarm\" vault for shared credentials",
+        "1Password Setup",
       );
 
       const op_token = await p.password({
