@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -12,23 +12,27 @@ export interface CommanderHealth {
   uptime_ms: number | null;
   restart_count: number;
   last_started_at: string | null;
+  tmux_session: string;
 }
 
+const TMUX_SESSION = "pat";
 const BACKOFF_SCHEDULE = [0, 5_000, 15_000, 60_000, 300_000];
 const BACKOFF_RESET_MS = 10 * 60 * 1000; // 10 min stable → reset counter
 const MAX_RESTARTS = 5;
+const HEALTH_INTERVAL_MS = 10_000; // check every 10s
 
 /**
  * Manages a persistent Claude Code session connected to Discord via the
- * channel plugin. The daemon's only job: spawn, health check, restart on crash.
+ * channel plugin, running inside a tmux session for proper TTY support.
+ * The daemon's only job: spawn, health check, restart on crash.
  */
 export class CommanderProcess extends EventEmitter {
-  private process: ChildProcess | null = null;
   private state: "stopped" | "starting" | "running" | "crashed" = "stopped";
   private restart_count = 0;
   private last_started_at: Date | null = null;
   private restart_timer: ReturnType<typeof setTimeout> | null = null;
   private backoff_reset_timer: ReturnType<typeof setTimeout> | null = null;
+  private health_timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private config: LobsterFarmConfig) {
     super();
@@ -50,7 +54,34 @@ export class CommanderProcess extends EventEmitter {
     }
   }
 
-  /** Start the persistent Commander session. */
+  /** Check if the tmux session is alive. */
+  private is_tmux_alive(): boolean {
+    try {
+      execFileSync("tmux", ["has-session", "-t", TMUX_SESSION], {
+        stdio: "ignore",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Get the PID of the main process inside the tmux session. */
+  private get_tmux_pid(): number | null {
+    try {
+      const out = execFileSync(
+        "tmux",
+        ["list-panes", "-t", TMUX_SESSION, "-F", "#{pane_pid}"],
+        { encoding: "utf-8" },
+      ).trim();
+      const pid = parseInt(out, 10);
+      return isNaN(pid) ? null : pid;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Start the persistent Commander session in a tmux session. */
   async start(): Promise<void> {
     if (this.state === "running" || this.state === "starting") {
       return;
@@ -62,89 +93,123 @@ export class CommanderProcess extends EventEmitter {
       return;
     }
 
+    // Kill any stale tmux session
+    if (this.is_tmux_alive()) {
+      try {
+        execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
+          stdio: "ignore",
+        });
+      } catch { /* ignore */ }
+    }
+
     this.state = "starting";
     const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
     const agent_name = this.config.agents.commander.name.toLowerCase();
     const working_dir = lobsterfarm_dir(this.config.paths);
 
-    const claude_args = [
+    const claude_cmd = [
+      claude_bin,
       "--channels", "plugin:discord@claude-plugins-official",
       "--agent", agent_name,
       "--model", "claude-opus-4-6",
       "--permission-mode", "bypassPermissions",
       "--add-dir", working_dir,
       "--add-dir", homedir(),
-    ];
+    ].join(" ");
 
-    console.log(`[commander] Starting ${agent_name} with Discord channel...`);
+    console.log(`[commander] Starting ${agent_name} in tmux session "${TMUX_SESSION}"...`);
 
-    // Claude Code's --channels requires an interactive session (TTY).
-    // Wrap in `script` to provide a pseudo-TTY when spawned from the daemon.
-    const proc = spawn("script", ["-q", "/dev/null", claude_bin, ...claude_args], {
+    // Create a detached tmux session running Claude Code.
+    // DISCORD_STATE_DIR is set so the channel plugin reads from the right dir.
+    const proc = spawn("tmux", [
+      "new-session", "-d",
+      "-s", TMUX_SESSION,
+      "-x", "200", "-y", "50",
+      `DISCORD_STATE_DIR=${this.state_dir()} ${claude_cmd}`,
+    ], {
       cwd: working_dir,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: "ignore",
       env: {
         ...process.env,
         DISCORD_STATE_DIR: this.state_dir(),
       },
     });
 
-    this.process = proc;
-    this.last_started_at = new Date();
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf-8").trim();
-      if (text) {
-        console.log(`[commander:stdout] ${text}`);
-      }
-    });
-
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf-8").trim();
-      if (text) {
-        console.log(`[commander:stderr] ${text}`);
-      }
-    });
-
-    proc.on("spawn", () => {
-      this.state = "running";
-      this.emit("started", proc.pid);
-      console.log(`[commander] ${agent_name} running (pid: ${String(proc.pid)})`);
-
-      // Reset backoff after 10 min of stable running
-      this.backoff_reset_timer = setTimeout(() => {
-        if (this.state === "running") {
-          this.restart_count = 0;
-        }
-      }, BACKOFF_RESET_MS);
-    });
-
     proc.on("close", (code) => {
-      this.process = null;
-      if (this.backoff_reset_timer) {
-        clearTimeout(this.backoff_reset_timer);
-        this.backoff_reset_timer = null;
-      }
-
-      if (this.state === "stopped") {
-        // Intentional shutdown
-        console.log("[commander] Session ended (shutdown)");
+      if (code !== 0) {
+        console.error(`[commander] tmux new-session failed with code ${String(code)}`);
+        this.state = "crashed";
+        this.schedule_restart();
         return;
       }
 
-      this.state = "crashed";
-      console.log(`[commander] Session exited with code ${String(code)}`);
-      this.emit("crashed", code);
-      this.schedule_restart();
+      // tmux new-session exits immediately (detached). Check the session exists.
+      if (this.is_tmux_alive()) {
+        // Claude Code shows a workspace trust dialog in interactive mode.
+        // Auto-accept it after a brief delay for the UI to render.
+        setTimeout(() => {
+          try {
+            execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "Enter"], {
+              stdio: "ignore",
+            });
+          } catch { /* ignore — dialog may not appear if already trusted */ }
+        }, 3000);
+
+        this.state = "running";
+        this.last_started_at = new Date();
+        const pid = this.get_tmux_pid();
+        console.log(`[commander] ${agent_name} running in tmux (pane pid: ${String(pid)})`);
+        this.emit("started", pid);
+
+        // Start health check polling
+        this.start_health_polling();
+
+        // Reset backoff after 10 min of stable running
+        this.backoff_reset_timer = setTimeout(() => {
+          if (this.state === "running") {
+            this.restart_count = 0;
+          }
+        }, BACKOFF_RESET_MS);
+      } else {
+        console.error("[commander] tmux session did not start");
+        this.state = "crashed";
+        this.schedule_restart();
+      }
     });
 
     proc.on("error", (err) => {
-      this.process = null;
       this.state = "crashed";
-      console.error(`[commander] Spawn failed: ${err.message}`);
+      console.error(`[commander] Failed to spawn tmux: ${err.message}`);
       this.emit("error", err);
       this.schedule_restart();
     });
+  }
+
+  /** Poll tmux session health. If it dies, trigger restart. */
+  private start_health_polling(): void {
+    this.stop_health_polling();
+    this.health_timer = setInterval(() => {
+      if (this.state !== "running") return;
+
+      if (!this.is_tmux_alive()) {
+        console.log("[commander] tmux session died");
+        this.state = "crashed";
+        this.stop_health_polling();
+        if (this.backoff_reset_timer) {
+          clearTimeout(this.backoff_reset_timer);
+          this.backoff_reset_timer = null;
+        }
+        this.emit("crashed", 1);
+        this.schedule_restart();
+      }
+    }, HEALTH_INTERVAL_MS);
+  }
+
+  private stop_health_polling(): void {
+    if (this.health_timer) {
+      clearInterval(this.health_timer);
+      this.health_timer = null;
+    }
   }
 
   private schedule_restart(): void {
@@ -181,47 +246,37 @@ export class CommanderProcess extends EventEmitter {
       clearTimeout(this.backoff_reset_timer);
       this.backoff_reset_timer = null;
     }
+    this.stop_health_polling();
 
-    if (!this.process) {
-      this.state = "stopped";
-      return;
+    this.state = "stopped";
+
+    if (this.is_tmux_alive()) {
+      console.log("[commander] Stopping tmux session...");
+      try {
+        execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
+          stdio: "ignore",
+        });
+      } catch { /* ignore */ }
     }
-
-    this.state = "stopped"; // Prevents close handler from restarting
-    console.log("[commander] Stopping...");
-
-    const proc = this.process;
-    proc.kill("SIGTERM");
-
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        if (this.process === proc) {
-          proc.kill("SIGKILL");
-        }
-        resolve();
-      }, 5000);
-
-      proc.once("close", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
-
-    this.process = null;
   }
 
   /** Get health status. */
   health_check(): CommanderHealth {
     const now = Date.now();
+    // Sync state with tmux reality
+    if (this.state === "running" && !this.is_tmux_alive()) {
+      this.state = "crashed";
+    }
     return {
       state: this.state,
-      pid: this.process?.pid ?? null,
+      pid: this.state === "running" ? this.get_tmux_pid() : null,
       uptime_ms:
         this.last_started_at && this.state === "running"
           ? now - this.last_started_at.getTime()
           : null,
       restart_count: this.restart_count,
       last_started_at: this.last_started_at?.toISOString() ?? null,
+      tmux_session: TMUX_SESSION,
     };
   }
 }
