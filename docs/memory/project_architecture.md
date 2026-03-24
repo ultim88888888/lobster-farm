@@ -6,14 +6,14 @@ type: project
 
 ## Three Concerns
 
-**Execution:** Claude Code is the single execution engine. With the `--chrome` flag, it has both CLI and GUI capabilities in the same session:
-- **CLI tools** — Bash, file ops, git, testing, MCP servers, web fetch/search
-- **Computer use** — full screen control, mouse, keyboard, screenshots (via `computer` tool)
-- **Browser automation** — navigate, read pages, fill forms, run JS, inspect console/network, manage tabs
+**Execution:** Claude Code is the primary execution engine. Two capability tiers:
+- **CLI tools** — Bash, file ops, git, testing, MCP servers, web fetch/search. Always available.
+- **Chrome browser control** (`--chrome` flag) — pixel-level control within Chrome tabs: click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome, not the full desktop.
+- **Full desktop computer use** — screen control for any application (Figma, Slack, native apps). Available via Claude API and Desktop app, but NOT yet in the Claude Code CLI (as of v2.1.81). Watch for this.
 
-An agent can write code AND verify it visually AND interact with GUI-only tools — all in one session. No routing between engines needed. The `--chrome` flag enables all GUI tools via the Claude in Chrome MCP server.
+For web-based work (most SaaS, web apps, browser tools), Claude Code + `--chrome` covers it. For native desktop apps, full computer use will need to come to the CLI or be accessed via the API separately.
 
-Not everything is dev work. Computer use matters for: design verification, QA, content workflows, research, interacting with tools that have no CLI/API.
+Not everything is dev work. Browser control matters for: design verification, QA, content workflows, research, web-based tools.
 
 **Orchestration:** Managing WHAT gets done, by WHOM, in WHAT order. Handoffs, SOPs, progress tracking across entities. Background coordinator. Must route to the right execution engine (Claude Code vs computer use vs both).
 

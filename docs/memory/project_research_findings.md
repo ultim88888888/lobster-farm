@@ -12,15 +12,15 @@ type: project
 
 **Implication:** Agent Teams can't leverage our archetype system until Anthropic ships profile support for teammates. Our orchestrator handles multi-agent coordination externally for now.
 
-## Claude Computer Use (in Claude Code CLI)
+## Computer Use — Two Tiers
 
-**What it is:** Full computer use — screen control, mouse, keyboard, screenshots — available in Claude Code CLI via the `--chrome` flag. Not a separate product. Same session as Bash/Read/Write/Edit.
+**Chrome browser control (in Claude Code CLI now):** The `--chrome` flag enables pixel-level control within Chrome tabs — click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome only, not the desktop. Same session as Bash/Read/Write/Edit. Useful for web-based verification, QA, form filling, web research.
 
-**Tools enabled by `--chrome`:** `computer` (full screen control), `navigate`, `read_page`, `find`, `form_input`, `javascript_tool`, `gif_creator`, `upload_image`, `read_console_messages`, `read_network_requests`, `tabs_create_mcp`, `shortcuts_execute`, and more. All via the Claude in Chrome MCP server.
+**Full desktop computer use (NOT in CLI yet):** Screen control for any application. Available via Claude API (with computer use tool + beta header) and Claude Desktop app. Not in Claude Code CLI as of v2.1.81. When this ships in the CLI, it will be a significant capability upgrade — agents could interact with Figma, Slack, native apps, etc.
 
-**Why it matters for LobsterFarm:** Not everything is dev work. Computer use in the same session means agents can write code AND verify it visually AND interact with GUI-only tools. No routing between engines needed.
+**Why it matters for LobsterFarm:** Not everything is dev work. Chrome control covers web-based workflows today. Full desktop use is the gap to watch.
 
-**Implication for daemon:** Add `--chrome` to agent spawn commands when GUI capabilities are needed. The session manager doesn't need to distinguish between "code work" and "GUI work" — the agent handles both.
+**Implication for daemon:** Add `--chrome` to agent spawn commands for browser capabilities. Watch for full desktop computer use coming to the CLI — will need architectural consideration when it ships.
 
 ## OpenClaw
 

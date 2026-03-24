@@ -20,7 +20,7 @@ LobsterFarm is built entirely on Claude Code as sole runtime. New features direc
 
 **Subagents**: Custom profiles, tool restrictions, isolated context windows. Useful for scoped sub-tasks within a session.
 
-**Computer use via `--chrome`**: Full GUI capabilities in CLI sessions. The `computer` tool gives screen control, mouse, keyboard. Plus browser automation: navigate, read pages, fill forms, run JS, inspect console/network. Enables agents to write code AND verify it visually in the same session. Not a separate engine — just more tools in the same Claude Code session.
+**Chrome browser control via `--chrome`**: Pixel-level control within Chrome tabs — click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome, NOT the full desktop. Enables agents to write code and verify it in a browser in the same session. Full desktop computer use (any app) is in the Claude API and Desktop app but not yet in the CLI.
 
 ## Known Limitations
 
