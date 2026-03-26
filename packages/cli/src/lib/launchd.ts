@@ -13,6 +13,18 @@ const BASE_PATH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin
 const CAPTURED_ENV_VARS = ["BUN_INSTALL", "OP_SERVICE_ACCOUNT_TOKEN"] as const;
 
 /**
+ * Escape a value for safe interpolation inside double-quoted shell strings.
+ * Handles backslashes, double quotes, backticks, and dollar signs.
+ */
+function escape_shell_value(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/`/g, "\\`")
+    .replace(/\$/g, "\\$");
+}
+
+/**
  * Resolve the absolute path of a binary using `which`.
  * Returns the path, or null if not found.
  */
@@ -70,7 +82,7 @@ export function generate_env_sh(
   for (const key of CAPTURED_ENV_VARS) {
     const value = env[key];
     if (value) {
-      env_exports.push(`export ${key}="${value}"`);
+      env_exports.push(`export ${key}="${escape_shell_value(value)}"`);
     }
   }
 

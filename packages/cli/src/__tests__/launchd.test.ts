@@ -83,6 +83,16 @@ describe("generate_env_sh", () => {
     expect(result).toContain('export OP_SERVICE_ACCOUNT_TOKEN="ops_abc123"');
   });
 
+  it("escapes shell-special characters in env var values", () => {
+    const resolver = mock_resolver({});
+    const env = { OP_SERVICE_ACCOUNT_TOKEN: 'token"with$pecial`chars\\here' };
+
+    const result = generate_env_sh(env, resolver);
+
+    // The value should be escaped so it's safe inside double quotes
+    expect(result).toContain('export OP_SERVICE_ACCOUNT_TOKEN="token\\"with\\$pecial\\`chars\\\\here"');
+  });
+
   it("omits env vars not present in process.env", () => {
     const resolver = mock_resolver({});
 

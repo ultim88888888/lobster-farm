@@ -95,7 +95,7 @@ export const start_command = new Command("start")
       console.log("env.sh already exists, skipping. Delete and re-run to regenerate.");
     } catch {
       const env_content = generate_env_sh();
-      await writeFile(env_sh_path, env_content, { encoding: "utf-8", mode: 0o644 });
+      await writeFile(env_sh_path, env_content, { encoding: "utf-8", mode: 0o600 });
       console.log(`Generated env.sh at ${env_sh_path}`);
     }
 
