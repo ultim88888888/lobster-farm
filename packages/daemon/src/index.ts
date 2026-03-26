@@ -60,6 +60,12 @@ async function main(): Promise<void> {
   const pool = new BotPool(config);
   await pool.initialize();
 
+  // Wire pool to feature manager for interactive builder sessions
+  feature_manager.set_pool(pool);
+
+  // Start health monitor for detecting dead tmux sessions
+  pool.start_health_monitor();
+
   // Initialize Discord bot (optional — daemon works without it via HTTP API)
   const discord = new DiscordBot(config, registry);
   let discord_connected = false;

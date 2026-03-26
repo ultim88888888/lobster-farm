@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { execFileSync } from "node:child_process";
+import { writeFile as writeFileAsync, unlink } from "node:fs/promises";
 import type {
   FeatureState,
   Phase,
@@ -11,6 +13,7 @@ import { PHASE_TRANSITIONS } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import { QueueFullError } from "./queue.js";
 import type { TaskQueue } from "./queue.js";
+import type { BotPool, PoolAssignment } from "./pool.js";
 import type { SessionResult } from "./session.js";
 import * as actions from "./actions.js";
 import { save_features, load_features } from "./persistence.js";
@@ -58,9 +61,17 @@ const PHASE_CONFIG: Record<Phase, PhaseConfig> = {
     needs_approval: false,
     optional: false,
     prompt_template:
-      "Implement feature #{issue}: {title}. " +
-      "Follow the spec in the GitHub issue. Write tests. " +
-      "Commit and push when complete.",
+      "Implement feature #{issue}: {title}.\n" +
+      "Follow the spec in the GitHub issue. Write tests.\n" +
+      "\n" +
+      "You're working in a collaboration room. Use your judgment on when to involve the user:\n" +
+      "- Straightforward, well-specced work: build it, push, and open a PR with `gh pr create`.\n" +
+      "- Complex or ambiguous work: show progress, ask questions when you hit decisions that could go either way.\n" +
+      "- Visual/UI work: show the user a preview or screenshots before opening a PR.\n" +
+      "- When you hit something the spec didn't cover: ask rather than guess.\n" +
+      "\n" +
+      "When the work is ready, commit, push, and open a PR. Post the PR link in this channel.\n" +
+      "If the user asks for changes after you show them: iterate, then open the PR when they approve.",
   },
   review: {
     archetype: "reviewer",
@@ -123,6 +134,12 @@ export class FeatureManager extends EventEmitter {
   private session_to_feature = new Map<string, string>();
   private task_to_feature = new Map<string, string>();
 
+  /** Maps pool bot ID → feature ID for pool-based builder sessions. */
+  private pool_bot_to_feature = new Map<number, string>();
+
+  /** Optional pool reference — set via set_pool() after construction. */
+  private pool: BotPool | null = null;
+
   constructor(
     private registry: EntityRegistry,
     private queue: TaskQueue,
@@ -134,11 +151,34 @@ export class FeatureManager extends EventEmitter {
     this.queue.on_drain(() => this.retry_queue_blocked());
   }
 
+  /**
+   * Connect the pool to this feature manager and wire up event listeners.
+   * Called from daemon index.ts after both pool and feature manager are initialized.
+   */
+  set_pool(pool: BotPool): void {
+    this.pool = pool;
+
+    // When a pool bot is released, retry features blocked waiting for pool capacity
+    pool.on("bot:released", () => {
+      this.retry_pool_blocked();
+    });
+
+    // When a pool bot's tmux session ends, check for PR and advance or alert
+    pool.on("bot:session_ended", (event: { bot_id: number; channel_id: string | null; entity_id: string | null }) => {
+      void this.on_bot_session_ended(event);
+    });
+  }
+
   /** Load persisted features from disk. Call on daemon startup. */
   async load_persisted(): Promise<void> {
     const saved = await load_features(this.config);
     for (const feature of saved) {
       this.features.set(feature.id, feature);
+
+      // Rebuild pool_bot_to_feature map from persisted poolBotId
+      if (feature.poolBotId !== null && feature.poolBotId !== undefined) {
+        this.pool_bot_to_feature.set(feature.poolBotId, feature.id);
+      }
     }
     if (saved.length > 0) {
       console.log(`[features] Restored ${String(saved.length)} features from disk`);
@@ -222,6 +262,7 @@ export class FeatureManager extends EventEmitter {
         : null,
       approved: false,
       labels: opts.labels ?? [],
+      poolBotId: null,
       prNumber: null,
       agentDone: false,
       createdAt: new Date().toISOString(),
@@ -239,9 +280,10 @@ export class FeatureManager extends EventEmitter {
         await this.run_entry_actions(feature, start_phase);
       }
 
-      // Spawn the agent for the start phase
+      // Spawn the agent for the start phase.
+      // Awaited so pool-based assignments complete before the caller sees the feature.
       const phase_config = PHASE_CONFIG[start_phase];
-      void this.spawn_phase_agent(feature, phase_config);
+      await this.spawn_phase_agent(feature, phase_config);
     }
 
     console.log(
@@ -362,7 +404,7 @@ export class FeatureManager extends EventEmitter {
     return feature;
   }
 
-  /** Register a session→feature mapping when a session starts. */
+  /** Register a session->feature mapping when a session starts. */
   on_session_started(session: { session_id: string; feature_id: string }): void {
     const feature = this.features.get(session.feature_id);
     if (feature) {
@@ -378,7 +420,7 @@ export class FeatureManager extends EventEmitter {
     }
   }
 
-  /** Handle a completed session — check if the feature can auto-advance. */
+  /** Handle a completed session -- check if the feature can auto-advance. */
   async on_session_completed(result: SessionResult): Promise<void> {
     const feature_id = this.session_to_feature.get(result.session_id);
     if (!feature_id) return;
@@ -433,12 +475,12 @@ export class FeatureManager extends EventEmitter {
     }
   }
 
-  /** Detect review outcome and route: approved → ship, changes_requested → build bounce, pending → blocked. */
+  /** Detect review outcome and route: approved -> ship, changes_requested -> build bounce, pending -> blocked. */
   private async handle_review_outcome(feature: FeatureState): Promise<void> {
     const entity = this.registry.get(feature.entity);
 
     if (!feature.prNumber) {
-      console.error(`[features] Review completed for ${feature.id} but no PR number — blocking`);
+      console.error(`[features] Review completed for ${feature.id} but no PR number -- blocking`);
       feature.blocked = true;
       feature.blockedReason = "Review completed but no PR number to check";
       void this.persist();
@@ -453,7 +495,7 @@ export class FeatureManager extends EventEmitter {
 
     switch (outcome) {
       case "approved":
-        console.log(`[features] PR #${String(feature.prNumber)} approved — advancing ${feature.id} to ship`);
+        console.log(`[features] PR #${String(feature.prNumber)} approved -- advancing ${feature.id} to ship`);
         try {
           await this.advance_feature(feature.id, "ship");
         } catch (err) {
@@ -463,7 +505,7 @@ export class FeatureManager extends EventEmitter {
         break;
 
       case "changes_requested":
-        console.log(`[features] PR #${String(feature.prNumber)} changes requested — bouncing ${feature.id} back to build`);
+        console.log(`[features] PR #${String(feature.prNumber)} changes requested -- bouncing ${feature.id} back to build`);
         try {
           await this.advance_feature(feature.id, "build");
         } catch (err) {
@@ -473,14 +515,14 @@ export class FeatureManager extends EventEmitter {
         // Notify alerts about the bounce
         await actions.notify_feature(
           feature,
-          `Review bounced ${feature.id} back to build — changes requested on PR #${String(feature.prNumber)}`,
+          `Review bounced ${feature.id} back to build -- changes requested on PR #${String(feature.prNumber)}`,
           entity,
           { also_alerts: true },
         );
         break;
 
       case "pending":
-        console.log(`[features] Reviewer completed for ${feature.id} without posting a decision — blocking`);
+        console.log(`[features] Reviewer completed for ${feature.id} without posting a decision -- blocking`);
         feature.blocked = true;
         feature.blockedReason = "Reviewer session completed without posting a review decision";
         void this.persist();
@@ -489,7 +531,7 @@ export class FeatureManager extends EventEmitter {
     }
   }
 
-  /** Handle a failed session — mark the feature as blocked. */
+  /** Handle a failed session -- mark the feature as blocked. */
   on_session_failed(session_id: string, error: string): void {
     const feature_id = this.session_to_feature.get(session_id);
     if (!feature_id) return;
@@ -538,13 +580,13 @@ export class FeatureManager extends EventEmitter {
 
       if (!all_deps_done) continue;
 
-      // All dependencies satisfied — unblock and spawn
+      // All dependencies satisfied -- unblock and spawn
       feature.blocked = false;
       feature.blockedReason = null;
       feature.updatedAt = new Date().toISOString();
 
       console.log(
-        `[features] Dependencies satisfied for ${feature.id} — unblocking`,
+        `[features] Dependencies satisfied for ${feature.id} -- unblocking`,
       );
 
       // Run entry actions if needed (same logic as create_feature)
@@ -587,6 +629,118 @@ export class FeatureManager extends EventEmitter {
       void this.spawn_phase_agent(feature, phase_config);
       void this.persist();
     }
+  }
+
+  /**
+   * Retry spawning builders for features blocked because no pool bots were available.
+   * Called when a pool bot is released (bot:released event).
+   */
+  private retry_pool_blocked(): void {
+    const blocked = [...this.features.values()].filter(
+      (f) => f.blocked && f.blockedReason?.includes("No pool bots"),
+    );
+
+    for (const feature of blocked) {
+      const phase_config = PHASE_CONFIG[feature.phase];
+      if (!phase_config.archetype || !phase_config.model || !phase_config.prompt_template) {
+        continue;
+      }
+
+      // Clear the block before retrying
+      feature.blocked = false;
+      feature.blockedReason = null;
+      feature.updatedAt = new Date().toISOString();
+
+      console.log(`[features] Retrying pool assignment for pool-blocked feature ${feature.id}`);
+
+      // spawn_phase_agent will re-block if pool is still full
+      void this.spawn_phase_agent(feature, phase_config);
+      void this.persist();
+    }
+  }
+
+  /**
+   * Handle a pool bot's tmux session ending.
+   * Looks up the feature via pool_bot_to_feature, checks for PR, advances or alerts.
+   */
+  private async on_bot_session_ended(event: {
+    bot_id: number;
+    channel_id: string | null;
+    entity_id: string | null;
+  }): Promise<void> {
+    const feature_id = this.pool_bot_to_feature.get(event.bot_id);
+    if (!feature_id) return;
+
+    const feature = this.get_feature(feature_id);
+    if (!feature) {
+      this.pool_bot_to_feature.delete(event.bot_id);
+      return;
+    }
+
+    // Clean up pool binding
+    this.pool_bot_to_feature.delete(event.bot_id);
+    feature.poolBotId = null;
+    feature.updatedAt = new Date().toISOString();
+
+    if (feature.phase !== "build") {
+      // Not in build phase — just clean up, don't try to advance
+      void this.persist();
+      return;
+    }
+
+    const entity = this.registry.get(feature.entity);
+
+    // Check if builder created a PR on the feature branch
+    try {
+      const repo_path = entity
+        ? expand_home_safe(entity.entity.repos[0]?.path ?? ".")
+        : ".";
+      const cwd = feature.worktreePath ?? repo_path;
+
+      const pr_number = this.detect_pr_on_branch(feature.branch, cwd);
+
+      if (pr_number > 0) {
+        // PR exists — advance to review
+        feature.prNumber = pr_number;
+        console.log(`[features] Builder exited with PR #${String(pr_number)} for ${feature.id} -- advancing to review`);
+        void this.persist();
+
+        try {
+          await this.advance_feature(feature.id, "review");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[features] Failed to advance ${feature.id} to review: ${msg}`);
+        }
+        return;
+      }
+    } catch {
+      // gh command failed — treat as no PR
+    }
+
+    // No PR — alert
+    console.log(`[features] Builder exited without creating a PR for ${feature.id}`);
+    await actions.notify_feature(
+      feature,
+      `Builder exited without creating a PR for ${feature.id}`,
+      entity,
+      { also_alerts: true },
+    );
+    void this.persist();
+  }
+
+  /**
+   * Check if a PR exists on the given branch. Returns the PR number (>0) or 0.
+   * Protected so tests can override without ESM module-spy gymnastics.
+   */
+  protected detect_pr_on_branch(branch: string, cwd: string): number {
+    const pr_output = execFileSync("gh", [
+      "pr", "list",
+      "--head", branch,
+      "--json", "number",
+      "--jq", ".[0].number",
+    ], { encoding: "utf-8", cwd, timeout: 10_000 }).trim();
+
+    return parseInt(pr_output, 10) || 0;
   }
 
   // ── Queries ──
@@ -638,13 +792,20 @@ export class FeatureManager extends EventEmitter {
       return;
     }
 
+    // Route builders with work rooms through the pool for interactive sessions
+    if (phase_config.archetype === "builder" && feature.discordWorkRoom && this.pool) {
+      await this.spawn_builder_in_pool(feature, phase_config);
+      return;
+    }
+
+    // All other archetypes (reviewers, planners, designers) go through the queue
     const entity = this.registry.get(feature.entity);
     if (!entity) return;
 
     const prompt = resolve_prompt(phase_config.prompt_template, feature);
     const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repos[0]?.path ?? ".");
 
-    // Resume builder session on review→build bounce using the dedicated lastBuilderSessionId.
+    // Resume builder session on review->build bounce using the dedicated lastBuilderSessionId.
     // This is intentionally narrow — only builder bounce gets resume. All other transitions get fresh sessions.
     const is_builder_bounce = phase_config.archetype === "builder" && Boolean(feature.lastBuilderSessionId);
     const resume_id = is_builder_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
@@ -668,11 +829,11 @@ export class FeatureManager extends EventEmitter {
         // Feature is created and persisted — only the agent spawn is deferred.
         // It will auto-retry when capacity frees up via retry_queue_blocked().
         feature.blocked = true;
-        feature.blockedReason = "Queue full — will retry when capacity frees up";
+        feature.blockedReason = "Queue full -- will retry when capacity frees up";
         feature.updatedAt = new Date().toISOString();
         void this.persist();
 
-        console.log(`[features] Queue full — ${feature.id} blocked, will retry on drain`);
+        console.log(`[features] Queue full -- ${feature.id} blocked, will retry on drain`);
         this.emit("feature:blocked", feature, feature.blockedReason);
         return;
       }
@@ -686,6 +847,197 @@ export class FeatureManager extends EventEmitter {
     console.log(
       `[features] Spawned ${phase_config.archetype} for ${feature.id} (task: ${task_id.slice(0, 8)})`,
     );
+  }
+
+  /**
+   * Spawn a builder as an interactive pool bot in the feature's work room.
+   * Uses the pool for Discord MCP access so the builder can collaborate with the user.
+   */
+  private async spawn_builder_in_pool(
+    feature: FeatureState,
+    phase_config: PhaseConfig,
+  ): Promise<void> {
+    if (!this.pool || !feature.discordWorkRoom || !phase_config.prompt_template) return;
+
+    const is_bounce = feature.phase === "build" && Boolean(feature.lastBuilderSessionId);
+
+    // On review->build bounce, check if the pool bot is still assigned to this work room
+    if (is_bounce && feature.poolBotId !== null) {
+      const existing = this.pool.get_assignment(feature.discordWorkRoom);
+      if (existing && existing.id === feature.poolBotId) {
+        // Bot still alive in the work room — bridge review feedback directly
+        await this.bridge_review_feedback(feature, existing);
+        feature.activeArchetype = phase_config.archetype;
+        feature.activeDna = phase_config.dna;
+        return;
+      }
+    }
+
+    // Either fresh build or bot was evicted — do a pool assignment
+    const resume_id = is_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
+    const worktree_path = feature.worktreePath ?? undefined;
+
+    let assignment: PoolAssignment | null;
+    try {
+      assignment = await this.pool.assign(
+        feature.discordWorkRoom,
+        feature.entity,
+        "builder",
+        resume_id,
+        "work_room",
+        worktree_path,
+      );
+    } catch {
+      assignment = null;
+    }
+
+    if (!assignment) {
+      // No pool bots available — block and wait for retry
+      feature.blocked = true;
+      feature.blockedReason = "No pool bots available -- will retry when one is freed";
+      feature.updatedAt = new Date().toISOString();
+      void this.persist();
+
+      console.log(`[features] No pool bots available -- ${feature.id} blocked, will retry on release`);
+      this.emit("feature:blocked", feature, feature.blockedReason);
+      return;
+    }
+
+    // Track pool-to-feature binding
+    feature.poolBotId = assignment.bot_id;
+    this.pool_bot_to_feature.set(assignment.bot_id, feature.id);
+    feature.activeArchetype = phase_config.archetype;
+    feature.activeDna = phase_config.dna;
+
+    console.log(
+      `[features] Spawned builder for ${feature.id} in pool (bot: pool-${String(assignment.bot_id)})`,
+    );
+
+    // Bridge the build prompt to the pool bot
+    if (is_bounce && feature.prNumber) {
+      // Bounce: send review feedback
+      await this.bridge_review_feedback_to_tmux(
+        assignment.tmux_session,
+        feature,
+      );
+    } else {
+      // Fresh build: send the full build prompt
+      await this.bridge_build_prompt(
+        assignment.tmux_session,
+        feature,
+        phase_config.prompt_template,
+      );
+    }
+
+    void this.persist();
+  }
+
+  /**
+   * Bridge a build prompt to a pool bot via temp file + tmux send-keys.
+   * Same pattern as bridge_first_message() in discord.ts.
+   */
+  private async bridge_build_prompt(
+    tmux_session: string,
+    feature: FeatureState,
+    prompt_template: string,
+  ): Promise<void> {
+    const prompt = resolve_prompt(prompt_template, feature);
+    const pending_path = `/tmp/lf-build-${feature.id}.txt`;
+
+    try {
+      await writeFileAsync(pending_path, prompt, "utf-8");
+
+      // Wait for the bot to be ready
+      const start = Date.now();
+      const timeout = 30_000;
+      let ready = false;
+
+      while (Date.now() - start < timeout) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        try {
+          const output = execFileSync(
+            "tmux", ["capture-pane", "-t", tmux_session, "-p"],
+            { encoding: "utf-8", timeout: 2000 },
+          );
+          if (output.includes("Listening for channel messages") && output.includes("❯")) {
+            ready = true;
+            break;
+          }
+        } catch { /* ignore */ }
+      }
+
+      if (!ready) {
+        console.log(`[features] Bot ${tmux_session} not ready after ${String(timeout)}ms -- prompt not bridged`);
+        return;
+      }
+
+      // Small extra delay for the plugin to fully connect
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Send the prompt to the bot's tmux session
+      const instruction = `Read ${pending_path} for your build instructions and begin working.`;
+      execFileSync("tmux", ["send-keys", "-t", tmux_session, instruction, "Enter"], {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+
+      console.log(`[features] Bridged build prompt to ${tmux_session} for ${feature.id}`);
+
+      // Clean up after a delay
+      setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 60_000);
+    } catch (err) {
+      console.error(`[features] Failed to bridge build prompt: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Bridge review feedback to an existing pool bot that is still assigned to the work room.
+   * Used when a review->build bounce finds the bot still alive.
+   */
+  private async bridge_review_feedback(
+    feature: FeatureState,
+    bot: { tmux_session: string },
+  ): Promise<void> {
+    await this.bridge_review_feedback_to_tmux(bot.tmux_session, feature);
+    console.log(`[features] Bridged review feedback to existing bot for ${feature.id}`);
+  }
+
+  /**
+   * Bridge review feedback to a pool bot via tmux send-keys.
+   * Used for review->build bounce — tells the builder what to fix.
+   */
+  private async bridge_review_feedback_to_tmux(
+    tmux_session: string,
+    feature: FeatureState,
+  ): Promise<void> {
+    const pr_number = feature.prNumber;
+    if (!pr_number) return;
+
+    const feedback_path = `/tmp/lf-review-feedback-${feature.id}.txt`;
+    const feedback = (
+      `The reviewer requested changes on PR #${String(pr_number)}.\n` +
+      `Read the review comments with \`gh pr view ${String(pr_number)} --json reviews\` and make the fixes.\n` +
+      `When done, commit, push, and post in this channel that the fixes are ready.`
+    );
+
+    try {
+      await writeFileAsync(feedback_path, feedback, "utf-8");
+
+      // Give the bot a moment if it's just starting up
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const instruction = `Read ${feedback_path} for review feedback and begin fixing the issues.`;
+      execFileSync("tmux", ["send-keys", "-t", tmux_session, instruction, "Enter"], {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+
+      console.log(`[features] Bridged review feedback to ${tmux_session} for ${feature.id}`);
+
+      setTimeout(() => { void unlink(feedback_path).catch(() => {}); }, 60_000);
+    } catch (err) {
+      console.error(`[features] Failed to bridge review feedback: ${String(err)}`);
+    }
   }
 
   private async run_entry_actions(
@@ -707,12 +1059,14 @@ export class FeatureManager extends EventEmitter {
         break;
       }
       case "review": {
-        // Create PR
-        try {
-          const pr_number = await actions.create_pr(feature, entity);
-          feature.prNumber = pr_number;
-        } catch (err) {
-          console.error(`[features] Failed to create PR: ${String(err)}`);
+        // Create PR (only if not already set by the pool bot health monitor)
+        if (!feature.prNumber) {
+          try {
+            const pr_number = await actions.create_pr(feature, entity);
+            feature.prNumber = pr_number;
+          } catch (err) {
+            console.error(`[features] Failed to create PR: ${String(err)}`);
+          }
         }
         break;
       }
@@ -759,6 +1113,20 @@ export class FeatureManager extends EventEmitter {
     // Cleanup worktree
     await actions.cleanup_worktree(feature, entity);
     feature.worktreePath = null;
+
+    // Release pool bot BEFORE releasing work room
+    // so the bot slot is freed while the room still exists for final messages
+    if (this.pool && feature.discordWorkRoom) {
+      const assignment = this.pool.get_assignment(feature.discordWorkRoom);
+      if (assignment) {
+        await this.pool.release(feature.discordWorkRoom);
+      }
+    }
+    // Clean up pool binding
+    if (feature.poolBotId !== null) {
+      this.pool_bot_to_feature.delete(feature.poolBotId);
+      feature.poolBotId = null;
+    }
 
     // Send "shipped" notification BEFORE releasing work room
     // so the message arrives in the work room before it's cleaned up / reset.
