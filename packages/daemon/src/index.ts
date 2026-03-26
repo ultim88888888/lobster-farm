@@ -265,8 +265,10 @@ async function main(): Promise<void> {
       }
     }
 
-    // Stop pool bots
-    await pool.shutdown();
+    // Stop health monitor but preserve tmux sessions — `lf restart` relies
+    // on tmux bots surviving daemon restarts.  `lf stop` handles tmux cleanup
+    // from the CLI side before unloading the service.
+    pool.stop_health_monitor();
 
     // Stop Commander
     await commander.stop();

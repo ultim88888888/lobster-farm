@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { execFileSync } from "node:child_process";
 import { unload_service, is_service_loaded } from "../lib/launchd.js";
 import { read_pid_file, is_process_running } from "../lib/process.js";
 import { pid_file_path } from "@lobster-farm/shared";
@@ -10,6 +11,15 @@ export const stop_command = new Command("stop")
     if (!loaded) {
       console.log("LobsterFarm daemon is not running.");
       return;
+    }
+
+    // Kill all pool-N tmux sessions before stopping the daemon.
+    // The daemon no longer kills tmux on SIGTERM (to support hot restart),
+    // so `lf stop` is responsible for full cleanup.
+    for (let i = 0; i < 10; i++) {
+      try {
+        execFileSync("tmux", ["kill-session", "-t", `pool-${i}`], { stdio: "ignore" });
+      } catch { /* session may not exist */ }
     }
 
     // Unload the launchd service
