@@ -115,6 +115,7 @@ export interface CreateFeatureOptions {
   priority?: Priority;
   labels?: string[];
   start_phase?: Phase;
+  depends_on?: string[];
 }
 
 export class FeatureManager extends EventEmitter {
@@ -170,6 +171,34 @@ export class FeatureManager extends EventEmitter {
 
     const id = `${opts.entity_id}-${String(opts.github_issue)}`;
     const branch = `feature/${String(opts.github_issue)}-${slugify(opts.title)}`;
+    const depends_on = opts.depends_on ?? [];
+
+    // Validate dependency IDs reference existing features
+    for (const dep_id of depends_on) {
+      if (!this.features.has(dep_id)) {
+        throw new Error(`Dependency "${dep_id}" not found`);
+      }
+    }
+
+    // Check for circular dependencies before creating the feature.
+    // We temporarily build what the graph would look like with this new feature,
+    // then run DFS cycle detection.
+    if (depends_on.length > 0) {
+      const cycle = check_dependency_cycle(id, depends_on, this.features);
+      if (cycle) {
+        throw new Error(
+          `Circular dependency detected: ${cycle.join(" → ")}`,
+        );
+      }
+    }
+
+    // Determine if any dependency is not yet done
+    const pending_deps = depends_on.filter((dep_id) => {
+      const dep = this.features.get(dep_id);
+      return dep !== undefined && dep.phase !== "done";
+    });
+
+    const is_blocked_by_deps = pending_deps.length > 0;
 
     const feature: FeatureState = {
       id,
@@ -186,8 +215,11 @@ export class FeatureManager extends EventEmitter {
       sessionId: null,
       lastSessionId: null,
       lastBuilderSessionId: null,
-      blocked: false,
-      blockedReason: null,
+      dependsOn: depends_on,
+      blocked: is_blocked_by_deps,
+      blockedReason: is_blocked_by_deps
+        ? `Waiting on: ${pending_deps.join(", ")}`
+        : null,
       approved: false,
       labels: opts.labels ?? [],
       prNumber: null,
@@ -198,18 +230,23 @@ export class FeatureManager extends EventEmitter {
 
     this.features.set(id, feature);
 
-    // Run entry actions for the start phase (e.g., build creates a worktree and assigns a work room).
-    // Skipped for "plan" — plan has no entry actions in run_entry_actions.
-    if (start_phase !== "plan") {
-      await this.run_entry_actions(feature, start_phase);
+    // If blocked by dependencies, skip entry actions and agent spawn —
+    // these will happen when the last dependency reaches done.
+    if (!is_blocked_by_deps) {
+      // Run entry actions for the start phase (e.g., build creates a worktree and assigns a work room).
+      // Skipped for "plan" — plan has no entry actions in run_entry_actions.
+      if (start_phase !== "plan") {
+        await this.run_entry_actions(feature, start_phase);
+      }
+
+      // Spawn the agent for the start phase
+      const phase_config = PHASE_CONFIG[start_phase];
+      void this.spawn_phase_agent(feature, phase_config);
     }
 
-    // Spawn the agent for the start phase
-    const phase_config = PHASE_CONFIG[start_phase];
-    void this.spawn_phase_agent(feature, phase_config);
-
     console.log(
-      `[features] Created feature ${id}: "${opts.title}" (phase: ${start_phase})`,
+      `[features] Created feature ${id}: "${opts.title}" (phase: ${start_phase})` +
+        (is_blocked_by_deps ? ` [blocked: ${pending_deps.join(", ")}]` : ""),
     );
 
     // Persist after entry actions so worktreePath / discordWorkRoom are captured
@@ -316,6 +353,12 @@ export class FeatureManager extends EventEmitter {
 
     void this.persist();
     this.emit("feature:advanced", feature, old_phase);
+
+    // When a feature reaches done, check if any blocked features can be unblocked
+    if (next_phase === "done") {
+      void this.resolve_dependencies(feature_id);
+    }
+
     return feature;
   }
 
@@ -475,6 +518,47 @@ export class FeatureManager extends EventEmitter {
     feature.updatedAt = new Date().toISOString();
     void this.persist();
     return feature;
+  }
+
+  /**
+   * When a feature reaches done, scan for features blocked by dependencies
+   * and unblock any whose deps are now all done.
+   */
+  private async resolve_dependencies(completed_feature_id: string): Promise<void> {
+    for (const feature of this.features.values()) {
+      if (!feature.blocked || feature.dependsOn.length === 0) continue;
+
+      // Only consider features that actually depend on the one that just completed
+      if (!feature.dependsOn.includes(completed_feature_id)) continue;
+
+      const all_deps_done = feature.dependsOn.every((dep_id) => {
+        const dep = this.features.get(dep_id);
+        return dep !== undefined && dep.phase === "done";
+      });
+
+      if (!all_deps_done) continue;
+
+      // All dependencies satisfied — unblock and spawn
+      feature.blocked = false;
+      feature.blockedReason = null;
+      feature.updatedAt = new Date().toISOString();
+
+      console.log(
+        `[features] Dependencies satisfied for ${feature.id} — unblocking`,
+      );
+
+      // Run entry actions if needed (same logic as create_feature)
+      if (feature.phase !== "plan") {
+        await this.run_entry_actions(feature, feature.phase);
+      }
+
+      const phase_config = PHASE_CONFIG[feature.phase];
+      void this.spawn_phase_agent(feature, phase_config);
+
+      this.emit("feature:unblocked", feature);
+    }
+
+    void this.persist();
   }
 
   /**
@@ -689,6 +773,55 @@ export class FeatureManager extends EventEmitter {
     await actions.release_work_room(feature, entity);
     feature.discordWorkRoom = null;
   }
+}
+
+// ── Dependency cycle detection ──
+
+/**
+ * Check if adding a feature with the given dependencies would create a cycle.
+ * Uses DFS: starting from each dep, walk its transitive dependsOn chain.
+ * If we encounter `new_feature_id`, that's a cycle.
+ *
+ * Returns the cycle path (e.g. ["X", "Y", "Z", "X"]) if a cycle is found, or null if safe.
+ */
+export function check_dependency_cycle(
+  new_feature_id: string,
+  depends_on: string[],
+  features: ReadonlyMap<string, FeatureState>,
+): string[] | null {
+  for (const dep_id of depends_on) {
+    const visited = new Set<string>();
+    const path = [new_feature_id, dep_id];
+
+    const cycle = dfs_find_cycle(dep_id, new_feature_id, features, visited, path);
+    if (cycle) return cycle;
+  }
+  return null;
+}
+
+function dfs_find_cycle(
+  current: string,
+  target: string,
+  features: ReadonlyMap<string, FeatureState>,
+  visited: Set<string>,
+  path: string[],
+): string[] | null {
+  if (current === target) return [...path];
+  if (visited.has(current)) return null;
+
+  visited.add(current);
+
+  const feature = features.get(current);
+  if (!feature) return null;
+
+  for (const dep_id of feature.dependsOn) {
+    path.push(dep_id);
+    const cycle = dfs_find_cycle(dep_id, target, features, visited, path);
+    if (cycle) return cycle;
+    path.pop();
+  }
+
+  return null;
 }
 
 function slugify(text: string): string {

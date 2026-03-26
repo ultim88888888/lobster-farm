@@ -18,6 +18,7 @@ export const FeatureStateSchema = z.object({
   sessionId: z.string().nullable().default(null),
   lastSessionId: z.string().nullable().default(null),
   lastBuilderSessionId: z.string().nullable().default(null),
+  dependsOn: z.array(z.string()).default([]),
   blocked: z.boolean().default(false),
   blockedReason: z.string().nullable().default(null),
   approved: z.boolean().default(false),

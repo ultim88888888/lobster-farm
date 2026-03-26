@@ -433,4 +433,197 @@ describe("FeatureManager", () => {
       expect(unblocked.blockedReason).toBeNull();
     });
   });
+
+  describe("feature dependencies", () => {
+    it("blocks a feature when a dependency is not done", async () => {
+      // Create the dependency feature first (in plan phase, not done)
+      await fm.create_feature({ entity_id: "alpha", title: "Parent feature", github_issue: 20 });
+
+      // Create a dependent feature
+      const feature = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Child feature",
+        github_issue: 21,
+        depends_on: ["alpha-20"],
+      });
+
+      expect(feature.blocked).toBe(true);
+      expect(feature.blockedReason).toBe("Waiting on: alpha-20");
+      expect(feature.dependsOn).toEqual(["alpha-20"]);
+      // Should not have spawned an agent
+      expect(feature.activeArchetype).toBeNull();
+    });
+
+    it("proceeds normally when all dependencies are done", async () => {
+      // Create a dependency and mark it done
+      await fm.create_feature({ entity_id: "alpha", title: "Done feature", github_issue: 22 });
+      const dep = fm.get_feature("alpha-22")!;
+      dep.phase = "done";
+
+      const feature = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Dependent feature",
+        github_issue: 23,
+        depends_on: ["alpha-22"],
+      });
+
+      expect(feature.blocked).toBe(false);
+      expect(feature.blockedReason).toBeNull();
+      expect(feature.dependsOn).toEqual(["alpha-22"]);
+      // Agent should have been spawned
+      expect(feature.activeArchetype).toBe("planner");
+    });
+
+    it("proceeds normally with no dependencies", async () => {
+      const feature = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Independent feature",
+        github_issue: 24,
+      });
+
+      expect(feature.blocked).toBe(false);
+      expect(feature.dependsOn).toEqual([]);
+    });
+
+    it("rejects invalid dependency IDs", async () => {
+      await expect(
+        fm.create_feature({
+          entity_id: "alpha",
+          title: "Bad dep",
+          github_issue: 25,
+          depends_on: ["nonexistent-99"],
+        }),
+      ).rejects.toThrow('Dependency "nonexistent-99" not found');
+    });
+
+    it("rejects circular dependencies", async () => {
+      // Create A depending on nothing
+      await fm.create_feature({ entity_id: "alpha", title: "Feature A", github_issue: 30 });
+      const a = fm.get_feature("alpha-30")!;
+      a.dependsOn = ["alpha-31"]; // will point to B
+
+      // Create B — but B depends on A, and A depends on B → cycle
+      // A depends on B and B depends on A
+      await expect(
+        fm.create_feature({
+          entity_id: "alpha",
+          title: "Feature B",
+          github_issue: 31,
+          depends_on: ["alpha-30"],
+        }),
+      ).rejects.toThrow("Circular dependency detected");
+    });
+
+    it("blocks feature when only some dependencies are done", async () => {
+      // Two deps: one done, one not done
+      await fm.create_feature({ entity_id: "alpha", title: "Dep A", github_issue: 40 });
+      const depA = fm.get_feature("alpha-40")!;
+      depA.phase = "done";
+
+      await fm.create_feature({ entity_id: "alpha", title: "Dep B", github_issue: 41 });
+      // alpha-41 is in plan phase (not done)
+
+      const feature = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Multi-dep feature",
+        github_issue: 42,
+        depends_on: ["alpha-40", "alpha-41"],
+      });
+
+      expect(feature.blocked).toBe(true);
+      // Only the pending dep should be in the blocked reason
+      expect(feature.blockedReason).toBe("Waiting on: alpha-41");
+    });
+
+    it("auto-unblocks dependents when dependency reaches done", async () => {
+      const mock_claude = join(tmp, "mock-claude-deps");
+      await writeFile(mock_claude, "#!/bin/bash\nsleep 10\n", "utf-8");
+      await chmod(mock_claude, 0o755);
+      process.env["CLAUDE_BIN"] = mock_claude;
+
+      // Create parent feature in plan phase
+      await fm.create_feature({ entity_id: "alpha", title: "Parent", github_issue: 50 });
+
+      // Create child blocked on parent
+      const child = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Child",
+        github_issue: 51,
+        depends_on: ["alpha-50"],
+      });
+
+      expect(child.blocked).toBe(true);
+
+      // Simulate parent completing all phases to reach done.
+      // We'll directly manipulate state and call advance_feature to done.
+      const parent = fm.get_feature("alpha-50")!;
+      parent.approved = true;  // approve plan gate
+      parent.phase = "ship";   // jump to ship (which auto-advances to done)
+      parent.approved = false;
+
+      // advance from ship → done triggers resolve_dependencies
+      await fm.advance_feature("alpha-50", "done");
+
+      // Child should be unblocked now
+      const updated_child = fm.get_feature("alpha-51")!;
+      expect(updated_child.blocked).toBe(false);
+      expect(updated_child.blockedReason).toBeNull();
+
+      await session_manager.kill_all();
+    });
+
+    it("multiple features blocked on same parent all unblock", async () => {
+      const mock_claude = join(tmp, "mock-claude-multi");
+      await writeFile(mock_claude, "#!/bin/bash\nsleep 10\n", "utf-8");
+      await chmod(mock_claude, 0o755);
+      process.env["CLAUDE_BIN"] = mock_claude;
+
+      // Create parent
+      await fm.create_feature({ entity_id: "alpha", title: "Shared parent", github_issue: 60 });
+
+      // Create two children blocked on the same parent
+      await fm.create_feature({
+        entity_id: "alpha",
+        title: "Child A",
+        github_issue: 61,
+        depends_on: ["alpha-60"],
+      });
+      await fm.create_feature({
+        entity_id: "alpha",
+        title: "Child B",
+        github_issue: 62,
+        depends_on: ["alpha-60"],
+      });
+
+      expect(fm.get_feature("alpha-61")!.blocked).toBe(true);
+      expect(fm.get_feature("alpha-62")!.blocked).toBe(true);
+
+      // Complete the parent
+      const parent = fm.get_feature("alpha-60")!;
+      parent.phase = "ship";
+      await fm.advance_feature("alpha-60", "done");
+
+      // Both children should be unblocked
+      expect(fm.get_feature("alpha-61")!.blocked).toBe(false);
+      expect(fm.get_feature("alpha-62")!.blocked).toBe(false);
+
+      await session_manager.kill_all();
+    });
+
+    it("dependsOn is persisted on the feature", async () => {
+      await fm.create_feature({ entity_id: "alpha", title: "Has deps", github_issue: 70 });
+      const dep = fm.get_feature("alpha-70")!;
+      dep.phase = "done";
+
+      await fm.create_feature({
+        entity_id: "alpha",
+        title: "With deps",
+        github_issue: 71,
+        depends_on: ["alpha-70"],
+      });
+
+      const feature = fm.get_feature("alpha-71")!;
+      expect(feature.dependsOn).toEqual(["alpha-70"]);
+    });
+  });
 });
