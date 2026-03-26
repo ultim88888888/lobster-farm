@@ -1,7 +1,7 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, appendFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { FeatureState, LobsterFarmConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
-import { lobsterfarm_dir } from "@lobster-farm/shared";
+import type { FeatureState, LobsterFarmConfig, ArchetypeRole, ChannelType, Phase } from "@lobster-farm/shared";
+import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 
 const STATE_DIR = "state";
 const FEATURES_FILE = "features.json";
@@ -122,4 +122,83 @@ export async function load_pool_state(
   } catch {
     return [];
   }
+}
+
+// ── Session Log ──
+
+const SESSION_LOG_FILE = "session-log.jsonl";
+
+export interface SessionLogEntry {
+  session_id: string;
+  entity_id: string;
+  feature_id: string | null;
+  archetype: ArchetypeRole;
+  phase: Phase | null;
+  source: "queue" | "pool";
+  started_at: string;           // ISO timestamp
+  ended_at: string | null;      // ISO timestamp, null if still running
+  exit_code: number | null;     // null if still running
+  duration_ms: number | null;   // computed from start/end
+  bot_id: number | null;        // pool bot ID if pool-sourced
+  resume: boolean;              // was this a resumed session?
+}
+
+function session_log_path(config: LobsterFarmConfig, entity_id: string): string {
+  return join(entity_dir(config.paths, entity_id), SESSION_LOG_FILE);
+}
+
+/**
+ * Append a session log entry to the entity's JSONL log file.
+ * Creates the file and parent directories if they don't exist.
+ */
+export async function append_session_log(
+  entity_id: string,
+  entry: SessionLogEntry,
+  config: LobsterFarmConfig,
+): Promise<void> {
+  const path = session_log_path(config, entity_id);
+  await mkdir(dirname(path), { recursive: true });
+  await appendFile(path, JSON.stringify(entry) + "\n", "utf-8");
+}
+
+/**
+ * Read session log entries for an entity.
+ * Skips malformed lines gracefully. Supports optional `since` date filter and `limit`.
+ */
+export async function read_session_log(
+  entity_id: string,
+  config: LobsterFarmConfig,
+  opts?: { since?: Date; limit?: number },
+): Promise<SessionLogEntry[]> {
+  const path = session_log_path(config, entity_id);
+  let content: string;
+  try {
+    content = await readFile(path, "utf-8");
+  } catch {
+    return [];
+  }
+
+  const lines = content.split("\n").filter(Boolean);
+  const entries: SessionLogEntry[] = [];
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line) as SessionLogEntry;
+
+      if (opts?.since) {
+        const entry_time = entry.ended_at ?? entry.started_at;
+        if (new Date(entry_time) < opts.since) continue;
+      }
+
+      entries.push(entry);
+    } catch {
+      // Skip malformed lines -- append-only log may have partial writes
+    }
+  }
+
+  if (opts?.limit && entries.length > opts.limit) {
+    return entries.slice(-opts.limit);
+  }
+
+  return entries;
 }

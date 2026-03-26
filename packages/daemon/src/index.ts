@@ -2,6 +2,7 @@ import type { Server } from "node:http";
 import { load_config } from "./config.js";
 import { EntityRegistry } from "./registry.js";
 import { ClaudeSessionManager } from "./session.js";
+import type { ActiveSession, SessionResult } from "./session.js";
 import { TaskQueue } from "./queue.js";
 import { FeatureManager } from "./features.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
@@ -12,6 +13,7 @@ import { CommanderProcess } from "./commander-process.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
+import { append_session_log } from "./persistence.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -41,15 +43,103 @@ async function main(): Promise<void> {
   await feature_manager.load_persisted();
   set_feature_manager(feature_manager);
 
-  // Wire up session events to feature manager
-  session_manager.on("session:started", (session) => {
+  // Wire up session events to feature manager + session history logging.
+  // Track session metadata at start so completion/failure handlers have full context
+  // even after the feature manager cleans up its session-to-feature mapping.
+  interface QueueSessionMeta {
+    start_ms: number;
+    entity_id: string;
+    feature_id: string;
+    archetype: ActiveSession["archetype"];
+    phase: string | null;
+    started_at: string;
+  }
+  const queue_session_meta = new Map<string, QueueSessionMeta>();
+
+  session_manager.on("session:started", (session: ActiveSession) => {
     feature_manager.on_session_started(session);
+
+    // Capture metadata for completion/failure logging
+    const feature = feature_manager.get_feature(session.feature_id);
+    const meta: QueueSessionMeta = {
+      start_ms: Date.now(),
+      entity_id: session.entity_id,
+      feature_id: session.feature_id,
+      archetype: session.archetype,
+      phase: feature?.phase ?? null,
+      started_at: session.started_at.toISOString(),
+    };
+    queue_session_meta.set(session.session_id, meta);
+
+    // Log session start
+    void append_session_log(session.entity_id, {
+      session_id: session.session_id,
+      entity_id: session.entity_id,
+      feature_id: session.feature_id,
+      archetype: session.archetype,
+      phase: meta.phase,
+      source: "queue",
+      started_at: meta.started_at,
+      ended_at: null,
+      exit_code: null,
+      duration_ms: null,
+      bot_id: null,
+      resume: false,
+    }, config);
   });
-  session_manager.on("session:completed", (result) => {
+
+  session_manager.on("session:completed", (result: SessionResult) => {
+    // Look up metadata before feature manager cleans up
+    const meta = queue_session_meta.get(result.session_id);
+    queue_session_meta.delete(result.session_id);
+
     void feature_manager.on_session_completed(result);
+
+    // Log session completion
+    if (meta) {
+      const now = new Date().toISOString();
+      void append_session_log(meta.entity_id, {
+        session_id: result.session_id,
+        entity_id: meta.entity_id,
+        feature_id: meta.feature_id,
+        archetype: meta.archetype,
+        phase: meta.phase,
+        source: "queue",
+        started_at: meta.started_at,
+        ended_at: now,
+        exit_code: result.exit_code,
+        duration_ms: Date.now() - meta.start_ms,
+        bot_id: null,
+        resume: false,
+      }, config);
+    }
   });
+
   session_manager.on("session:failed", (session_id: string, error: string) => {
+    // Look up metadata before feature manager cleans up
+    const meta = queue_session_meta.get(session_id);
+    queue_session_meta.delete(session_id);
+
     feature_manager.on_session_failed(session_id, error);
+
+    // Log session failure
+    if (meta) {
+      const now = new Date().toISOString();
+      void append_session_log(meta.entity_id, {
+        session_id,
+        entity_id: meta.entity_id,
+        feature_id: meta.feature_id,
+        archetype: meta.archetype,
+        phase: meta.phase,
+        source: "queue",
+        started_at: meta.started_at,
+        ended_at: now,
+        exit_code: 1,
+        duration_ms: Date.now() - meta.start_ms,
+        bot_id: null,
+        resume: false,
+      }, config);
+    }
   });
 
   console.log(

@@ -16,7 +16,7 @@ import type { TaskQueue } from "./queue.js";
 import type { BotPool, PoolAssignment } from "./pool.js";
 import type { SessionResult } from "./session.js";
 import * as actions from "./actions.js";
-import { save_features, load_features } from "./persistence.js";
+import { save_features, load_features, append_session_log } from "./persistence.js";
 import { extract_session_learnings } from "./hooks.js";
 
 // ── Phase configuration ──
@@ -136,6 +136,9 @@ export class FeatureManager extends EventEmitter {
 
   /** Maps pool bot ID → feature ID for pool-based builder sessions. */
   private pool_bot_to_feature = new Map<number, string>();
+
+  /** Maps pool bot ID → session start timestamp (ms) for duration tracking. */
+  private pool_bot_start_times = new Map<number, number>();
 
   /** Optional pool reference — set via set_pool() after construction. */
   private pool: BotPool | null = null;
@@ -677,6 +680,25 @@ export class FeatureManager extends EventEmitter {
       return;
     }
 
+    // Log pool session completion
+    const start_ms = this.pool_bot_start_times.get(event.bot_id);
+    this.pool_bot_start_times.delete(event.bot_id);
+    const now = new Date();
+    void append_session_log(feature.entity, {
+      session_id: `pool-${String(event.bot_id)}-ended-${now.getTime()}`,
+      entity_id: feature.entity,
+      feature_id: feature.id,
+      archetype: feature.activeArchetype ?? "builder",
+      phase: feature.phase,
+      source: "pool",
+      started_at: start_ms ? new Date(start_ms).toISOString() : now.toISOString(),
+      ended_at: now.toISOString(),
+      exit_code: 0,  // tmux session ended -- treat as normal exit
+      duration_ms: start_ms ? now.getTime() - start_ms : null,
+      bot_id: event.bot_id,
+      resume: false,
+    }, this.config);
+
     // Clean up pool binding
     this.pool_bot_to_feature.delete(event.bot_id);
     feature.poolBotId = null;
@@ -909,12 +931,29 @@ export class FeatureManager extends EventEmitter {
     // Track pool-to-feature binding
     feature.poolBotId = assignment.bot_id;
     this.pool_bot_to_feature.set(assignment.bot_id, feature.id);
+    this.pool_bot_start_times.set(assignment.bot_id, Date.now());
     feature.activeArchetype = phase_config.archetype;
     feature.activeDna = phase_config.dna;
 
     console.log(
       `[features] Spawned builder for ${feature.id} in pool (bot: pool-${String(assignment.bot_id)})`,
     );
+
+    // Log pool session start
+    void append_session_log(feature.entity, {
+      session_id: assignment.session_id ?? `pool-${String(assignment.bot_id)}-${Date.now()}`,
+      entity_id: feature.entity,
+      feature_id: feature.id,
+      archetype: "builder",
+      phase: feature.phase,
+      source: "pool",
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      exit_code: null,
+      duration_ms: null,
+      bot_id: assignment.bot_id,
+      resume: Boolean(resume_id),
+    }, this.config);
 
     // Bridge the build prompt to the pool bot
     if (is_bounce && feature.prNumber) {
