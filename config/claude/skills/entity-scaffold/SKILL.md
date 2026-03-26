@@ -73,10 +73,11 @@ entity:
   status: active
   blueprint: {blueprint}
 
-  repo:
-    url: {repo_url}        # GitHub URL or empty string for none
-    path: {local_path}     # Local path to repo
-    structure: monorepo    # or polyrepo
+  repos:                     # Optional — omit for non-code entities
+    - name: {repo_name}
+      url: {repo_url}
+      path: {local_path}
+      structure: monorepo  # or polyrepo
 
   accounts:
     github:

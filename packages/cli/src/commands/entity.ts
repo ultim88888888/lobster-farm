@@ -216,11 +216,12 @@ entity_command
         description: description || "",
         status: "active",
         blueprint: "software",
-        repo: {
+        repos: [{
+          name: entity_id,
           url: repo_url,
           path: repo_path,
           structure: "monorepo",
-        },
+        }],
         accounts: {
           ...(github_org ? { github: { org: github_org } } : {}),
         },

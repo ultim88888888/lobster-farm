@@ -32,11 +32,12 @@ export const EntityConfigSchema = z.object({
     // channel structure, model defaults. Entity config only needs overrides.
     blueprint: z.string().optional(),
 
-    repo: z.object({
+    repos: z.array(z.object({
+      name: z.string(),
       url: z.string(),
       path: z.string(),
       structure: RepoStructureSchema.default("monorepo"),
-    }),
+    })).default([]),
 
     accounts: z.object({
       github: z.object({

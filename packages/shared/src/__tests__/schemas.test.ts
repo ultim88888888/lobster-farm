@@ -81,10 +81,6 @@ describe("EntityConfigSchema", () => {
     entity: {
       id: "alpha",
       name: "Trading Platform",
-      repo: {
-        url: "git@github.com:org/alpha.git",
-        path: "/repos/alpha",
-      },
       memory: {
         path: "~/.lobsterfarm/entities/alpha",
       },
@@ -98,10 +94,27 @@ describe("EntityConfigSchema", () => {
     const config = EntityConfigSchema.parse(MINIMAL_ENTITY);
     expect(config.entity.id).toBe("alpha");
     expect(config.entity.status).toBe("active");
-    expect(config.entity.repo.structure).toBe("monorepo");
+    expect(config.entity.repos).toEqual([]);
     expect(config.entity.channels.category_id).toBe("");
     expect(config.entity.channels.list).toEqual([]);
     expect(config.entity.secrets.vault).toBe("1password");
+  });
+
+  it("accepts repos array", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        repos: [
+          { name: "alpha", url: "git@github.com:org/alpha.git", path: "/repos/alpha" },
+          { name: "alpha-dashboard", url: "git@github.com:org/alpha-dashboard.git", path: "/repos/alpha-dashboard" },
+        ],
+      },
+    });
+    expect(config.entity.repos).toHaveLength(2);
+    expect(config.entity.repos[0]!.name).toBe("alpha");
+    expect(config.entity.repos[0]!.structure).toBe("monorepo");
+    expect(config.entity.repos[1]!.name).toBe("alpha-dashboard");
   });
 
   it("accepts channels with category and list", () => {

@@ -28,7 +28,7 @@ export async function create_worktree(
   feature: FeatureState,
   entity_config: EntityConfig,
 ): Promise<string> {
-  const repo_path = expand_home(entity_config.entity.repo.path);
+  const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
   const worktree_path = `${repo_path}/worktrees/${feature.branch.replace("feature/", "")}`;
 
   try {
@@ -63,7 +63,7 @@ export async function cleanup_worktree(
 ): Promise<void> {
   if (!feature.worktreePath) return;
 
-  const repo_path = expand_home(entity_config.entity.repo.path);
+  const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
 
   try {
     await run("git", ["worktree", "remove", feature.worktreePath, "--force"], repo_path);
@@ -87,7 +87,7 @@ export async function create_pr(
   feature: FeatureState,
   entity_config: EntityConfig,
 ): Promise<number> {
-  const repo_path = expand_home(entity_config.entity.repo.path);
+  const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
   const cwd = feature.worktreePath ?? repo_path;
 
   const output = await run("gh", [

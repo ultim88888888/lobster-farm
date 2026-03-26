@@ -48,11 +48,12 @@ function valid_entity_yaml(id: string, name: string, status: "active" | "paused"
       name,
       description: `Test entity ${name}`,
       status,
-      repo: {
+      repos: [{
+        name: id,
         url: `https://github.com/test/${id}`,
         path: `/tmp/projects/${id}`,
         structure: "monorepo",
-      },
+      }],
       memory: {
         path: `~/.lobsterfarm/entities/${id}/MEMORY.md`,
         auto_extract: true,

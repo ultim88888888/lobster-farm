@@ -47,11 +47,12 @@ function make_entity_config(repo_path: string): EntityConfig {
       name: "Test Entity",
       description: "A test entity",
       status: "active",
-      repo: {
+      repos: [{
+        name: "test-entity",
         url: "https://github.com/test/test-entity",
         path: repo_path,
         structure: "monorepo",
-      },
+      }],
       accounts: {},
       channels: {
         category_id: "",

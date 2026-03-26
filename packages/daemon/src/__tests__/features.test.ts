@@ -22,7 +22,7 @@ function make_entity_config(tmp: string): EntityConfig {
     entity: {
       id: "alpha",
       name: "Alpha Project",
-      repo: { url: "git@github.com:test/alpha.git", path: tmp },
+      repos: [{ name: "alpha", url: "git@github.com:test/alpha.git", path: tmp }],
       memory: { path: `${tmp}/.memory` },
       secrets: { vault_name: "entity-alpha" },
     },

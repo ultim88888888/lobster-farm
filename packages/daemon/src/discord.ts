@@ -322,7 +322,7 @@ export class DiscordBot extends EventEmitter {
 
     try {
       // Create entity category
-      const category_name = `${entity_name} [${entity_id}]`;
+      const category_name = entity_name;
       let category = guild.channels.cache.find(
         (c) => c.name === category_name && c.type === DiscordChannelType.GuildCategory,
       ) as CategoryChannel | undefined;
@@ -790,11 +790,12 @@ export class DiscordBot extends EventEmitter {
           description: "",
           status: "active",
           blueprint: "software",
-          repo: {
+          repos: [{
+            name: entity_id,
             url: repo_url || `git@github.com:org/${entity_id}.git`,
             path: `~/.lobsterfarm/entities/${entity_id}/repos/${entity_id}`,
             structure: "monorepo",
-          },
+          }],
           accounts: {},
           channels: {
             category_id,

@@ -418,7 +418,7 @@ export class FeatureManager extends EventEmitter {
     if (!entity) return;
 
     const prompt = resolve_prompt(phase_config.prompt_template, feature);
-    const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repo.path);
+    const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repos[0]?.path ?? ".");
 
     // Resume prior session if same archetype is being re-spawned for this feature
     // (e.g., builder picks up where it left off after being unblocked)

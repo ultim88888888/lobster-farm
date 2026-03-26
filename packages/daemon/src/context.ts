@@ -57,7 +57,7 @@ export async function compile_context(options: {
   const daily_log_paths = [today_log, yesterday_log];
 
   // Read project CLAUDE.md from repo root
-  const repo_path = expand_home(entity_config.entity.repo.path);
+  const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
   const claude_md_file = join(repo_path, "CLAUDE.md");
   let claude_md_content: string;
   try {

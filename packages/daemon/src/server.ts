@@ -164,7 +164,7 @@ const handle_submit_task: RouteHandler = async (req, res, ctx) => {
   if (!submission.worktree_path) {
     const entity = ctx.registry.get(submission.entity_id);
     if (entity) {
-      submission.worktree_path = entity.entity.repo.path;
+      submission.worktree_path = entity.entity.repos[0]?.path;
     } else {
       json_response(res, 404, {
         error: `Entity "${submission.entity_id}" not found`,
