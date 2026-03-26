@@ -119,6 +119,27 @@ async function main(): Promise<void> {
     // Stop PR cron
     pr_cron.stop();
 
+    // Check for active work before killing pool bots
+    const work_check = pool.has_active_work();
+    if (work_check.active) {
+      console.log(`[shutdown] ${String(work_check.working_bots.length)} agent(s) actively working:`);
+      for (const bot of work_check.working_bots) {
+        console.log(`  pool-${String(bot.id)} (${bot.archetype})`);
+      }
+      console.log("[shutdown] Waiting up to 60s for active work to complete...");
+
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        const recheck = pool.has_active_work();
+        if (!recheck.active) {
+          console.log("[shutdown] All agents idle. Proceeding.");
+          break;
+        }
+        console.log(`[shutdown] ${String(recheck.working_bots.length)} still working... (${String(Math.round((deadline - Date.now()) / 1000))}s remaining)`);
+      }
+    }
+
     // Stop pool bots
     await pool.shutdown();
 

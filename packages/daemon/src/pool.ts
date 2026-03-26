@@ -306,6 +306,38 @@ export class BotPool {
     };
   }
 
+  /** Check if any pool bots are actively working (not idle at prompt). */
+  has_active_work(): { active: boolean; working_bots: Array<{ id: number; archetype: string; channel_id: string }> } {
+    const working: Array<{ id: number; archetype: string; channel_id: string }> = [];
+
+    for (const bot of this.bots) {
+      if (bot.state !== "assigned") continue;
+
+      try {
+        const output = execFileSync(
+          "tmux", ["capture-pane", "-t", bot.tmux_session, "-p"],
+          { encoding: "utf-8", timeout: 2000 },
+        );
+        // If the pane shows a spinner/working indicator (no ❯ prompt at the end),
+        // the bot is actively processing
+        const lines = output.trim().split("\n");
+        const last_line = lines[lines.length - 1] ?? "";
+        const is_idle = last_line.includes("❯") || last_line.includes("bypass permissions");
+        if (!is_idle) {
+          working.push({
+            id: bot.id,
+            archetype: bot.archetype ?? "unknown",
+            channel_id: bot.channel_id ?? "",
+          });
+        }
+      } catch {
+        // Can't check — assume not working
+      }
+    }
+
+    return { active: working.length > 0, working_bots: working };
+  }
+
   /** Update last_active timestamp for a channel's bot. */
   touch(channel_id: string): void {
     const bot = this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
