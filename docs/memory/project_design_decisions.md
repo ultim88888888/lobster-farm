@@ -35,26 +35,35 @@ Four layers, hardest to softest:
 
 ## Discord Agent Architecture
 
-**One Discord bot per archetype, not per channel or per session.** Each archetype (Gary, Bob, Pearl, Ray, Pat) has its own Discord bot application with its own token. The daemon manages which channels each bot is active in via `allowed_channels` in `access.json`. Only one agent is active per work room at a time — the daemon cycles them on phase transitions.
+**Dynamic bot pool, not one bot per archetype.** Discord bots are generic pool slots (LF Agent 1-10) managed by the daemon. Each bot gets assigned to one channel at a time with a specific archetype. The daemon manages the pool — assigns bots, scopes them to channels, cycles them on phase transitions.
 
-**Agent bots:** Pat (#command-center), Gary (#general + active planning rooms), Bob (active build rooms), Pearl (active design rooms), Ray (active infra rooms). Reviewer is ephemeral/headless — no bot needed.
+**Dedicated bots:** Pat (#command-center) and the daemon bot (infrastructure) are permanent. All other agent sessions use pool bots.
 
-**Daemon bot is separate** — handles infrastructure only (scaffolding, webhooks, status). Does not handle conversations.
+**One bot = one session = one channel.** Each pool bot runs as its own Claude Code session via the native Discord channel plugin. Separate context windows, no cross-contamination, no latency. Channel scoping uses the `groups` field in `access.json` which accepts **channel IDs** (not server IDs) to restrict which channel the bot listens to.
 
-**Sessions are persistent, not headless.** Each agent runs as a persistent Claude Code session with the Discord channel plugin (`--channels plugin:discord`). No `-p` headless sessions for conversational work. Agents can ask questions, users can interject mid-work. The daemon manages session lifecycle (start, stop, cycle on phase transition).
+**LRU pool management.** When all pool bots are assigned and a new channel needs one:
+1. Find the least recently active bot
+2. Park its session (kill tmux, preserve session ID for later `--resume`)
+3. Reassign the bot to the new channel with updated `access.json`
+4. When the parked channel gets a message later, grab an inactive bot and resume the parked session
 
-**One agent can handle multiple channels** in a single session (messages are tagged with channel context). Shared context within an entity is a feature — cross-pollination between #general and work room conversations helps.
+This means pool size is a soft limit. Sessions are preserved on disk — parking and resuming is transparent. The only cost is a few seconds of startup when resuming a parked session.
 
-**Why:** Headless sessions introduce latency (startup per message) and prevent real-time collaboration. The user is a collaborator, not just an approver. Agents should surface discoveries and ask questions naturally, not pause/resume.
+**Max capacity escalation.** If all bots are actively in use and a new channel needs one, Pat alerts the user: "All agent slots active. Create another bot or queue this?"
+
+**Phase transitions.** When a work room transitions (e.g., plan → build): kill the planner's pool bot session, reassign a pool bot with the builder archetype for that channel. The planner session was idle (you just approved), so no work is interrupted. The builder starts fresh or resumes a prior session.
+
+**Why:** Headless sessions introduce latency and prevent real-time collaboration. The user is a collaborator, not just an approver. Agents should surface discoveries and ask questions naturally. Dynamic pooling keeps resource usage proportional to actual concurrency, not total channels.
 
 ## Channel Ownership
 
-**#general** — Gary (planner) owns this channel. Discovery, brainstorming, "what should we build." Features spin out of conversations here into work rooms. Gary is the entity-level project manager.
+**#general** — Gary (planner) owns this channel. Discovery, brainstorming, "what should we build." Features spin out of conversations here into work rooms. Gary is the entity-level project manager. Gets a dedicated pool bot (persistent, rarely parked).
 
 **#work-room-N** — one feature per room, one active agent at a time. Phase determines which agent. Room has a pinned status message updated by the daemon:
 - `🟢 Available`
 - `🔵 Secret Scanning Hook — Plan`
 - `🟡 Secret Scanning Hook — Build`
+Pool bots are assigned/released as features enter/leave rooms.
 
 **#alerts** — notification inbox. Errors, cross-room pings, entity-level notifications. Not for conversation — go to the work room for that.
 

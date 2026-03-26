@@ -448,24 +448,31 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    const routed: RoutedMessage = {
-      entity_id: entry.entity_id,
-      channel_type: entry.channel_type,
-      content: message.content,
-      author: message.author.tag,
-      channel_id: message.channelId,
-      assigned_feature: entry.assigned_feature,
-    };
+    // In entity channels, daemon only handles !lf commands.
+    // Conversational messages are handled by archetype bots (Gary, Bob, etc.)
+    if (message.content.trim().startsWith("!lf")) {
+      const routed: RoutedMessage = {
+        entity_id: entry.entity_id,
+        channel_type: entry.channel_type,
+        content: message.content,
+        author: message.author.tag,
+        channel_id: message.channelId,
+        assigned_feature: entry.assigned_feature,
+      };
 
-    const action = route_message(routed);
-
-    try {
-      await this.execute_action(action, routed, message);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[discord] Error handling message: ${msg}`);
-      await this.reply(message, `Error: ${msg}`);
+      const { parse_command } = await import("./router.js");
+      const cmd = parse_command(message.content);
+      if (cmd) {
+        try {
+          await this.handle_command(cmd.name, cmd.args, routed, message);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.reply(message, `Error: ${msg}`);
+        }
+      }
     }
+    // Non-command messages in entity channels are ignored by the daemon.
+    // Archetype bots handle conversational interaction.
   }
 
   private async execute_action(
