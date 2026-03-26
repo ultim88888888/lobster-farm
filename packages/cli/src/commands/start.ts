@@ -21,9 +21,9 @@ import { read_pid_file, is_process_running } from "../lib/process.js";
 
 /** Resolve the daemon entry point. */
 function resolve_daemon_path(): string {
-  // Primary: look in ~/.lobsterfarm/src (standard install location)
+  // Primary: look in the entity-zero repo location
   const home = homedir();
-  const standard = join(home, ".lobsterfarm", "src", "packages", "daemon", "dist", "index.js");
+  const standard = join(home, ".lobsterfarm", "entities", "lobster-farm", "repos", "lobster-farm", "packages", "daemon", "dist", "index.js");
   try {
     require.resolve(standard);
     return standard;
