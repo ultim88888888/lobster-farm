@@ -27,6 +27,7 @@ function make_feature(overrides: Partial<FeatureState> = {}): FeatureState {
     sessionId: null,
     lastSessionId: null,
     lastBuilderSessionId: null,
+    dependsOn: [],
     blocked: false,
     blockedReason: null,
     approved: false,

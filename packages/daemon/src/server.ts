@@ -248,6 +248,16 @@ const handle_create_feature: RouteHandler = async (req, res, ctx) => {
     return;
   }
 
+  // Validate depends_on is an array of strings if provided
+  if (opts.depends_on !== undefined) {
+    if (!Array.isArray(opts.depends_on) || !opts.depends_on.every((d) => typeof d === "string")) {
+      json_response(res, 400, {
+        error: "depends_on must be an array of feature ID strings",
+      });
+      return;
+    }
+  }
+
   try {
     const feature = await ctx.features.create_feature(opts);
     json_response(res, 201, feature);
