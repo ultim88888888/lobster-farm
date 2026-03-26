@@ -859,10 +859,12 @@ export class FeatureManager extends EventEmitter {
   ): Promise<void> {
     if (!this.pool || !feature.discordWorkRoom || !phase_config.prompt_template) return;
 
-    const is_bounce = feature.phase === "build" && Boolean(feature.lastBuilderSessionId);
+    // Pool-based builders don't go through the queue, so lastBuilderSessionId is never set for them.
+    // Use poolBotId as the bounce signal: if a bot was previously assigned, this is a review->build bounce.
+    const is_bounce = feature.phase === "build" && feature.poolBotId !== null;
 
     // On review->build bounce, check if the pool bot is still assigned to this work room
-    if (is_bounce && feature.poolBotId !== null) {
+    if (is_bounce) {
       const existing = this.pool.get_assignment(feature.discordWorkRoom);
       if (existing && existing.id === feature.poolBotId) {
         // Bot still alive in the work room — bridge review feedback directly
@@ -874,7 +876,8 @@ export class FeatureManager extends EventEmitter {
     }
 
     // Either fresh build or bot was evicted — do a pool assignment
-    const resume_id = is_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
+    // Pool bots don't have queue-tracked session IDs, so no resume_id is available.
+    const resume_id = undefined;
     const worktree_path = feature.worktreePath ?? undefined;
 
     let assignment: PoolAssignment | null;
@@ -1023,7 +1026,31 @@ export class FeatureManager extends EventEmitter {
     try {
       await writeFileAsync(feedback_path, feedback, "utf-8");
 
-      // Give the bot a moment if it's just starting up
+      // Poll for the bot to be ready (same pattern as bridge_build_prompt)
+      const start = Date.now();
+      const timeout = 30_000;
+      let ready = false;
+
+      while (Date.now() - start < timeout) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        try {
+          const output = execFileSync(
+            "tmux", ["capture-pane", "-t", tmux_session, "-p"],
+            { encoding: "utf-8", timeout: 2000 },
+          );
+          if (output.includes("Listening for channel messages") && output.includes("❯")) {
+            ready = true;
+            break;
+          }
+        } catch { /* ignore */ }
+      }
+
+      if (!ready) {
+        console.log(`[features] Bot ${tmux_session} not ready after ${String(timeout)}ms -- review feedback not bridged`);
+        return;
+      }
+
+      // Small extra delay for the plugin to fully connect
       await new Promise(resolve => setTimeout(resolve, 2000));
 
       const instruction = `Read ${feedback_path} for review feedback and begin fixing the issues.`;
@@ -1098,48 +1125,52 @@ export class FeatureManager extends EventEmitter {
     const entity = this.registry.get(feature.entity);
     if (!entity) return;
 
-    // Merge PR
-    if (feature.prNumber) {
-      try {
-        await actions.merge_pr(feature, entity);
-      } catch (err) {
-        console.error(`[features] Failed to merge PR: ${String(err)}`);
-        feature.blocked = true;
-        feature.blockedReason = `Merge failed: ${String(err)}`;
-        return;
+    // Capture work room before any mutations so pool cleanup works regardless of outcome.
+    const work_room = feature.discordWorkRoom;
+
+    try {
+      // Merge PR
+      if (feature.prNumber) {
+        try {
+          await actions.merge_pr(feature, entity);
+        } catch (err) {
+          console.error(`[features] Failed to merge PR: ${String(err)}`);
+          feature.blocked = true;
+          feature.blockedReason = `Merge failed: ${String(err)}`;
+          return;
+        }
+      }
+
+      // Cleanup worktree
+      await actions.cleanup_worktree(feature, entity);
+      feature.worktreePath = null;
+
+      // Send "shipped" notification BEFORE releasing work room
+      // so the message arrives in the work room before it's cleaned up / reset.
+      await actions.notify_feature(
+        feature,
+        `Feature #${String(feature.githubIssue)} shipped and merged to main: ${feature.title}`,
+        entity,
+        { also_general: true },
+      );
+
+      // Release work room (after notification so the room still exists)
+      await actions.release_work_room(feature, entity);
+      feature.discordWorkRoom = null;
+    } finally {
+      // Always release pool bot, even if merge fails — otherwise the slot is permanently occupied.
+      // pool.release() kills the tmux session, so do this after any work room messaging is done.
+      if (this.pool && work_room) {
+        const assignment = this.pool.get_assignment(work_room);
+        if (assignment) {
+          await this.pool.release(work_room);
+        }
+      }
+      if (feature.poolBotId !== null) {
+        this.pool_bot_to_feature.delete(feature.poolBotId);
+        feature.poolBotId = null;
       }
     }
-
-    // Cleanup worktree
-    await actions.cleanup_worktree(feature, entity);
-    feature.worktreePath = null;
-
-    // Release pool bot BEFORE releasing work room
-    // so the bot slot is freed while the room still exists for final messages
-    if (this.pool && feature.discordWorkRoom) {
-      const assignment = this.pool.get_assignment(feature.discordWorkRoom);
-      if (assignment) {
-        await this.pool.release(feature.discordWorkRoom);
-      }
-    }
-    // Clean up pool binding
-    if (feature.poolBotId !== null) {
-      this.pool_bot_to_feature.delete(feature.poolBotId);
-      feature.poolBotId = null;
-    }
-
-    // Send "shipped" notification BEFORE releasing work room
-    // so the message arrives in the work room before it's cleaned up / reset.
-    await actions.notify_feature(
-      feature,
-      `Feature #${String(feature.githubIssue)} shipped and merged to main: ${feature.title}`,
-      entity,
-      { also_general: true },
-    );
-
-    // Release work room (after notification so the room still exists)
-    await actions.release_work_room(feature, entity);
-    feature.discordWorkRoom = null;
   }
 }
 

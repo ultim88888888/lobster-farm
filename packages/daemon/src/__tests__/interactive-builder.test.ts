@@ -453,10 +453,11 @@ describe("Interactive builder sessions", () => {
 
       expect(feature.poolBotId).toBe(1);
 
-      // Set up bounce scenario: feature went to review, now bouncing back to build
+      // Set up bounce scenario: feature went to review, now bouncing back to build.
+      // poolBotId is already set (from the initial pool assignment above), which is the
+      // bounce signal for pool-based builders — lastBuilderSessionId is never set for them.
       feature.phase = "review";
       feature.prNumber = 42;
-      feature.lastBuilderSessionId = "sess-abc";
 
       const assign_spy = vi.spyOn(pool, "assign");
 
@@ -494,14 +495,15 @@ describe("Interactive builder sessions", () => {
 
       expect(feature.poolBotId).toBe(1);
 
-      // Simulate eviction
+      // Simulate eviction — release the bot and clear poolBotId, matching what
+      // on_bot_session_ended does in production.
       await pool.release(feature.discordWorkRoom!);
       feature.poolBotId = null;
 
-      // Set up bounce scenario
+      // Set up bounce scenario — with poolBotId cleared by eviction, the next build
+      // is treated as a fresh build (not a bounce), which gets a new pool assignment.
       feature.phase = "review";
       feature.prNumber = 99;
-      feature.lastBuilderSessionId = "sess-xyz";
 
       await fm.advance_feature("alpha-109", "build");
 
