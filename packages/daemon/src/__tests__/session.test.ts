@@ -77,7 +77,8 @@ describe("ClaudeSessionManager", () => {
       expect(args).toContain("--session-id");
       expect(args).toContain("--append-system-prompt");
       expect(args).toContain("--add-dir");
-      expect(args).toContain("Build feature #42");
+      // Prompt is piped via stdin, not in args
+      expect(args).not.toContain("Build feature #42");
     });
 
     it("uses custom agent names from config", async () => {

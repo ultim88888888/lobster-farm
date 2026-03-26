@@ -1,6 +1,6 @@
 ---
 name: Architecture design decisions
-description: Key design decisions - entity isolation via directory scoping, governance model, SOP engine direction, shared vaults
+description: Key design decisions - entity isolation, governance, agent architecture, Discord model, feature lifecycle, session tracking, skill taxonomy
 type: project
 ---
 
@@ -32,6 +32,85 @@ Four layers, hardest to softest:
 **Why:** During development, deleting the lobster-farm entity to test scaffolding nuked the daemon's source/build artifacts. This chicken-and-egg problem only exists because the daemon runs from inside an entity. OpenClaw solves this by separating state (`~/.openclaw/`) from code (global install or dev repo), with profile isolation (`OPENCLAW_PROFILE`) for parallel instances.
 
 **How to apply:** When preparing for distribution, publish the three packages to npm. The launchd plist should point to the globally installed daemon binary. For development, support a `--dev` flag or equivalent that runs from the local repo instead.
+
+## Discord Agent Architecture
+
+**One Discord bot per archetype, not per channel or per session.** Each archetype (Gary, Bob, Pearl, Ray, Pat) has its own Discord bot application with its own token. The daemon manages which channels each bot is active in via `allowed_channels` in `access.json`. Only one agent is active per work room at a time — the daemon cycles them on phase transitions.
+
+**Agent bots:** Pat (#command-center), Gary (#general + active planning rooms), Bob (active build rooms), Pearl (active design rooms), Ray (active infra rooms). Reviewer is ephemeral/headless — no bot needed.
+
+**Daemon bot is separate** — handles infrastructure only (scaffolding, webhooks, status). Does not handle conversations.
+
+**Sessions are persistent, not headless.** Each agent runs as a persistent Claude Code session with the Discord channel plugin (`--channels plugin:discord`). No `-p` headless sessions for conversational work. Agents can ask questions, users can interject mid-work. The daemon manages session lifecycle (start, stop, cycle on phase transition).
+
+**One agent can handle multiple channels** in a single session (messages are tagged with channel context). Shared context within an entity is a feature — cross-pollination between #general and work room conversations helps.
+
+**Why:** Headless sessions introduce latency (startup per message) and prevent real-time collaboration. The user is a collaborator, not just an approver. Agents should surface discoveries and ask questions naturally, not pause/resume.
+
+## Channel Ownership
+
+**#general** — Gary (planner) owns this channel. Discovery, brainstorming, "what should we build." Features spin out of conversations here into work rooms. Gary is the entity-level project manager.
+
+**#work-room-N** — one feature per room, one active agent at a time. Phase determines which agent. Room has a pinned status message updated by the daemon:
+- `🟢 Available`
+- `🔵 Secret Scanning Hook — Plan`
+- `🟡 Secret Scanning Hook — Build`
+
+**#alerts** — notification inbox. Errors, cross-room pings, entity-level notifications. Not for conversation — go to the work room for that.
+
+**#work-log** — read-only activity feed.
+
+## Feature Lifecycle (Revised)
+
+**Planning happens in Discord, not headless.** The GitHub issue is the OUTPUT of planning, not the input. You riff with Gary in #general or a work room. Gary does socratic discovery, creates the issue when the spec is ready, posts it in the work room. You approve in Discord.
+
+**Two modes of building:**
+1. **Collaborative** — you and an agent riff together, step by step (like a pair programming session). No strict phase handoffs. The agent in the room stays for the duration.
+2. **Autonomous** — clear spec, well-scoped feature. Gary plans, you approve, Bob builds independently, reviewer reviews. Clean handoffs between phases.
+
+**Approvals happen in Discord, not GitHub.** The spec is posted in the work room. You approve right there. GitHub issues/PRs are record-keeping artifacts, not the user's interface.
+
+**Agents are collaborators, not task executors.** During any phase, agents should surface discoveries that could affect decisions. Plans drift during implementation — new information should be communicated, not suppressed. This applies to ALL agents, not just builders.
+
+**Planner gets coding-dna** for technical features (composable DNA). Planning-dna + coding-dna when the spec involves implementation decisions.
+
+## PR Review-Merge (Independent SOP)
+
+**Review is decoupled from the feature lifecycle.** Any PR on any entity repo triggers the review-merge SOP — whether from the feature lifecycle, a manual push, or external contributor.
+
+**Triggered by cron** — daemon polls repos for open PRs. When found, spawns reviewer. Review → fix → re-review loop until clean. Merge with squash. Escalate conflicts if non-trivial rebase.
+
+**Leverages Claude Code's built-in /review and /simplify** commands. Bob runs /simplify before pushing (less noise for reviewer). Reviewer uses /review for comprehensive analysis plus review-guideline for our standards.
+
+## Work Room Management
+
+**Daemon tracks room status** — which rooms are free, which are assigned to features. Stored in daemon state. Pinned status message in each room updated on assignment/release.
+
+**Auto-assignment** — when a feature needs a room, daemon grabs the next free one. If all occupied, create overflow channel.
+
+**Entity scaffold creates rooms with pinned "Available" status** during initial setup.
+
+## Session Tracking
+
+**Sessions tracked at entity level** — `entities/{id}/sessions/{feature-id}.json` with session history (session_id, archetype, started_at, ended_at, work_room). Enables "show me all sessions for feature X" and session restore.
+
+**Why:** Lost session context is expensive. At the start of a session, 30+ minutes were spent recovering context from a previous session in a different project directory. Entity-scoped session tracking prevents this.
+
+## Skill Taxonomy
+
+Five types, each with a distinct loading behavior:
+
+| Type | Loading | Purpose | Example |
+|------|---------|---------|---------|
+| **DNA** | Auto-load by task match | Creative/expertise lenses | coding-dna, design-dna, planning-dna |
+| **Guidelines** | Auto-load by task match | Operational requirements | secrets-guideline, review-guideline, readme-guideline, discord-guideline |
+| **SOPs** | Auto-load by task match | Step-by-step procedures with gates | entity-scaffold, feature-lifecycle, pr-review-merge |
+| **Rules** | Always loaded | Universal constraints | secrets rules, git rules, escalation rules |
+| **Commands** | Explicitly invoked with / | Specific actions | (future, as patterns emerge) |
+
+**review-dna was renamed to review-guideline** — review standards are operational requirements, not a creative lens. DNA is for style/expertise that would change if the tech stack changed. Guidelines are operational requirements that apply regardless of stack.
+
+**Rules live in `~/.claude/rules/`** (global) or `.claude/rules/` (per-repo). Always loaded, no auto-match needed. For constraints that should NEVER be skipped — secrets handling, git conventions, escalation policy. Currently these live in CLAUDE.md — should be extracted to rules for modularity.
 
 ## Other Decisions
 

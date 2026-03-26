@@ -141,7 +141,7 @@ export class FeatureManager extends EventEmitter {
     await save_features([...this.features.values()], this.config);
   }
 
-  /** Create a new feature. Starts in the "plan" phase. */
+  /** Create a new feature. Starts in the "plan" phase and spawns the planner. */
   create_feature(opts: CreateFeatureOptions): FeatureState {
     const entity = this.registry.get(opts.entity_id);
     if (!entity) {
@@ -181,6 +181,11 @@ export class FeatureManager extends EventEmitter {
     console.log(
       `[features] Created feature ${id}: "${opts.title}" (phase: plan)`,
     );
+
+    // Auto-spawn the planner agent. The approval gate is for leaving plan,
+    // not entering it — Gary should start writing the spec immediately.
+    const plan_config = PHASE_CONFIG.plan;
+    void this.spawn_phase_agent(feature, plan_config);
 
     this.emit("feature:created", feature);
     return feature;

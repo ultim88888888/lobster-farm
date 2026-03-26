@@ -181,6 +181,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     // Autonomous mode
     args.push("-p");
     args.push("--output-format", "stream-json");
+    args.push("--verbose");
 
     // Agent and model
     args.push("--agent", agent_name);
@@ -209,8 +210,8 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     const ent_dir = entity_dir(this.config.paths, options.entity_id);
     args.push("--add-dir", ent_dir);
 
-    // The prompt itself (positional argument)
-    args.push(options.prompt);
+    // Prompt is piped via stdin (not positional) to avoid arg parsing issues
+    // with --append-system-prompt containing newlines
 
     return { command, args };
   }
@@ -238,12 +239,18 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       tmux_pane: null,
     };
 
-    // Spawn the process
+    // Spawn the process — prompt is piped via stdin
     const proc = spawn(command, args, {
       cwd: options.worktree_path,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
     });
+
+    // Write prompt to stdin and close it
+    if (proc.stdin) {
+      proc.stdin.write(options.prompt);
+      proc.stdin.end();
+    }
 
     session.pid = proc.pid ?? null;
     this.sessions.set(session_id, session);
