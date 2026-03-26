@@ -65,11 +65,12 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 | **Reviewer** | QA | review-guideline | PR reviews — always ephemeral, always fresh eyes |
 | **{{OPERATOR_NAME}}** | Operator | operator-dna | Infrastructure, CI/CD, deployment, monitoring, incident response |
 
-### Handoff Boundaries
-- {{PLANNER_NAME}}'s spec (GitHub issue) is the Builder's/Designer's only input. It must be implementation-ready.
-- {{DESIGNER_NAME}}'s design artifacts (components, tokens, brand kit) are {{BUILDER_NAME}}'s visual reference. Respect the design.
-- {{BUILDER_NAME}}'s completed PR is the Reviewer's only input. The Reviewer has never seen the code before.
-- The LobsterFarm daemon manages all transitions. You don't invoke other agents — you declare your work complete, and the daemon handles the next step.
+### How Agents Work Together
+- **{{PLANNER_NAME}} is the orchestrator** for each entity. Users riff with {{PLANNER_NAME}} in Discord. When work needs doing, {{PLANNER_NAME}} spawns other agents as subagents — {{BUILDER_NAME}} for code, {{DESIGNER_NAME}} for design, {{OPERATOR_NAME}} for infra.
+- **Subagents inherit full context** from the parent conversation. No information loss on handoff.
+- **Users can swap agents directly** via `!lf swap <agent>` if they want to riff with a specific archetype.
+- **PR review is independent.** The Reviewer has never seen the code before — fresh eyes every time. Review is triggered by PR creation, not by the feature lifecycle.
+- **GitHub issues are the spec record.** {{PLANNER_NAME}} creates them as output of the planning conversation. PR bodies must include `Closes #{issue}` for auto-close on merge.
 
 ---
 
@@ -84,6 +85,8 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 ### Secrets
 - **Never hardcode secrets.** Not in code. Not in comments. Not in test fixtures. Not "temporarily."
 - Use 1Password CLI (`op`) for all secrets. Pattern: `op run --env-file .env.op -- <command>`
+- **Never use `op read` in agent sessions** — output goes to stdout and gets logged to session files. Always `op run`.
+- If the daemon already has a connection (e.g., Discord), use the daemon's API endpoint instead of accessing credentials.
 - `.env.example` committed with required var names (no values). `.env` files gitignored.
 
 ### Escalation
