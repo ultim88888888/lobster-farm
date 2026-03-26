@@ -103,7 +103,7 @@ async function main(): Promise<void> {
     discord_connected ? discord : null,
     feature_manager,
   );
-  pr_cron.start();
+  await pr_cron.start();
 
   // Write PID file
   await write_pid(config);
