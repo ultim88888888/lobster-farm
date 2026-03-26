@@ -111,32 +111,44 @@ async function main(): Promise<void> {
   let shutting_down = false;
 
   async function shutdown(signal: string): Promise<void> {
-    if (shutting_down) return;
+    if (shutting_down) {
+      // Second signal = force kill
+      console.log("[shutdown] Second signal received — forcing shutdown.");
+      process.exit(1);
+    }
     shutting_down = true;
 
     console.log(`\nReceived ${signal}. Shutting down gracefully...`);
 
-    // Stop PR cron
+    // Enter drain mode — no new work accepted
+    pool.drain();
     pr_cron.stop();
 
-    // Check for active work before killing pool bots
+    // Check for active work
     const work_check = pool.has_active_work();
     if (work_check.active) {
-      console.log(`[shutdown] ${String(work_check.working_bots.length)} agent(s) actively working:`);
-      for (const bot of work_check.working_bots) {
-        console.log(`  pool-${String(bot.id)} (${bot.archetype})`);
-      }
-      console.log("[shutdown] Waiting up to 60s for active work to complete...");
+      const names = work_check.working_bots.map(b => `${b.archetype} (pool-${String(b.id)})`).join(", ");
+      console.log(`[shutdown] Draining — ${String(work_check.working_bots.length)} agent(s) still working: ${names}`);
 
-      const deadline = Date.now() + 60_000;
-      while (Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 3000));
+      // Notify command center
+      if (discord_connected) {
+        try {
+          await discord.send(
+            config.discord?.server_id ? "" : "",
+            `Daemon shutting down — waiting for ${String(work_check.working_bots.length)} active agent(s) to finish: ${names}. Send another signal to force.`,
+          );
+        } catch { /* best effort */ }
+      }
+
+      // Wait indefinitely for agents to finish (second SIGTERM forces)
+      while (true) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
         const recheck = pool.has_active_work();
         if (!recheck.active) {
-          console.log("[shutdown] All agents idle. Proceeding.");
+          console.log("[shutdown] All agents idle. Proceeding with shutdown.");
           break;
         }
-        console.log(`[shutdown] ${String(recheck.working_bots.length)} still working... (${String(Math.round((deadline - Date.now()) / 1000))}s remaining)`);
+        console.log(`[shutdown] ${String(recheck.working_bots.length)} still working...`);
       }
     }
 

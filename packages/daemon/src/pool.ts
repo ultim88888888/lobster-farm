@@ -90,9 +90,21 @@ function bot_user_id_from_token(token: string): string | null {
 export class BotPool {
   private bots: PoolBot[] = [];
   private config: LobsterFarmConfig;
+  private _draining = false;
 
   constructor(config: LobsterFarmConfig) {
     this.config = config;
+  }
+
+  /** Enter drain mode — no new assignments accepted. */
+  drain(): void {
+    this._draining = true;
+    console.log("[pool] Entering drain mode — no new assignments");
+  }
+
+  /** Check if pool is draining. */
+  get draining(): boolean {
+    return this._draining;
   }
 
   /** Discover pool bot directories and initialize state. */
@@ -167,6 +179,11 @@ export class BotPool {
     archetype: ArchetypeRole,
     resume_session_id?: string,
   ): Promise<PoolAssignment | null> {
+    if (this._draining) {
+      console.log("[pool] Rejecting assignment — draining");
+      return null;
+    }
+
     // Check if this channel already has an assignment
     const existing = this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
     if (existing) {
