@@ -5,7 +5,7 @@ import { ClaudeSessionManager } from "./session.js";
 import { TaskQueue } from "./queue.js";
 import { FeatureManager } from "./features.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
-import { set_discord_bot, set_feature_manager } from "./actions.js";
+import { set_discord_bot, set_feature_manager, reset_idle_work_room_topics } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
@@ -88,6 +88,11 @@ async function main(): Promise<void> {
       "[discord] No bot token found. Set DISCORD_BOT_TOKEN env var or configure 1Password reference.",
     );
     console.log("[discord] Daemon will run with HTTP API only.");
+  }
+
+  // Reset stale work room topics from previous daemon runs
+  if (discord_connected) {
+    await reset_idle_work_room_topics(registry);
   }
 
   // Initialize Commander (persistent Claude Code session with Discord channel)

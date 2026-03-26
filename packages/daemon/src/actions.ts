@@ -5,6 +5,7 @@ import type { FeatureState, EntityConfig, ChannelType, ArchetypeRole, ChannelMap
 import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
 import type { FeatureManager } from "./features.js";
+import type { EntityRegistry } from "./registry.js";
 
 const exec = promisify(execFile);
 
@@ -195,7 +196,11 @@ export async function notify(
   }
 }
 
-/** Send a feature-scoped notification. Routes to work room if assigned, work_log as fallback. */
+/**
+ * Send a feature-scoped notification. Routes to work room if assigned.
+ * No fallback — if no work room is assigned, the notification is not sent to Discord.
+ * Phase transitions are still logged to console via the log line below.
+ */
 export async function notify_feature(
   feature: FeatureState,
   message: string,
@@ -204,12 +209,14 @@ export async function notify_feature(
 ): Promise<void> {
   const archetype = (feature.activeArchetype ?? "system") as ArchetypeRole | "system";
 
-  // Primary: send to work room (by channel ID) or work_log fallback
+  // Primary: send to work room (by channel ID). No work_log fallback —
+  // interactive builders post their own progress in work rooms.
   if (feature.discordWorkRoom && _discord) {
     await _discord.send_as_agent(feature.discordWorkRoom, message, archetype);
     console.log(`[actions:notify] [work_room:${feature.discordWorkRoom}] ${message}`);
   } else {
-    await notify("work_log", message, entity_config, archetype);
+    // Still log to console so phase transitions appear in daily logs
+    console.log(`[actions:notify] [no_room] ${message}`);
   }
 
   // Secondary channels
@@ -292,11 +299,14 @@ export async function assign_work_room(
     await persist_entity_config(entity_config);
   }
 
-  // Set channel topic
+  // Set channel topic with truncated title
   if (_discord && channel_id) {
+    const short_title = feature.title.length > 60
+      ? feature.title.slice(0, 57) + "..."
+      : feature.title;
     await _discord.set_channel_topic(
       channel_id,
-      `🔵 ${feature.id} — #${String(feature.githubIssue)} — Building`,
+      `🔨 #${String(feature.githubIssue)}: ${short_title}`,
     );
   }
 
@@ -397,4 +407,40 @@ export async function update_work_room_topic(
 ): Promise<void> {
   if (!feature.discordWorkRoom || !_discord) return;
   await _discord.set_channel_topic(feature.discordWorkRoom, topic);
+}
+
+// ── Startup cleanup ──
+
+/**
+ * Reset topics on unoccupied work rooms to "Available".
+ * Called on daemon startup to clear stale topics from previous runs.
+ * Rooms with active (non-done) features keep their current topic.
+ */
+export async function reset_idle_work_room_topics(
+  registry: EntityRegistry,
+): Promise<void> {
+  if (!_discord || !_features) return;
+
+  // Collect work rooms that have an active feature
+  const active_rooms = new Set<string>();
+  for (const feature of _features.list_features()) {
+    if (feature.discordWorkRoom && feature.phase !== "done") {
+      active_rooms.add(feature.discordWorkRoom);
+    }
+  }
+
+  // Reset unoccupied work rooms
+  let reset_count = 0;
+  for (const entity_config of registry.get_active()) {
+    for (const channel of entity_config.entity.channels.list) {
+      if (channel.type === "work_room" && !active_rooms.has(channel.id)) {
+        await _discord.set_channel_topic(channel.id, "🟢 Available");
+        reset_count++;
+      }
+    }
+  }
+
+  if (reset_count > 0) {
+    console.log(`[actions] Reset ${String(reset_count)} idle work room topic(s) to Available`);
+  }
 }

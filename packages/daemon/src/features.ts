@@ -1103,10 +1103,14 @@ export class FeatureManager extends EventEmitter {
 
     // Update work room topic on phase change
     if (feature.discordWorkRoom) {
+      const short_title = feature.title.length > 60
+        ? feature.title.slice(0, 57) + "..."
+        : feature.title;
+
       const topic_map: Partial<Record<Phase, string>> = {
-        build: `🔵 ${feature.id} — #${String(feature.githubIssue)} — Building`,
-        review: `🟣 ${feature.id} — #${String(feature.githubIssue)} — In Review`,
-        ship: `✅ ${feature.id} — #${String(feature.githubIssue)} — Shipping`,
+        build: `🔨 #${String(feature.githubIssue)}: ${short_title}`,
+        review: `🔍 #${String(feature.githubIssue)}: ${short_title} — In Review`,
+        ship: `✅ #${String(feature.githubIssue)}: ${short_title} — Shipping`,
       };
       const topic = topic_map[phase];
       if (topic) {

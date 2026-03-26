@@ -213,7 +213,7 @@ describe("Work Room Assignment", () => {
       expect(room_id).toBe("wr-1");
     });
 
-    it("sets channel topic on assignment", async () => {
+    it("sets channel topic with title on assignment", async () => {
       const feature = make_feature();
       const entity = make_entity_config(make_static_work_rooms());
       // @ts-expect-error — mock feature manager
@@ -223,7 +223,23 @@ describe("Work Room Assignment", () => {
 
       expect(discord.set_channel_topic).toHaveBeenCalledWith(
         "wr-1",
-        "🔵 alpha-42 — #42 — Building",
+        "🔨 #42: Test Feature",
+      );
+    });
+
+    it("truncates long title in channel topic on assignment", async () => {
+      const long_title = "A".repeat(80);
+      const feature = make_feature({ title: long_title });
+      const entity = make_entity_config(make_static_work_rooms());
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+
+      await actions.assign_work_room(feature, entity);
+
+      const expected_title = "A".repeat(57) + "...";
+      expect(discord.set_channel_topic).toHaveBeenCalledWith(
+        "wr-1",
+        `🔨 #42: ${expected_title}`,
       );
     });
 
@@ -401,15 +417,15 @@ describe("Notification Routing", () => {
       expect(discord.send_as_agent).toHaveBeenCalledWith("wr-1", "Build started", "builder");
     });
 
-    it("falls back to work_log when no work room assigned", async () => {
+    it("does not send to Discord when no work room assigned (no work_log fallback)", async () => {
       const feature = make_feature({ discordWorkRoom: null, activeArchetype: null });
       const entity = make_entity_config(make_static_work_rooms());
 
       await actions.notify_feature(feature, "Build started", entity);
 
-      expect(discord.send_to_entity).toHaveBeenCalledWith(
-        "alpha", "work_log", "Build started", "system",
-      );
+      // No Discord message sent — neither work room nor work_log
+      expect(discord.send_as_agent).not.toHaveBeenCalled();
+      expect(discord.send_to_entity).not.toHaveBeenCalled();
     });
 
     it("also sends to alerts when also_alerts is true", async () => {
@@ -464,6 +480,34 @@ describe("Notification Routing", () => {
       expect(discord.send_as_agent).toHaveBeenCalledWith("wr-1", "Phase change", "system");
     });
 
+    it("still sends to alerts when no work room but also_alerts is true", async () => {
+      const feature = make_feature({ discordWorkRoom: null, activeArchetype: "builder" });
+      const entity = make_entity_config(make_static_work_rooms());
+
+      await actions.notify_feature(feature, "Blocked!", entity, { also_alerts: true });
+
+      // No primary Discord message (no work room, no fallback)
+      expect(discord.send_as_agent).not.toHaveBeenCalled();
+      // But secondary alert still fires
+      expect(discord.send_to_entity).toHaveBeenCalledWith(
+        "alpha", "alerts", "Blocked!", "builder",
+      );
+    });
+
+    it("still sends to general when no work room but also_general is true", async () => {
+      const feature = make_feature({ discordWorkRoom: null, activeArchetype: "builder" });
+      const entity = make_entity_config(make_static_work_rooms());
+
+      await actions.notify_feature(feature, "Shipped!", entity, { also_general: true });
+
+      // No primary Discord message
+      expect(discord.send_as_agent).not.toHaveBeenCalled();
+      // But secondary general still fires
+      expect(discord.send_to_entity).toHaveBeenCalledWith(
+        "alpha", "general", "Shipped!", "builder",
+      );
+    });
+
     it("routes to specific channel ID, not first work_room", async () => {
       // Verify it routes to wr-2, not wr-1 (which send_to_entity would pick)
       const feature = make_feature({ discordWorkRoom: "wr-2" });
@@ -514,6 +558,155 @@ describe("Channel Topic Updates", () => {
 
       // No error thrown, function returns silently
     });
+  });
+});
+
+describe("Startup Topic Reset", () => {
+  let discord: ReturnType<typeof make_mock_discord>;
+
+  beforeEach(() => {
+    discord = make_mock_discord();
+    // @ts-expect-error — mock does not implement full DiscordBot interface
+    actions.set_discord_bot(discord);
+  });
+
+  it("resets unoccupied work rooms to Available on startup", async () => {
+    // No active features — all work rooms should be reset
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([]));
+
+    const entity = make_entity_config(make_static_work_rooms());
+    const registry = {
+      get_active: vi.fn().mockReturnValue([entity]),
+    };
+
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    // All 3 work rooms should be reset
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-2", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-3", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves topic on work rooms with active features", async () => {
+    const active_feature = make_feature({
+      id: "alpha-10",
+      discordWorkRoom: "wr-1",
+      phase: "build",
+    });
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([active_feature]));
+
+    const entity = make_entity_config(make_static_work_rooms());
+    const registry = {
+      get_active: vi.fn().mockReturnValue([entity]),
+    };
+
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    // wr-1 has an active feature — should NOT be reset
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wr-1", "🟢 Available");
+    // wr-2 and wr-3 should be reset
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-2", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-3", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not reset rooms for features in review phase", async () => {
+    const review_feature = make_feature({
+      id: "alpha-10",
+      discordWorkRoom: "wr-2",
+      phase: "review",
+    });
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([review_feature]));
+
+    const entity = make_entity_config(make_static_work_rooms());
+    const registry = {
+      get_active: vi.fn().mockReturnValue([entity]),
+    };
+
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    // wr-2 has a review feature — should NOT be reset
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wr-2", "🟢 Available");
+    // wr-1 and wr-3 should be reset
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-3", "🟢 Available");
+  });
+
+  it("resets rooms for done features (they are no longer active)", async () => {
+    const done_feature = make_feature({
+      id: "alpha-10",
+      discordWorkRoom: "wr-1",
+      phase: "done",
+    });
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([done_feature]));
+
+    const entity = make_entity_config(make_static_work_rooms());
+    const registry = {
+      get_active: vi.fn().mockReturnValue([entity]),
+    };
+
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    // wr-1 has a done feature — should be reset
+    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledTimes(3);
+  });
+
+  it("is a no-op when no discord bot is available", async () => {
+    actions.set_discord_bot(null);
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([]));
+
+    const registry = {
+      get_active: vi.fn().mockReturnValue([]),
+    };
+
+    // Should not throw
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    expect(registry.get_active).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when no feature manager is available", async () => {
+    actions.set_feature_manager(null);
+
+    const registry = {
+      get_active: vi.fn().mockReturnValue([]),
+    };
+
+    // Should not throw
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    expect(registry.get_active).not.toHaveBeenCalled();
+  });
+
+  it("only touches work_room channels, not general or alerts", async () => {
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([]));
+
+    const entity = make_entity_config(make_static_work_rooms());
+    const registry = {
+      get_active: vi.fn().mockReturnValue([entity]),
+    };
+
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    // Should not be called for gen-1, wl-1, or al-1
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("gen-1", expect.anything());
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wl-1", expect.anything());
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("al-1", expect.anything());
   });
 });
 
