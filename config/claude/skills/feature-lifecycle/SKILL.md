@@ -76,7 +76,7 @@ For visual work, Gary can spawn Pearl (designer) as a subagent, or you can ask t
 
 ## Work Room Management
 
-- **Status pins:** each work room has a pinned status message updated by the daemon
+- **Channel topics:** each work room's topic shows current status, updated by the daemon
   - `🟢 Available`
   - `🔵 Secret Scanning Hook — Plan`
   - `🟡 Secret Scanning Hook — Build`

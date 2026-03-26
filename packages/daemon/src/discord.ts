@@ -365,14 +365,13 @@ export class DiscordBot extends EventEmitter {
 
         channels.push({ type: ch.type, id: channel.id, purpose: ch.purpose });
 
-        // Pin status message in work rooms
+        // Set channel topic for work rooms
         if (ch.type === "work_room") {
           try {
             const text_channel = channel as TextChannel;
-            const status_msg = await text_channel.send("🟢 Available");
-            await status_msg.pin();
-          } catch (pin_err) {
-            console.log(`[discord] Could not pin status in #${ch.name}: ${String(pin_err)}`);
+            await text_channel.setTopic("🟢 Available");
+          } catch (topic_err) {
+            console.log(`[discord] Could not set topic for #${ch.name}: ${String(topic_err)}`);
           }
         }
       }

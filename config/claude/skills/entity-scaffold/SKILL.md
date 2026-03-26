@@ -160,7 +160,7 @@ curl -s -X POST http://localhost:7749/scaffold/entity \
 
 The daemon handles Discord authentication internally — **never access Discord tokens directly.** See the `secrets-guideline` skill.
 
-The endpoint returns the category ID and channel IDs. Update the entity config with these. The daemon automatically pins a "🟢 Available" status message in each work room during scaffolding.
+The endpoint returns the category ID and channel IDs. Update the entity config with these. The daemon automatically sets the channel topic to "🟢 Available" for each work room during scaffolding.
 
 ### 7. Register with daemon
 

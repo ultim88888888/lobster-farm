@@ -95,11 +95,11 @@ Pool bots are assigned/released as features enter/leave rooms.
 
 ## Work Room Management
 
-**Daemon tracks room status** — which rooms are free, which are assigned to features. Stored in daemon state. Pinned status message in each room updated on assignment/release.
+**Daemon tracks room status** — which rooms are free, which are assigned to features. Stored in daemon state. Channel topic shows current status (e.g., "🟢 Available", "🔵 Feature Name — Plan"), updated on assignment/release.
 
 **Auto-assignment** — when a feature needs a room, daemon grabs the next free one. If all occupied, create overflow channel.
 
-**Entity scaffold creates rooms with pinned "Available" status** during initial setup.
+**Entity scaffold sets channel topics** to "🟢 Available" during initial setup. Topics are used instead of pinned messages — always visible, no clutter, updates in place.
 
 ## Session Tracking
 
