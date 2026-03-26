@@ -3,6 +3,7 @@ import type { LobsterFarmConfig, Phase } from "@lobster-farm/shared";
 import { DAEMON_PORT } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
+import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import type { CommanderProcess } from "./commander-process.js";
@@ -176,8 +177,16 @@ const handle_submit_task: RouteHandler = async (req, res, ctx) => {
     }
   }
 
-  const task_id = ctx.queue.submit(submission);
-  json_response(res, 201, { task_id });
+  try {
+    const task_id = ctx.queue.submit(submission);
+    json_response(res, 201, { task_id });
+  } catch (err) {
+    if (err instanceof QueueFullError) {
+      json_response(res, 429, { error: err.message });
+      return;
+    }
+    throw err;
+  }
 };
 
 const handle_list_tasks: RouteHandler = (_req, res, ctx) => {

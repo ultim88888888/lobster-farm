@@ -9,6 +9,7 @@ import type {
 } from "@lobster-farm/shared";
 import { PHASE_TRANSITIONS } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
+import { QueueFullError } from "./queue.js";
 import type { TaskQueue } from "./queue.js";
 import type { SessionResult } from "./session.js";
 import * as actions from "./actions.js";
@@ -127,6 +128,9 @@ export class FeatureManager extends EventEmitter {
     private config: LobsterFarmConfig,
   ) {
     super();
+
+    // When the queue drains (a task completes), retry features blocked due to queue-full
+    this.queue.on_drain(() => this.retry_queue_blocked());
   }
 
   /** Load persisted features from disk. Call on daemon startup. */
@@ -473,6 +477,34 @@ export class FeatureManager extends EventEmitter {
     return feature;
   }
 
+  /**
+   * Retry spawning agents for features that were blocked because the queue was full.
+   * Called by the queue's drain callback when a task completes and capacity frees up.
+   */
+  private retry_queue_blocked(): void {
+    const blocked = [...this.features.values()].filter(
+      (f) => f.blocked && f.blockedReason?.includes("Queue full"),
+    );
+
+    for (const feature of blocked) {
+      const phase_config = PHASE_CONFIG[feature.phase];
+      if (!phase_config.archetype || !phase_config.model || !phase_config.prompt_template) {
+        continue;
+      }
+
+      // Clear the block before retrying so the feature isn't stuck if spawn succeeds
+      feature.blocked = false;
+      feature.blockedReason = null;
+      feature.updatedAt = new Date().toISOString();
+
+      console.log(`[features] Retrying spawn for queue-blocked feature ${feature.id}`);
+
+      // spawn_phase_agent will re-block if the queue is still full
+      void this.spawn_phase_agent(feature, phase_config);
+      void this.persist();
+    }
+  }
+
   // ── Queries ──
 
   get_feature(id: string): FeatureState | undefined {
@@ -533,18 +565,35 @@ export class FeatureManager extends EventEmitter {
     const is_builder_bounce = phase_config.archetype === "builder" && Boolean(feature.lastBuilderSessionId);
     const resume_id = is_builder_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
 
-    const task_id = this.queue.submit({
-      entity_id: feature.entity,
-      feature_id: feature.id,
-      archetype: phase_config.archetype,
-      dna: phase_config.dna,
-      model: phase_config.model,
-      prompt,
-      interactive: false,
-      priority: feature.priority,
-      worktree_path,
-      resume_session_id: resume_id,
-    });
+    let task_id: string;
+    try {
+      task_id = this.queue.submit({
+        entity_id: feature.entity,
+        feature_id: feature.id,
+        archetype: phase_config.archetype,
+        dna: phase_config.dna,
+        model: phase_config.model,
+        prompt,
+        interactive: false,
+        priority: feature.priority,
+        worktree_path,
+        resume_session_id: resume_id,
+      });
+    } catch (err) {
+      if (err instanceof QueueFullError) {
+        // Feature is created and persisted — only the agent spawn is deferred.
+        // It will auto-retry when capacity frees up via retry_queue_blocked().
+        feature.blocked = true;
+        feature.blockedReason = "Queue full — will retry when capacity frees up";
+        feature.updatedAt = new Date().toISOString();
+        void this.persist();
+
+        console.log(`[features] Queue full — ${feature.id} blocked, will retry on drain`);
+        this.emit("feature:blocked", feature, feature.blockedReason);
+        return;
+      }
+      throw err;
+    }
 
     feature.activeArchetype = phase_config.archetype;
     feature.activeDna = phase_config.dna;
