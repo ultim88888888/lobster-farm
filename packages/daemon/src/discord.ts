@@ -174,6 +174,57 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
+  // ── Channel management ──
+
+  /** Set a channel's topic. No-op if disconnected or channel not found. */
+  async set_channel_topic(channel_id: string, topic: string): Promise<void> {
+    if (!this.connected) return;
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (channel?.isTextBased() && !channel.isDMBased()) {
+        await (channel as TextChannel).setTopic(topic);
+      }
+    } catch (err) {
+      console.error(`[discord] Failed to set topic for ${channel_id}: ${String(err)}`);
+    }
+  }
+
+  /** Create a text channel under a category. Returns the channel ID, or null on failure. */
+  async create_channel(
+    category_id: string,
+    name: string,
+    reason?: string,
+  ): Promise<string | null> {
+    const guild = await this.get_guild();
+    if (!guild) return null;
+    try {
+      const channel = await guild.channels.create({
+        name,
+        type: DiscordChannelType.GuildText,
+        parent: category_id,
+        reason: reason ?? "LobsterFarm dynamic channel",
+      });
+      console.log(`[discord] Created #${name} (${channel.id})`);
+      return channel.id;
+    } catch (err) {
+      console.error(`[discord] Failed to create channel "${name}": ${String(err)}`);
+      return null;
+    }
+  }
+
+  /** Delete a channel by ID. No-op if disconnected or DM channel. */
+  async delete_channel(channel_id: string): Promise<void> {
+    if (!this.connected) return;
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel || channel.isDMBased()) return;
+      await channel.delete("LobsterFarm work room cleanup");
+      console.log(`[discord] Deleted channel ${channel_id}`);
+    } catch (err) {
+      console.error(`[discord] Failed to delete channel ${channel_id}: ${String(err)}`);
+    }
+  }
+
   // ── Agent identity ──
 
   private resolve_agent_identity(archetype: ArchetypeRole | "system"): { name: string; avatar_url: string | undefined } {
@@ -236,7 +287,7 @@ export class DiscordBot extends EventEmitter {
   // ── Server & Entity Scaffolding ──
 
   /** Get the guild (Discord server) from config. */
-  private async get_guild(): Promise<Guild | null> {
+  protected async get_guild(): Promise<Guild | null> {
     const server_id = this.config.discord?.server_id;
     if (!server_id) {
       console.log("[discord] No server_id in config — cannot scaffold");

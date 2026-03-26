@@ -340,11 +340,11 @@ export class FeatureManager extends EventEmitter {
     } else {
       // Notify that the phase is done and awaiting approval
       const entity = this.registry.get(feature.entity);
-      await actions.notify(
-        "alerts",
+      await actions.notify_feature(
+        feature,
         `Feature ${feature_id}: ${feature.phase} phase complete. Awaiting approval.`,
         entity,
-        feature.activeArchetype ?? undefined,
+        { also_alerts: true },
       );
     }
   }
@@ -463,6 +463,10 @@ export class FeatureManager extends EventEmitter {
         // Create worktree
         const worktree_path = await actions.create_worktree(feature, entity);
         feature.worktreePath = worktree_path;
+
+        // Assign work room
+        const room_id = await actions.assign_work_room(feature, entity);
+        feature.discordWorkRoom = room_id;
         break;
       }
       case "review": {
@@ -479,11 +483,23 @@ export class FeatureManager extends EventEmitter {
         break;
     }
 
-    await actions.notify(
-      "work_log",
+    // Update work room topic on phase change
+    if (feature.discordWorkRoom) {
+      const topic_map: Partial<Record<Phase, string>> = {
+        build: `🔵 ${feature.id} — #${String(feature.githubIssue)} — Building`,
+        review: `🟣 ${feature.id} — #${String(feature.githubIssue)} — In Review`,
+        ship: `✅ ${feature.id} — #${String(feature.githubIssue)} — Shipping`,
+      };
+      const topic = topic_map[phase];
+      if (topic) {
+        await actions.update_work_room_topic(feature, topic);
+      }
+    }
+
+    await actions.notify_feature(
+      feature,
       `${feature.id}: entered ${phase} phase`,
       entity,
-      "system",
     );
   }
 
@@ -507,16 +523,18 @@ export class FeatureManager extends EventEmitter {
     await actions.cleanup_worktree(feature, entity);
     feature.worktreePath = null;
 
-    // Release work room
-    await actions.release_work_room(feature, entity);
-    feature.discordWorkRoom = null;
-
-    await actions.notify(
-      "general",
+    // Send "shipped" notification BEFORE releasing work room
+    // so the message arrives in the work room before it's cleaned up / reset.
+    await actions.notify_feature(
+      feature,
       `Feature #${String(feature.githubIssue)} shipped and merged to main: ${feature.title}`,
       entity,
-      "system",
+      { also_general: true },
     );
+
+    // Release work room (after notification so the room still exists)
+    await actions.release_work_room(feature, entity);
+    feature.discordWorkRoom = null;
   }
 }
 

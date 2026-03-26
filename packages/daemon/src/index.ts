@@ -5,7 +5,7 @@ import { ClaudeSessionManager } from "./session.js";
 import { TaskQueue } from "./queue.js";
 import { FeatureManager } from "./features.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
-import { set_discord_bot } from "./actions.js";
+import { set_discord_bot, set_feature_manager } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
@@ -32,6 +32,7 @@ async function main(): Promise<void> {
   const queue = new TaskQueue(session_manager, config);
   const feature_manager = new FeatureManager(registry, queue, config);
   await feature_manager.load_persisted();
+  set_feature_manager(feature_manager);
 
   // Wire up session events to feature manager
   session_manager.on("session:started", (session) => {

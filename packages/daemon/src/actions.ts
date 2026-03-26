@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { FeatureState, LobsterFarmConfig, EntityConfig, ChannelType } from "@lobster-farm/shared";
-import { expand_home } from "@lobster-farm/shared";
+import type { FeatureState, EntityConfig, ChannelType, ArchetypeRole, ChannelMapping } from "@lobster-farm/shared";
+import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
+import type { FeatureManager } from "./features.js";
 
 const exec = promisify(execFile);
 
@@ -155,8 +156,15 @@ export async function run_tests(
 /** Global Discord bot reference, set by the daemon on startup. */
 let _discord: DiscordBot | null = null;
 
+/** Global feature manager reference, set by the daemon on startup. */
+let _features: FeatureManager | null = null;
+
 export function set_discord_bot(bot: DiscordBot | null): void {
   _discord = bot;
+}
+
+export function set_feature_manager(fm: FeatureManager | null): void {
+  _features = fm;
 }
 
 /** Send a notification to an entity's Discord channel (or log if not connected). */
@@ -173,24 +181,162 @@ export async function notify(
       entity_config.entity.id,
       channel_type as ChannelType,
       message,
-      (archetype as import("@lobster-farm/shared").ArchetypeRole) ?? "system",
+      (archetype as ArchetypeRole) ?? "system",
     );
   }
 }
 
-/** Stub: assign a work room to a feature. */
-export async function assign_work_room(
+/** Send a feature-scoped notification. Routes to work room if assigned, work_log as fallback. */
+export async function notify_feature(
   feature: FeatureState,
-  _entity_config: EntityConfig,
-): Promise<string | null> {
-  console.log(`[actions:stub] Would assign work room for ${feature.id}`);
-  return null;
+  message: string,
+  entity_config?: EntityConfig,
+  options?: { also_alerts?: boolean; also_general?: boolean },
+): Promise<void> {
+  const archetype = (feature.activeArchetype ?? "system") as ArchetypeRole | "system";
+
+  // Primary: send to work room (by channel ID) or work_log fallback
+  if (feature.discordWorkRoom && _discord) {
+    await _discord.send_as_agent(feature.discordWorkRoom, message, archetype);
+    console.log(`[actions:notify] [work_room:${feature.discordWorkRoom}] ${message}`);
+  } else {
+    await notify("work_log", message, entity_config, archetype);
+  }
+
+  // Secondary channels
+  if (options?.also_alerts) {
+    await notify("alerts", message, entity_config, archetype);
+  }
+  if (options?.also_general) {
+    await notify("general", message, entity_config, archetype);
+  }
 }
 
-/** Stub: release a work room. */
+// ── Entity config persistence ──
+
+/** Persist an entity's config back to YAML. Used after modifying dynamic channels. */
+export async function persist_entity_config(
+  entity_config: EntityConfig,
+): Promise<void> {
+  // The config object contains the full entity config; write it back to its YAML path.
+  // entity_config_path needs the paths config — extract from the path convention.
+  const config_path = entity_config_path(undefined, entity_config.entity.id);
+  await write_yaml(config_path, entity_config);
+  console.log(`[actions] Persisted entity config for ${entity_config.entity.id}`);
+}
+
+// ── Work room management ──
+
+/** Assign a work room to a feature. Finds a free static room or creates a dynamic one. */
+export async function assign_work_room(
+  feature: FeatureState,
+  entity_config: EntityConfig,
+): Promise<string | null> {
+  const channels = entity_config.entity.channels;
+  const work_rooms = channels.list.filter((c: ChannelMapping) => c.type === "work_room");
+
+  // Find rooms not assigned to an active (non-done) feature
+  const active = _features?.get_features_by_entity(feature.entity)
+    .filter(f => f.phase !== "done" && f.id !== feature.id) ?? [];
+  const occupied = new Set(
+    active.map(f => f.discordWorkRoom).filter((id): id is string => Boolean(id)),
+  );
+  const free_room = work_rooms.find((r: ChannelMapping) => !occupied.has(r.id));
+
+  let channel_id: string | null = null;
+
+  if (free_room) {
+    channel_id = free_room.id;
+    free_room.assigned_feature = feature.id;
+  } else {
+    // Overflow: create a dynamic room
+    const room_number = work_rooms.length + 1;
+    const name = `work-room-${String(room_number)}`;
+    const category_id = channels.category_id;
+
+    if (!_discord || !category_id) {
+      console.log("[actions] Cannot create dynamic room — no discord or category_id");
+      return null;
+    }
+
+    channel_id = await _discord.create_channel(
+      category_id, name, `Overflow for ${feature.id}`,
+    );
+    if (!channel_id) return null;
+
+    // Register in entity config
+    channels.list.push({
+      type: "work_room",
+      id: channel_id,
+      purpose: `Dynamic workspace for ${feature.id}`,
+      assigned_feature: feature.id,
+      dynamic: true,
+    });
+
+    // Persist entity config change to YAML
+    await persist_entity_config(entity_config);
+  }
+
+  // Set channel topic
+  if (_discord && channel_id) {
+    await _discord.set_channel_topic(
+      channel_id,
+      `🔵 ${feature.id} — #${String(feature.githubIssue)} — Building`,
+    );
+  }
+
+  // Rebuild channel map so Discord bot routes messages correctly
+  _discord?.build_channel_map();
+
+  console.log(`[actions] Assigned work room ${channel_id} to ${feature.id}`);
+  return channel_id;
+}
+
+/** Release a work room from a feature. Resets static rooms, deletes dynamic ones. */
 export async function release_work_room(
   feature: FeatureState,
-  _entity_config: EntityConfig,
+  entity_config: EntityConfig,
 ): Promise<void> {
-  console.log(`[actions:stub] Would release work room for ${feature.id}`);
+  if (!feature.discordWorkRoom) return;
+
+  const channel_id = feature.discordWorkRoom;
+  const channels = entity_config.entity.channels;
+  const entry = channels.list.find((c: ChannelMapping) => c.id === channel_id);
+
+  if (entry?.dynamic) {
+    // Dynamic room — farewell message, then delete
+    if (_discord) {
+      await _discord.send(
+        channel_id,
+        `Feature ${feature.id} complete. Cleaning up this work room.`,
+      );
+      await _discord.delete_channel(channel_id);
+    }
+    channels.list = channels.list.filter((c: ChannelMapping) => c.id !== channel_id);
+    await persist_entity_config(entity_config);
+  } else if (entry) {
+    // Static room — reset topic and clear assignment
+    entry.assigned_feature = null;
+    if (_discord) {
+      await _discord.set_channel_topic(channel_id, "🟢 Available");
+      await _discord.send(
+        channel_id,
+        `Feature ${feature.id} complete. This work room is now available.`,
+      );
+    }
+  }
+
+  // Rebuild channel map
+  _discord?.build_channel_map();
+
+  console.log(`[actions] Released work room ${channel_id} from ${feature.id}`);
+}
+
+/** Update the topic of a feature's work room. */
+export async function update_work_room_topic(
+  feature: FeatureState,
+  topic: string,
+): Promise<void> {
+  if (!feature.discordWorkRoom || !_discord) return;
+  await _discord.set_channel_topic(feature.discordWorkRoom, topic);
 }

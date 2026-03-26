@@ -10,6 +10,7 @@ export const ChannelMappingSchema = z.object({
   id: z.string(),
   purpose: z.string().optional(),
   assigned_feature: z.string().nullable().optional(),
+  dynamic: z.boolean().optional(),
 });
 export type ChannelMapping = z.infer<typeof ChannelMappingSchema>;
 
