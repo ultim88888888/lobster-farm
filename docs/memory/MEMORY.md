@@ -23,6 +23,7 @@
 
 ## Feedback
 - [feedback_collaboration_style.md](feedback_collaboration_style.md) — Be opinionated, socratic, ask questions
+- [feedback_collaboration.md](feedback_collaboration.md) — Think everything through, push back, be a genuine collaborator
 
 ## Architecture Reference
 Full architecture docs: `docs/architecture/` (README, TERMINOLOGY, STATUS, FILE-STRUCTURE, ARCHITECTURE, AGENT-FILES, RESEARCH)

@@ -53,18 +53,14 @@ function make_entity_config(repo_path: string): EntityConfig {
         structure: "monorepo",
       },
       accounts: {},
-      channels: [],
-      agent_mode: "hybrid",
-      models: {},
-      budget: {
-        monthly_warning_pct: 80,
-        monthly_limit: null,
+      channels: {
+        category_id: "",
+        list: [],
       },
       memory: {
         path: "~/.lobsterfarm/entities/test-entity/MEMORY.md",
         auto_extract: true,
       },
-      active_sops: ["feature-lifecycle"],
       secrets: {
         vault: "1password",
         vault_name: "test-vault",

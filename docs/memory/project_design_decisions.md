@@ -23,6 +23,16 @@ Four layers, hardest to softest:
 
 **SOPs should eventually be YAML state machines, not hardcoded TypeScript.** Lobster (OpenClaw's workflow engine) already does what our SOP engine needs. Whether we use Lobster directly or build our own equivalent is an open decision, but the target representation is declarative YAML with deterministic `run:` steps, LLM `pipeline:` steps, and `approval:` gates.
 
+## Daemon Installation & Entity Independence
+
+**The daemon and CLI should be installable independently of any entity.** When published, users install via `npm install -g @lobster-farm/cli` — no repo clone needed. The daemon binary lives in the global npm install, and `~/.lobsterfarm/` is pure runtime state. The lobster-farm repo only exists as an entity for platform developers (entity zero). This means no entity deletion — including lobster-farm itself — can kill the running daemon.
+
+**For the primary developer instance, the repo living inside the entity is fine.** But the launchd plist and daemon startup must reference the globally installed binary, not a path inside an entity directory. The monorepo's existing package structure (`packages/cli`, `packages/daemon`, `packages/shared`) already supports this — it's a publishing concern, not a restructuring one.
+
+**Why:** During development, deleting the lobster-farm entity to test scaffolding nuked the daemon's source/build artifacts. This chicken-and-egg problem only exists because the daemon runs from inside an entity. OpenClaw solves this by separating state (`~/.openclaw/`) from code (global install or dev repo), with profile isolation (`OPENCLAW_PROFILE`) for parallel instances.
+
+**How to apply:** When preparing for distribution, publish the three packages to npm. The launchd plist should point to the globally installed daemon binary. For development, support a `--dev` flag or equivalent that runs from the local repo instead.
+
 ## Other Decisions
 
 **GitHub accounts are per-entity, not global.** Different GitHub orgs/accounts for different entities. GitHub config belongs in entity config, not tools.md.

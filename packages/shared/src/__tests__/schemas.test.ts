@@ -99,30 +99,31 @@ describe("EntityConfigSchema", () => {
     expect(config.entity.id).toBe("alpha");
     expect(config.entity.status).toBe("active");
     expect(config.entity.repo.structure).toBe("monorepo");
-    expect(config.entity.agent_mode).toBe("hybrid");
-    expect(config.entity.channels).toEqual([]);
-    expect(config.entity.budget.monthly_warning_pct).toBe(80);
-    expect(config.entity.budget.monthly_limit).toBeNull();
-    expect(config.entity.active_sops).toEqual([]); // SOPs come from blueprint, not defaults
+    expect(config.entity.channels.category_id).toBe("");
+    expect(config.entity.channels.list).toEqual([]);
     expect(config.entity.secrets.vault).toBe("1password");
   });
 
-  it("accepts channels with abstract types", () => {
+  it("accepts channels with category and list", () => {
     const config = EntityConfigSchema.parse({
       ...MINIMAL_ENTITY,
       entity: {
         ...MINIMAL_ENTITY.entity,
-        channels: [
-          { type: "general", id: "discord-123", purpose: "Main channel" },
-          { type: "work_room", id: "discord-456", assigned_feature: "alpha-42" },
-          { type: "work_log", id: "discord-789" },
-          { type: "alerts", id: "discord-101" },
-        ],
+        channels: {
+          category_id: "cat-123",
+          list: [
+            { type: "general", id: "discord-123", purpose: "Main channel" },
+            { type: "work_room", id: "discord-456", assigned_feature: "alpha-42" },
+            { type: "work_log", id: "discord-789" },
+            { type: "alerts", id: "discord-101" },
+          ],
+        },
       },
     });
-    expect(config.entity.channels).toHaveLength(4);
-    expect(config.entity.channels[0]!.type).toBe("general");
-    expect(config.entity.channels[1]!.assigned_feature).toBe("alpha-42");
+    expect(config.entity.channels.category_id).toBe("cat-123");
+    expect(config.entity.channels.list).toHaveLength(4);
+    expect(config.entity.channels.list[0]!.type).toBe("general");
+    expect(config.entity.channels.list[1]!.assigned_feature).toBe("alpha-42");
   });
 
   it("accepts per-entity accounts", () => {

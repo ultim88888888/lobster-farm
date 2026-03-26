@@ -1,11 +1,9 @@
 import { z } from "zod";
 import {
   EntityStatusSchema,
-  AgentModeSchema,
   ChannelTypeSchema,
   RepoStructureSchema,
 } from "./enums.js";
-import { ModelTierSchema } from "./config.js";
 
 export const ChannelMappingSchema = z.object({
   type: ChannelTypeSchema,
@@ -15,6 +13,12 @@ export const ChannelMappingSchema = z.object({
 });
 export type ChannelMapping = z.infer<typeof ChannelMappingSchema>;
 
+export const ChannelsSchema = z.object({
+  category_id: z.string().default(""),
+  list: z.array(ChannelMappingSchema).default([]),
+}).default({ category_id: "", list: [] });
+export type Channels = z.infer<typeof ChannelsSchema>;
+
 // Per-entity configuration (~/.lobsterfarm/entities/{id}/config.yaml)
 // Uses snake_case keys to match YAML file format.
 export const EntityConfigSchema = z.object({
@@ -23,6 +27,10 @@ export const EntityConfigSchema = z.object({
     name: z.string(),
     description: z.string().default(""),
     status: EntityStatusSchema.default("active"),
+
+    // Blueprint this entity follows. Defines archetypes, SOPs, guidelines,
+    // channel structure, model defaults. Entity config only needs overrides.
+    blueprint: z.string().optional(),
 
     repo: z.object({
       url: z.string(),
@@ -43,41 +51,19 @@ export const EntityConfigSchema = z.object({
       }).optional(),
     }).default({}),
 
-    channels: z.array(ChannelMappingSchema).default([]),
-
-    // Blueprint this entity follows. Defines archetypes, SOPs, guidelines,
-    // channel structure, and model defaults. Entity config only needs overrides.
-    blueprint: z.string().optional(),
-
-    agent_mode: AgentModeSchema.default("hybrid"),
-
-    models: z.object({
-      planning: ModelTierSchema.optional(),
-      design: ModelTierSchema.optional(),
-      building: ModelTierSchema.optional(),
-      database: ModelTierSchema.optional(),
-      review: ModelTierSchema.optional(),
-      operations: ModelTierSchema.optional(),
-    }).default({}),
-
-    budget: z.object({
-      monthly_warning_pct: z.number().min(0).max(100).default(80),
-      monthly_limit: z.number().nullable().default(null),
-    }).default({}),
+    channels: ChannelsSchema,
 
     memory: z.object({
       path: z.string(),
       auto_extract: z.boolean().default(true),
     }),
 
-    // SOPs come from the blueprint. Only list overrides here.
-    active_sops: z.array(z.string()).default([]),
+    // SOPs and guidelines come from the blueprint. Only list overrides here.
     sop_overrides: z.object({
       add: z.array(z.string()).default([]),
       remove: z.array(z.string()).default([]),
     }).optional(),
 
-    // Guidelines come from the blueprint. Only list overrides here.
     guideline_overrides: z.object({
       add: z.array(z.string()).default([]),
       remove: z.array(z.string()).default([]),

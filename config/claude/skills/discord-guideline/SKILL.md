@@ -1,12 +1,12 @@
 ---
-name: discord-guide
+name: discord-guideline
 description: >
   Discord server management — creating channels, categories, webhooks,
   and managing permissions. Auto-loads when tasks involve Discord setup,
   channel scaffolding, or bot configuration.
 ---
 
-# Discord Guide
+# Discord Guideline
 
 _How to manage Discord servers in LobsterFarm. Covers the daemon API for scaffolding and direct discord.js patterns when needed._
 

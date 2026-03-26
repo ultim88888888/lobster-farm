@@ -44,24 +44,26 @@ The blueprint defines: archetypes, SOPs, guidelines, channel structure, model ti
 ```
 ~/.lobsterfarm/entities/{id}/
 ├── config.yaml          # Entity configuration
-├── MEMORY.md            # Long-term curated knowledge
+├── MEMORY.md            # Shared entity knowledge
 ├── context/             # Reference docs
 │   ├── decisions.md     # Append-only decision log
 │   └── gotchas.md       # Known issues and workarounds
+├── daily/               # Session logs (staging for MEMORY.md)
 ├── files/               # Arbitrary entity files
-└── repos/               # Entity codebases
+└── repos/               # Entity codebases (optional)
     └── {repo-name}/     # Git repo(s)
 ```
 
 ```bash
 mkdir -p ~/.lobsterfarm/entities/{id}/context
+mkdir -p ~/.lobsterfarm/entities/{id}/daily
 mkdir -p ~/.lobsterfarm/entities/{id}/files
 mkdir -p ~/.lobsterfarm/entities/{id}/repos
 ```
 
 ### 3. Write entity config
 
-The config references the blueprint. Only include overrides if the entity deviates from blueprint defaults.
+The config references the blueprint. Only include overrides if the entity deviates from blueprint defaults. Model tiers and SOPs come from the blueprint — don't duplicate them here.
 
 ```yaml
 entity:
@@ -72,7 +74,7 @@ entity:
   blueprint: {blueprint}
 
   repo:
-    url: {repo_url}        # GitHub URL or empty
+    url: {repo_url}        # GitHub URL or empty string for none
     path: {local_path}     # Local path to repo
     structure: monorepo    # or polyrepo
 
@@ -80,7 +82,9 @@ entity:
     github:
       user: {github_user}
 
-  channels: []              # Populated by step 6
+  channels:
+    category_id: ""        # Populated by step 6
+    list: []               # Populated by step 6
 
   # Override blueprint defaults only if needed:
   # sop_overrides:
@@ -139,7 +143,7 @@ mv {existing_path} ~/.lobsterfarm/entities/{id}/repos/{repo_name}
 ln -sf {existing_path} ~/.lobsterfarm/entities/{id}/repos/{repo_name}
 ```
 
-**`none`** — Skip repo setup. Entity has no codebase (content entity, research entity, etc.).
+**`none`** — Skip repo setup. Entity has no codebase (personal assistant, content entity, research entity, etc.). The entity still gets MEMORY.md, context/, and daily/ — memory is the primary artifact.
 
 If the repo exists, ensure it has a `CLAUDE.md` with project-level facts (stack, how to run tests, structure). Create one if missing.
 
@@ -153,9 +157,9 @@ curl -s -X POST http://localhost:7749/scaffold/entity \
   -d '{"entity_id": "{id}", "entity_name": "{name}"}'
 ```
 
-If the daemon API doesn't have a scaffold endpoint, use `!lf scaffold entity {id} {name}` in Discord.
+The daemon handles Discord authentication internally — **never access Discord tokens directly.** See the `secrets-guideline` skill.
 
-Update the entity config with the returned channel IDs.
+The endpoint returns the category ID and channel IDs. Update the entity config with these.
 
 ### 7. Register with daemon
 
@@ -164,8 +168,6 @@ Tell the daemon to reload its entity registry so it picks up the new entity:
 ```bash
 curl -s -X POST http://localhost:7749/reload
 ```
-
-If no reload endpoint exists, the daemon picks up new entities on restart.
 
 ### 8. Confirm
 
@@ -182,7 +184,8 @@ Report what was created:
 ## What NOT to do
 
 - Don't ask for tech stack (determined during planning)
-- Don't list SOPs directly in entity config (they come from the blueprint)
+- Don't list SOPs or model tiers in entity config (they come from the blueprint)
 - Don't skip Discord scaffolding without explaining why
 - Don't report success if core files are missing
 - Don't create files the blueprint doesn't specify
+- Don't access Discord tokens or any secrets directly — use daemon endpoints or `op run`

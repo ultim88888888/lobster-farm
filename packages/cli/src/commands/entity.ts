@@ -215,6 +215,7 @@ entity_command
         name: entity_name,
         description: description || "",
         status: "active",
+        blueprint: "software",
         repo: {
           url: repo_url,
           path: repo_path,
@@ -223,20 +224,14 @@ entity_command
         accounts: {
           ...(github_org ? { github: { org: github_org } } : {}),
         },
-        channels,
-        agent_mode: "hybrid",
-        models: {},
-        budget: { monthly_warning_pct: 80, monthly_limit: null },
+        channels: {
+          category_id: "",
+          list: channels,
+        },
         memory: {
           path: entity_dir(path_overrides, entity_id),
           auto_extract: true,
         },
-        active_sops: [
-          "feature-lifecycle",
-          "pr-review-merge",
-          "secrets-management",
-          "readme-maintenance",
-        ],
         secrets: {
           vault: "1password",
           vault_name: `entity-${entity_id}`,

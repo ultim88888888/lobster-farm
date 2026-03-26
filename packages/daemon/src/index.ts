@@ -84,7 +84,7 @@ async function main(): Promise<void> {
   }
 
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, feature_manager, commander);
+  const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null);
 
   // Write PID file
   await write_pid(config);

@@ -313,11 +313,12 @@ export class DiscordBot extends EventEmitter {
   async scaffold_entity(
     entity_id: string,
     entity_name: string,
-  ): Promise<Array<{ type: string; id: string; purpose: string }>> {
+  ): Promise<{ category_id: string; channels: Array<{ type: string; id: string; purpose: string }> }> {
     const guild = await this.get_guild();
-    if (!guild) return [];
+    if (!guild) return { category_id: "", channels: [] };
 
     const channels: Array<{ type: string; id: string; purpose: string }> = [];
+    let category_id = "";
 
     try {
       // Create entity category
@@ -334,6 +335,7 @@ export class DiscordBot extends EventEmitter {
         });
         console.log(`[discord] Created category "${category_name}"`);
       }
+      category_id = category.id;
 
       // Standard entity channels
       const entity_channels = [
@@ -369,7 +371,7 @@ export class DiscordBot extends EventEmitter {
       console.error(`[discord] Entity scaffold failed for ${entity_id}: ${String(err)}`);
     }
 
-    return channels;
+    return { category_id, channels };
   }
 
   /** Rebuild the channel → entity/type index from entity configs. */
@@ -381,7 +383,7 @@ export class DiscordBot extends EventEmitter {
       const entity_id = entity_config.entity.id;
       const entity_map = new Map<ChannelType, string>();
 
-      for (const channel of entity_config.entity.channels) {
+      for (const channel of entity_config.entity.channels.list) {
         this.channel_map.set(channel.id, {
           entity_id,
           channel_type: channel.type,
@@ -766,7 +768,7 @@ export class DiscordBot extends EventEmitter {
       await this.reply(message, `Setting up entity **${entity_id}** ("${entity_name}")...`);
 
       // 1. Create Discord channels
-      const channels = await this.scaffold_entity(entity_id, entity_name);
+      const { category_id, channels } = await this.scaffold_entity(entity_id, entity_name);
 
       // 2. Create directory structure
       const paths = this.config.paths;
@@ -787,26 +789,21 @@ export class DiscordBot extends EventEmitter {
           name: entity_name,
           description: "",
           status: "active",
+          blueprint: "software",
           repo: {
             url: repo_url || `git@github.com:org/${entity_id}.git`,
             path: `~/.lobsterfarm/entities/${entity_id}/repos/${entity_id}`,
             structure: "monorepo",
           },
           accounts: {},
-          channels,
-          agent_mode: "hybrid",
-          models: {},
-          budget: { monthly_warning_pct: 80, monthly_limit: null },
+          channels: {
+            category_id,
+            list: channels,
+          },
           memory: {
             path: entity_dir(paths, entity_id),
             auto_extract: true,
           },
-          active_sops: [
-            "feature-lifecycle",
-            "pr-review-merge",
-            "secrets-management",
-            "readme-maintenance",
-          ],
           secrets: {
             vault: "1password",
             vault_name: `entity-${entity_id}`,

@@ -6,6 +6,7 @@ import type { ClaudeSessionManager } from "./session.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import type { CommanderProcess } from "./commander-process.js";
+import type { DiscordBot } from "./discord.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -14,6 +15,7 @@ interface ServerContext {
   queue: TaskQueue;
   features: FeatureManager;
   commander: CommanderProcess | null;
+  discord: DiscordBot | null;
 }
 
 type RouteHandler = (
@@ -318,6 +320,51 @@ const handle_approve_feature: RouteHandler = (_req, res, ctx) => {
   }
 };
 
+// ── Scaffold routes ──
+
+const handle_scaffold_entity: RouteHandler = async (req, res, ctx) => {
+  const body = await read_body(req);
+  let params: { entity_id?: string; entity_name?: string };
+  try {
+    params = JSON.parse(body) as { entity_id?: string; entity_name?: string };
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!params.entity_id || !params.entity_name) {
+    json_response(res, 400, { error: "Missing required fields: entity_id, entity_name" });
+    return;
+  }
+
+  if (!ctx.discord) {
+    json_response(res, 503, { error: "Discord bot not connected" });
+    return;
+  }
+
+  try {
+    const result = await ctx.discord.scaffold_entity(params.entity_id, params.entity_name);
+    json_response(res, 201, result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 500, { error: msg });
+  }
+};
+
+const handle_reload: RouteHandler = async (_req, res, ctx) => {
+  try {
+    await ctx.registry.load_all();
+    json_response(res, 200, {
+      ok: true,
+      entities: ctx.registry.count(),
+      active: ctx.registry.get_active().length,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 500, { error: msg });
+  }
+};
+
 // ── Router ──
 
 const routes: Route[] = [
@@ -332,6 +379,8 @@ const routes: Route[] = [
   { method: "GET", pattern: /^\/features\/[a-z0-9-]+$/, handler: handle_get_feature },
   { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/advance$/, handler: handle_advance_feature },
   { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/approve$/, handler: handle_approve_feature },
+  { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
+  { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },
   { method: "POST", pattern: /^\/webhooks\/sentry$/, handler: handle_webhook_sentry },
   { method: "POST", pattern: /^\/hooks\/stop$/, handler: handle_stop_hook },
@@ -368,9 +417,10 @@ export function start_server(
   queue: TaskQueue,
   features: FeatureManager,
   commander: CommanderProcess | null = null,
+  discord: DiscordBot | null = null,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander };
+  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander, discord };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);
