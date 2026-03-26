@@ -96,6 +96,7 @@ export class BotPool extends EventEmitter {
   private bots: PoolBot[] = [];
   private config: LobsterFarmConfig;
   private _draining = false;
+  private health_timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -186,6 +187,7 @@ export class BotPool extends EventEmitter {
     archetype: ArchetypeRole,
     resume_session_id?: string,
     channel_type?: ChannelType,
+    working_dir?: string,
   ): Promise<PoolAssignment | null> {
     if (this._draining) {
       console.log("[pool] Rejecting assignment — draining");
@@ -293,9 +295,9 @@ export class BotPool extends EventEmitter {
     // Set Discord nickname to match the archetype
     await this.set_bot_nickname(bot.state_dir, archetype);
 
-    // Start the tmux session
-    const working_dir = entity_dir(this.config.paths, entity_id);
-    await this.start_tmux(bot, archetype, entity_id, working_dir, resume_session_id);
+    // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
+    const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
+    await this.start_tmux(bot, archetype, entity_id, resolved_dir, resume_session_id);
 
     // Update bot state
     bot.state = "assigned";
@@ -326,6 +328,7 @@ export class BotPool extends EventEmitter {
     const bot = this.bots.find(b => b.channel_id === channel_id);
     if (!bot) return;
 
+    const bot_id = bot.id;
     this.kill_tmux(bot.tmux_session);
 
     bot.state = "free";
@@ -339,7 +342,8 @@ export class BotPool extends EventEmitter {
     // Clear access.json
     await this.write_access_json(bot.state_dir, null);
 
-    console.log(`[pool] Released pool-${String(bot.id)}`);
+    console.log(`[pool] Released pool-${String(bot_id)}`);
+    this.emit("bot:released", { bot_id });
   }
 
   /** Park a bot — preserve session ID for later resume, free the bot. */
@@ -448,8 +452,69 @@ export class BotPool extends EventEmitter {
     }
   }
 
+  /**
+   * Start the tmux session health monitor.
+   * Checks every 30 seconds for assigned bots whose tmux sessions have died.
+   * Emits "bot:session_ended" and cleans up bot state when a dead session is found.
+   */
+  start_health_monitor(): void {
+    if (this.health_timer) return; // already running
+
+    this.health_timer = setInterval(() => {
+      this.check_assigned_health();
+    }, 30_000);
+
+    console.log("[pool] Health monitor started (30s interval)");
+  }
+
+  /** Stop the health monitor. */
+  stop_health_monitor(): void {
+    if (this.health_timer) {
+      clearInterval(this.health_timer);
+      this.health_timer = null;
+      console.log("[pool] Health monitor stopped");
+    }
+  }
+
+  /**
+   * Check all assigned bots for dead tmux sessions.
+   * Protected so tests can call it directly without waiting for the interval.
+   */
+  protected check_assigned_health(): void {
+    for (const bot of this.bots) {
+      if (bot.state !== "assigned") continue;
+      if (this.is_tmux_alive(bot.tmux_session)) continue;
+
+      // Tmux session died — emit event and clean up
+      const event_data = {
+        bot_id: bot.id,
+        channel_id: bot.channel_id,
+        entity_id: bot.entity_id,
+      };
+
+      console.log(
+        `[pool] Detected dead tmux session for pool-${String(bot.id)} ` +
+        `(channel: ${bot.channel_id ?? "none"})`,
+      );
+
+      // Reset bot to free state
+      bot.state = "free";
+      bot.channel_id = null;
+      bot.entity_id = null;
+      bot.archetype = null;
+      bot.channel_type = null;
+      bot.session_id = null;
+      bot.last_active = null;
+
+      this.emit("bot:session_ended", event_data);
+      this.emit("bot:released", { bot_id: bot.id });
+    }
+  }
+
   /** Stop all pool bot sessions. Used during daemon shutdown. */
   async shutdown(): Promise<void> {
+    this.stop_health_monitor();
+
     for (const bot of this.bots) {
       if (bot.state === "assigned") {
         this.kill_tmux(bot.tmux_session);

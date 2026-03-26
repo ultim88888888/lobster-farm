@@ -23,6 +23,7 @@ export const FeatureStateSchema = z.object({
   blockedReason: z.string().nullable().default(null),
   approved: z.boolean().default(false),
   labels: z.array(z.string()).default([]),
+  poolBotId: z.number().int().nullable().default(null),
   prNumber: z.number().int().nullable().default(null),
   agentDone: z.boolean().default(false),
   createdAt: z.string().datetime(),
