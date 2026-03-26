@@ -40,6 +40,18 @@ export interface QueueStats {
   failed_total: number;
 }
 
+// ── Errors ──
+
+/** Thrown when the queue is at max_queue_depth and cannot accept more tasks. */
+export class QueueFullError extends Error {
+  readonly code = "QUEUE_FULL";
+
+  constructor(max_depth: number) {
+    super(`Queue is full (max_queue_depth: ${String(max_depth)}). Try again later.`);
+    this.name = "QueueFullError";
+  }
+}
+
 // ── Priority ordering ──
 
 const PRIORITY_ORDER: Record<Priority, number> = {
@@ -56,6 +68,7 @@ export class TaskQueue {
   private active = new Map<string, QueuedTask>();
   private completed_count = 0;
   private failed_count = 0;
+  private on_drain_callback: (() => void) | null = null;
 
   constructor(
     private session_manager: ClaudeSessionManager,
@@ -71,8 +84,13 @@ export class TaskQueue {
     });
   }
 
-  /** Submit a new task. Returns the task ID. */
+  /** Submit a new task. Returns the task ID. Throws QueueFullError if at max_queue_depth. */
   submit(submission: TaskSubmission): string {
+    const max_depth = this.config.concurrency.max_queue_depth;
+    if (this.pending.length >= max_depth) {
+      throw new QueueFullError(max_depth);
+    }
+
     const task: QueuedTask = {
       ...submission,
       id: randomUUID(),
@@ -169,6 +187,19 @@ export class TaskQueue {
     return [...this.active.values()];
   }
 
+  /** Number of tasks waiting to be processed. */
+  get pending_count(): number {
+    return this.pending.length;
+  }
+
+  /**
+   * Register a callback to be invoked when a task completes and capacity frees up.
+   * Used by FeatureManager to retry features blocked due to queue-full.
+   */
+  on_drain(callback: () => void): void {
+    this.on_drain_callback = callback;
+  }
+
   /** Get queue statistics for the /status endpoint. */
   get_stats(): QueueStats {
     return {
@@ -195,8 +226,9 @@ export class TaskQueue {
       }
     }
 
-    // Process next pending task
+    // Process next pending task, then notify drain listeners so blocked features can retry
     void this.process_next();
+    this.notify_drain();
   }
 
   private on_session_failed(session_id: string, error: string): void {
@@ -213,8 +245,19 @@ export class TaskQueue {
       }
     }
 
-    // Process next pending task
+    // Process next pending task, then notify drain listeners so blocked features can retry
     void this.process_next();
+    this.notify_drain();
+  }
+
+  private notify_drain(): void {
+    if (this.on_drain_callback) {
+      try {
+        this.on_drain_callback();
+      } catch (err) {
+        console.error("[queue] Drain callback error:", err);
+      }
+    }
   }
 
   private sort_pending(): void {

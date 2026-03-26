@@ -11,12 +11,19 @@ import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
+import { check_required_binaries, propagate_tmux_env } from "./env.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
 
+  // Verify environment before any initialization
+  check_required_binaries();
+
   // Load global config
   const config = await load_config();
+
+  // Propagate env to tmux (after config load, before pool init)
+  propagate_tmux_env();
 
   // Initialize entity registry
   const registry = new EntityRegistry(config);
