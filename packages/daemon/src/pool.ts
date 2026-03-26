@@ -6,7 +6,6 @@ import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
-import { build_entity_context } from "./session.js";
 
 // ── Types ──
 
@@ -456,15 +455,9 @@ export class BotPool {
       claude_args.push("--resume", resume_session_id);
     }
 
-    // Inject entity context — parity with headless sessions in session.ts
-    try {
-      const feature_id = ""; // Pool bots may not have a feature; empty is safe
-      const entity_context = await build_entity_context(entity_id, feature_id, this.config);
-      claude_args.push("--append-system-prompt", entity_context);
-    } catch (err) {
-      console.log(`[pool] Failed to build entity context for pool-${String(bot.id)}: ${String(err)}`);
-      // Fail open — bot starts without context rather than failing entirely
-    }
+    // Note: entity context is NOT injected via --append-system-prompt for pool bots.
+    // Multi-line context strings break tmux command parsing. Pool bots load context
+    // naturally via CLAUDE.md, skills, and entity memory in the working directory.
 
     const display_name = resolve_agent_display_name(archetype, this.config);
     const git_env = `GIT_AUTHOR_NAME="${display_name} (LobsterFarm)" GIT_AUTHOR_EMAIL="${agent_name}@lobsterfarm.dev" GIT_COMMITTER_NAME="${display_name} (LobsterFarm)" GIT_COMMITTER_EMAIL="${agent_name}@lobsterfarm.dev"`;
