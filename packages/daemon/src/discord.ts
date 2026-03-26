@@ -768,7 +768,7 @@ export class DiscordBot extends EventEmitter {
     const issue_number = Date.now() % 10000;
 
     try {
-      const feature = features.create_feature({
+      const feature = await features.create_feature({
         entity_id,
         title,
         github_issue: issue_number,

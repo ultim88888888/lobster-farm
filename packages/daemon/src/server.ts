@@ -221,6 +221,8 @@ function task_summary(task: { id: string; entity_id: string; feature_id: string;
 
 // ── Feature routes ──
 
+const VALID_START_PHASES = ["plan", "design", "build"];
+
 const handle_create_feature: RouteHandler = async (req, res, ctx) => {
   const body = await read_body(req);
   let opts: CreateFeatureOptions;
@@ -238,8 +240,16 @@ const handle_create_feature: RouteHandler = async (req, res, ctx) => {
     return;
   }
 
+  // Validate start_phase before passing to feature manager
+  if (opts.start_phase !== undefined && !VALID_START_PHASES.includes(opts.start_phase)) {
+    json_response(res, 400, {
+      error: `Invalid start_phase "${opts.start_phase}". Must be one of: ${VALID_START_PHASES.join(", ")}`,
+    });
+    return;
+  }
+
   try {
-    const feature = ctx.features.create_feature(opts);
+    const feature = await ctx.features.create_feature(opts);
     json_response(res, 201, feature);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

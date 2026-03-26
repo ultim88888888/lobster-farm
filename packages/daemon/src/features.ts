@@ -104,12 +104,16 @@ function resolve_prompt(
 
 // ── Feature Manager ──
 
+/** Phases that are valid as a starting phase for feature creation. */
+const VALID_START_PHASES: readonly Phase[] = ["plan", "design", "build"] as const;
+
 export interface CreateFeatureOptions {
   entity_id: string;
   title: string;
   github_issue: number;
   priority?: Priority;
   labels?: string[];
+  start_phase?: Phase;
 }
 
 export class FeatureManager extends EventEmitter {
@@ -141,11 +145,23 @@ export class FeatureManager extends EventEmitter {
     await save_features([...this.features.values()], this.config);
   }
 
-  /** Create a new feature. Starts in the "plan" phase and spawns the planner. */
-  create_feature(opts: CreateFeatureOptions): FeatureState {
+  /**
+   * Create a new feature.
+   * Defaults to "plan" phase. Pass `start_phase` to skip earlier phases
+   * (e.g., "build" when the spec is already written on the GitHub issue).
+   */
+  async create_feature(opts: CreateFeatureOptions): Promise<FeatureState> {
     const entity = this.registry.get(opts.entity_id);
     if (!entity) {
       throw new Error(`Entity "${opts.entity_id}" not found`);
+    }
+
+    const start_phase = opts.start_phase ?? "plan";
+
+    if (!VALID_START_PHASES.includes(start_phase)) {
+      throw new Error(
+        `Invalid start_phase "${start_phase}". Must be one of: ${VALID_START_PHASES.join(", ")}`,
+      );
     }
 
     const id = `${opts.entity_id}-${String(opts.github_issue)}`;
@@ -156,7 +172,7 @@ export class FeatureManager extends EventEmitter {
       entity: opts.entity_id,
       githubIssue: opts.github_issue,
       title: opts.title,
-      phase: "plan",
+      phase: start_phase,
       priority: opts.priority ?? "medium",
       branch,
       worktreePath: null,
@@ -177,16 +193,23 @@ export class FeatureManager extends EventEmitter {
     };
 
     this.features.set(id, feature);
-    void this.persist();
+
+    // Run entry actions for the start phase (e.g., build creates a worktree and assigns a work room).
+    // Skipped for "plan" — plan has no entry actions in run_entry_actions.
+    if (start_phase !== "plan") {
+      await this.run_entry_actions(feature, start_phase);
+    }
+
+    // Spawn the agent for the start phase
+    const phase_config = PHASE_CONFIG[start_phase];
+    void this.spawn_phase_agent(feature, phase_config);
 
     console.log(
-      `[features] Created feature ${id}: "${opts.title}" (phase: plan)`,
+      `[features] Created feature ${id}: "${opts.title}" (phase: ${start_phase})`,
     );
 
-    // Auto-spawn the planner agent. The approval gate is for leaving plan,
-    // not entering it — Gary should start writing the spec immediately.
-    const plan_config = PHASE_CONFIG.plan;
-    void this.spawn_phase_agent(feature, plan_config);
+    // Persist after entry actions so worktreePath / discordWorkRoom are captured
+    void this.persist();
 
     this.emit("feature:created", feature);
     return feature;
