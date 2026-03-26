@@ -10,6 +10,7 @@ import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
 import { BotPool } from "./pool.js";
+import { PRReviewCron } from "./pr-cron.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -93,6 +94,15 @@ async function main(): Promise<void> {
   // Start HTTP server
   const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null, pool);
 
+  // Start PR review cron
+  const pr_cron = new PRReviewCron(
+    registry,
+    session_manager,
+    config,
+    discord_connected ? discord : null,
+  );
+  pr_cron.start();
+
   // Write PID file
   await write_pid(config);
   console.log(`PID file written (pid: ${String(process.pid)})`);
@@ -105,6 +115,9 @@ async function main(): Promise<void> {
     shutting_down = true;
 
     console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+    // Stop PR cron
+    pr_cron.stop();
 
     // Stop pool bots
     await pool.shutdown();
