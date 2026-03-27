@@ -213,6 +213,24 @@ export class FeatureManager extends EventEmitter {
     }
 
     const id = `${opts.entity_id}-${String(opts.github_issue)}`;
+
+    // Guard against duplicate creation.
+    // If the feature already exists and is active, reject the request to avoid
+    // orphaning an in-progress session or pool bot assignment.
+    // If the feature is in a terminal state ("done"), allow re-creation by
+    // removing the old entry first.
+    const existing = this.features.get(id);
+    if (existing) {
+      if (existing.phase === "done") {
+        this.features.delete(id);
+      } else {
+        throw new Error(
+          `Feature "${id}" already exists and is active (phase: ${existing.phase}). ` +
+            `Finish or remove the existing feature before re-creating it.`,
+        );
+      }
+    }
+
     const branch = `feature/${String(opts.github_issue)}-${slugify(opts.title)}`;
     const depends_on = opts.depends_on ?? [];
 
