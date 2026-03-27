@@ -1232,6 +1232,9 @@ export class FeatureManager extends EventEmitter {
       // Always release pool bot, even if merge fails — otherwise the slot is permanently occupied.
       // pool.release() kills the tmux session, so do this after any work room messaging is done.
       if (this.pool && work_room) {
+        // Clear session history for the work room — feature is done, no context to preserve
+        this.pool.clear_session_history(feature.entity, work_room);
+
         const assignment = this.pool.get_assignment(work_room);
         if (assignment) {
           await this.pool.release(work_room);
