@@ -101,6 +101,10 @@ export class BotPool extends EventEmitter {
   private config: LobsterFarmConfig;
   private _draining = false;
   private health_timer: ReturnType<typeof setInterval> | null = null;
+  /** In-flight lock: channels currently being assigned. Prevents check-then-act races. */
+  private assigning_channels = new Set<string>();
+  /** In-flight lock: channels currently being released. Prevents double-release races. */
+  private releasing_channels = new Set<string>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -262,121 +266,135 @@ export class BotPool extends EventEmitter {
       };
     }
 
-    // Check for a parked bot that was previously on this channel — auto-resume
-    const returning = this.bots.find(
-      b => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
-    );
-    let bot: PoolBot | undefined;
-    if (returning) {
-      resume_session_id = resume_session_id ?? returning.session_id ?? undefined;
-      bot = returning;
-      console.log(
-        `[pool] Reclaiming parked bot pool-${String(bot.id)} for channel ${channel_id} ` +
-        `(session: ${resume_session_id?.slice(0, 8) ?? "fresh"})`,
-      );
-    }
-
-    // Find a free bot if we don't have a returning one
-    if (!bot) {
-      bot = this.bots.find(b => b.state === "free");
-    }
-
-    // Activity-aware eviction: free → parked → idle assigned → waiting_for_human → FLOOR
-    // Within each tier: general channels before work rooms, then LRU.
-    const eviction_sort = (a: PoolBot, b: PoolBot) => {
-      const type_a = a.channel_type === "work_room" ? 1 : 0;
-      const type_b = b.channel_type === "work_room" ? 1 : 0;
-      if (type_a !== type_b) return type_a - type_b;
-      return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
-    };
-
-    // Tier 2: Parked bots (cheapest eviction — already suspended)
-    if (!bot) {
-      const parked = this.bots
-        .filter(b => b.state === "parked")
-        .sort(eviction_sort);
-
-      if (parked.length > 0) {
-        bot = parked[0];
-        console.log(`[pool] Evicting parked bot pool-${String(bot!.id)} (${bot!.channel_type ?? "unknown"} channel, LRU)`);
-      }
-    }
-
-    // Tier 3: Idle assigned bots (>= 30 min since last human interaction)
-    if (!bot) {
-      const idle_assigned = this.bots
-        .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "idle")
-        .sort(eviction_sort);
-
-      if (idle_assigned.length > 0) {
-        bot = idle_assigned[0];
-        console.log(`[pool] Evicting idle bot pool-${String(bot!.id)} — parking`);
-        await this.park_bot(bot!);
-      }
-    }
-
-    // Tier 4: Waiting-for-human bots (3-30 min since last interaction — expensive but necessary)
-    if (!bot) {
-      const waiting = this.bots
-        .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "waiting_for_human")
-        .sort(eviction_sort);
-
-      if (waiting.length > 0) {
-        bot = waiting[0];
-        console.log(`[pool] Evicting waiting-for-human bot pool-${String(bot!.id)} — parking`);
-        await this.park_bot(bot!);
-        // Notify that this session was parked with active context
-        this.emit("bot:parked_with_context", {
-          bot_id: bot!.id,
-          channel_id: bot!.channel_id,
-          entity_id: bot!.entity_id,
-        });
-      }
-    }
-
-    // FLOOR: active_conversation and working bots are NEVER evicted
-    if (!bot) {
-      console.log("[pool] All bots at floor (active/working) — no eviction possible");
+    // Synchronous in-flight lock: if another assign() call for this channel is
+    // already past the "already assigned?" check but hasn't written state yet,
+    // treat it as already assigned. This closes the check-then-act race where
+    // two concurrent callers both pass the check above before either writes.
+    if (this.assigning_channels.has(channel_id)) {
+      console.log(`[pool] Channel ${channel_id} has an in-flight assignment — skipping`);
       return null;
     }
+    this.assigning_channels.add(channel_id);
 
-    // Kill any existing tmux session
-    this.kill_tmux(bot.tmux_session);
+    try {
+      // Check for a parked bot that was previously on this channel — auto-resume
+      const returning = this.bots.find(
+        b => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
+      );
+      let bot: PoolBot | undefined;
+      if (returning) {
+        resume_session_id = resume_session_id ?? returning.session_id ?? undefined;
+        bot = returning;
+        console.log(
+          `[pool] Reclaiming parked bot pool-${String(bot.id)} for channel ${channel_id} ` +
+          `(session: ${resume_session_id?.slice(0, 8) ?? "fresh"})`,
+        );
+      }
 
-    // Update access.json with the channel ID
-    await this.write_access_json(bot.state_dir, channel_id);
+      // Find a free bot if we don't have a returning one
+      if (!bot) {
+        bot = this.bots.find(b => b.state === "free");
+      }
 
-    // Set Discord nickname to match the archetype
-    await this.set_bot_nickname(bot.state_dir, archetype);
+      // Activity-aware eviction: free → parked → idle assigned → waiting_for_human → FLOOR
+      // Within each tier: general channels before work rooms, then LRU.
+      const eviction_sort = (a: PoolBot, b: PoolBot) => {
+        const type_a = a.channel_type === "work_room" ? 1 : 0;
+        const type_b = b.channel_type === "work_room" ? 1 : 0;
+        if (type_a !== type_b) return type_a - type_b;
+        return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
+      };
 
-    // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
-    const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
-    await this.start_tmux(bot, archetype, entity_id, resolved_dir, resume_session_id);
+      // Tier 2: Parked bots (cheapest eviction — already suspended)
+      if (!bot) {
+        const parked = this.bots
+          .filter(b => b.state === "parked")
+          .sort(eviction_sort);
 
-    // Update bot state
-    bot.state = "assigned";
-    bot.channel_id = channel_id;
-    bot.entity_id = entity_id;
-    bot.archetype = archetype;
-    bot.channel_type = channel_type ?? null;
-    bot.session_id = resume_session_id ?? null;
-    bot.last_active = new Date();
+        if (parked.length > 0) {
+          bot = parked[0];
+          console.log(`[pool] Evicting parked bot pool-${String(bot!.id)} (${bot!.channel_type ?? "unknown"} channel, LRU)`);
+        }
+      }
 
-    await this.persist();
+      // Tier 3: Idle assigned bots (>= 30 min since last human interaction)
+      if (!bot) {
+        const idle_assigned = this.bots
+          .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "idle")
+          .sort(eviction_sort);
 
-    console.log(
-      `[pool] Assigned pool-${String(bot.id)} to channel ${channel_id} ` +
-      `as ${archetype} for entity ${entity_id}`,
-    );
+        if (idle_assigned.length > 0) {
+          bot = idle_assigned[0];
+          console.log(`[pool] Evicting idle bot pool-${String(bot!.id)} — parking`);
+          await this.park_bot(bot!);
+        }
+      }
 
-    return {
-      bot_id: bot.id,
-      channel_id,
-      entity_id,
-      archetype,
-      session_id: bot.session_id,
-      tmux_session: bot.tmux_session,
-    };
+      // Tier 4: Waiting-for-human bots (3-30 min since last interaction — expensive but necessary)
+      if (!bot) {
+        const waiting = this.bots
+          .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "waiting_for_human")
+          .sort(eviction_sort);
+
+        if (waiting.length > 0) {
+          bot = waiting[0];
+          console.log(`[pool] Evicting waiting-for-human bot pool-${String(bot!.id)} — parking`);
+          await this.park_bot(bot!);
+          // Notify that this session was parked with active context
+          this.emit("bot:parked_with_context", {
+            bot_id: bot!.id,
+            channel_id: bot!.channel_id,
+            entity_id: bot!.entity_id,
+          });
+        }
+      }
+
+      // FLOOR: active_conversation and working bots are NEVER evicted
+      if (!bot) {
+        console.log("[pool] All bots at floor (active/working) — no eviction possible");
+        return null;
+      }
+
+      // Kill any existing tmux session
+      this.kill_tmux(bot.tmux_session);
+
+      // Update access.json with the channel ID
+      await this.write_access_json(bot.state_dir, channel_id);
+
+      // Set Discord nickname to match the archetype
+      await this.set_bot_nickname(bot.state_dir, archetype);
+
+      // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
+      const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
+      await this.start_tmux(bot, archetype, entity_id, resolved_dir, resume_session_id);
+
+      // Update bot state
+      bot.state = "assigned";
+      bot.channel_id = channel_id;
+      bot.entity_id = entity_id;
+      bot.archetype = archetype;
+      bot.channel_type = channel_type ?? null;
+      bot.session_id = resume_session_id ?? null;
+      bot.last_active = new Date();
+
+      await this.persist();
+
+      console.log(
+        `[pool] Assigned pool-${String(bot.id)} to channel ${channel_id} ` +
+        `as ${archetype} for entity ${entity_id}`,
+      );
+
+      return {
+        bot_id: bot.id,
+        channel_id,
+        entity_id,
+        archetype,
+        session_id: bot.session_id,
+        tmux_session: bot.tmux_session,
+      };
+    } finally {
+      this.assigning_channels.delete(channel_id);
+    }
   }
 
   /** Release a bot from its channel assignment. */
@@ -384,24 +402,36 @@ export class BotPool extends EventEmitter {
     const bot = this.bots.find(b => b.channel_id === channel_id);
     if (!bot) return;
 
-    const bot_id = bot.id;
-    this.kill_tmux(bot.tmux_session);
+    // Synchronous in-flight lock: prevents double-release when two callers
+    // (e.g., health monitor + explicit release) race on the same channel.
+    if (this.releasing_channels.has(channel_id)) {
+      console.log(`[pool] Channel ${channel_id} already being released — skipping`);
+      return;
+    }
+    this.releasing_channels.add(channel_id);
 
-    bot.state = "free";
-    bot.channel_id = null;
-    bot.entity_id = null;
-    bot.archetype = null;
-    bot.channel_type = null;
-    bot.session_id = null;
-    bot.last_active = null;
+    try {
+      const bot_id = bot.id;
+      this.kill_tmux(bot.tmux_session);
 
-    // Clear access.json
-    await this.write_access_json(bot.state_dir, null);
+      bot.state = "free";
+      bot.channel_id = null;
+      bot.entity_id = null;
+      bot.archetype = null;
+      bot.channel_type = null;
+      bot.session_id = null;
+      bot.last_active = null;
 
-    await this.persist();
+      // Clear access.json
+      await this.write_access_json(bot.state_dir, null);
 
-    console.log(`[pool] Released pool-${String(bot_id)}`);
-    this.emit("bot:released", { bot_id });
+      await this.persist();
+
+      console.log(`[pool] Released pool-${String(bot_id)}`);
+      this.emit("bot:released", { bot_id });
+    } finally {
+      this.releasing_channels.delete(channel_id);
+    }
   }
 
   /** Park a bot — preserve session ID for later resume, free the bot. */

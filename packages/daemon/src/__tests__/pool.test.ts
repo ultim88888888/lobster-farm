@@ -428,4 +428,94 @@ describe("BotPool", () => {
       expect(result!.bot_id).toBe(1); // returning parked bot, not the free one
     });
   });
+
+  describe("concurrent assign() race condition", () => {
+    it("second concurrent assign for same channel returns null, not a duplicate bot", async () => {
+      pool.inject_bots([
+        make_bot({ id: 1, state: "free" }),
+        make_bot({ id: 2, state: "free" }),
+      ]);
+
+      // Slow down start_tmux to simulate an async gap where the race occurs
+      vi.spyOn(pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> }, "start_tmux" as never)
+        .mockImplementation(() => new Promise(resolve => setTimeout(resolve, 50)));
+
+      // Fire two assigns concurrently for the same channel
+      const [result_a, result_b] = await Promise.all([
+        pool.assign("ch-race", "e1", "builder", undefined, "work_room"),
+        pool.assign("ch-race", "e1", "builder", undefined, "work_room"),
+      ]);
+
+      // Exactly one should succeed, the other should get null (in-flight lock)
+      const results = [result_a, result_b];
+      const successes = results.filter(r => r !== null);
+      const nulls = results.filter(r => r === null);
+
+      expect(successes).toHaveLength(1);
+      expect(nulls).toHaveLength(1);
+      expect(successes[0]!.channel_id).toBe("ch-race");
+    });
+
+    it("in-flight lock is released after assign completes, allowing re-assignment", async () => {
+      pool.inject_bots([
+        make_bot({ id: 1, state: "free" }),
+      ]);
+
+      // First assign succeeds
+      const first = await pool.assign("ch-seq", "e1", "builder", undefined, "work_room");
+      expect(first).not.toBeNull();
+
+      // Second assign for same channel sees it as already assigned (not locked)
+      const second = await pool.assign("ch-seq", "e1", "builder", undefined, "work_room");
+      expect(second).not.toBeNull();
+      expect(second!.bot_id).toBe(first!.bot_id); // returns existing assignment
+    });
+
+    it("in-flight lock is released even if assign throws", async () => {
+      pool.inject_bots([
+        make_bot({ id: 1, state: "free" }),
+        make_bot({ id: 2, state: "free" }),
+      ]);
+
+      // Make start_tmux throw on first call, succeed on second
+      let call_count = 0;
+      vi.spyOn(pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> }, "start_tmux" as never)
+        .mockImplementation(async () => {
+          call_count++;
+          if (call_count === 1) throw new Error("tmux failed");
+        });
+
+      // First assign should throw
+      await expect(pool.assign("ch-err", "e1", "builder", undefined, "work_room"))
+        .rejects.toThrow("tmux failed");
+
+      // Lock should be released — second assign should proceed (not return null from lock)
+      const result = await pool.assign("ch-err", "e1", "builder", undefined, "work_room");
+      expect(result).not.toBeNull();
+    });
+  });
+
+  describe("concurrent release() race condition", () => {
+    it("second concurrent release for same channel is a no-op", async () => {
+      pool.inject_bots([
+        make_bot({ id: 1, state: "assigned", channel_id: "ch-rel", entity_id: "e1", archetype: "builder" }),
+      ]);
+
+      // Slow down write_access_json to create an async gap
+      vi.spyOn(pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> }, "write_access_json" as never)
+        .mockImplementation(() => new Promise(resolve => setTimeout(resolve, 50)));
+
+      const events: unknown[] = [];
+      pool.on("bot:released", (info: unknown) => events.push(info));
+
+      // Fire two releases concurrently for the same channel
+      await Promise.all([
+        pool.release("ch-rel"),
+        pool.release("ch-rel"),
+      ]);
+
+      // Only one bot:released event should fire (not two)
+      expect(events).toHaveLength(1);
+    });
+  });
 });
