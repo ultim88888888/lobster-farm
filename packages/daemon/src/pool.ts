@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -340,7 +341,7 @@ export class BotPool extends EventEmitter {
 
         // Start tmux with --resume to restore the previous session
         const working_dir = entity_dir(this.config.paths, candidate.entity_id);
-        await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!);
+        await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!, true);
 
         // Update bot state to assigned
         bot.state = "assigned";
@@ -498,8 +499,11 @@ export class BotPool extends EventEmitter {
       await this.set_bot_nickname(bot, archetype);
 
       // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
+      // For fresh sessions, generate a UUID so pool-state.json always has a session_id
+      // for proactive resume on daemon restart.
+      const session_id = resume_session_id ?? randomUUID();
       const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
-      await this.start_tmux(bot, archetype, entity_id, resolved_dir, resume_session_id);
+      await this.start_tmux(bot, archetype, entity_id, resolved_dir, session_id, !!resume_session_id);
 
       // Update bot state
       bot.state = "assigned";
@@ -507,7 +511,7 @@ export class BotPool extends EventEmitter {
       bot.entity_id = entity_id;
       bot.archetype = archetype;
       bot.channel_type = channel_type ?? null;
-      bot.session_id = resume_session_id ?? null;
+      bot.session_id = session_id;
       bot.last_active = new Date();
 
       await this.persist();
@@ -858,7 +862,8 @@ export class BotPool extends EventEmitter {
     archetype: ArchetypeRole,
     entity_id: string,
     working_dir: string,
-    resume_session_id?: string,
+    session_id: string,
+    is_resume: boolean = false,
   ): Promise<void> {
     const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
     const agent_name = resolve_agent_name(archetype, this.config);
@@ -873,8 +878,12 @@ export class BotPool extends EventEmitter {
       "--add-dir", sq(homedir()),
     ];
 
-    if (resume_session_id) {
-      claude_args.push("--resume", sq(resume_session_id));
+    if (is_resume) {
+      claude_args.push("--resume", sq(session_id));
+    } else {
+      // Fresh session — pass explicit session ID so pool-state.json can
+      // persist it for proactive resume on future daemon restarts.
+      claude_args.push("--session-id", sq(session_id));
     }
 
     // Note: entity context is NOT injected via --append-system-prompt for pool bots.
