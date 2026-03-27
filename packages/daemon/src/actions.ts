@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, exec as execCb } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { FeatureState, EntityConfig, ChannelType, ArchetypeRole, ChannelMapping } from "@lobster-farm/shared";
@@ -8,6 +8,7 @@ import type { FeatureManager } from "./features.js";
 import type { EntityRegistry } from "./registry.js";
 
 const exec = promisify(execFile);
+const exec_shell = promisify(execCb);
 
 /** Run a shell command and return stdout. Throws on non-zero exit. */
 async function run(
@@ -151,8 +152,12 @@ export async function run_tests(
   }
 
   try {
-    const [cmd, ...args] = command.split(" ");
-    await run(cmd!, args, feature.worktreePath);
+    // Use shell execution so commands with spaces, pipes, and quotes work correctly
+    await exec_shell(command, {
+      cwd: feature.worktreePath,
+      timeout: 60_000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
     console.log(`[actions] Tests passed for ${feature.id}`);
     return true;
   } catch {
@@ -162,6 +167,10 @@ export async function run_tests(
 }
 
 // ── Notifications ──
+
+// TODO: Refactor module globals (_discord, _features) to explicit parameter passing.
+// These are set once at daemon startup and used implicitly by action functions.
+// Moving to a context object or dependency injection would improve testability.
 
 /** Global Discord bot reference, set by the daemon on startup. */
 let _discord: DiscordBot | null = null;

@@ -164,6 +164,11 @@ export async function append_session_log(
 /**
  * Read session log entries for an entity.
  * Skips malformed lines gracefully. Supports optional `since` date filter and `limit`.
+ *
+ * Note: `since` filters entries before collecting, while `limit` truncates after.
+ * When both are provided, `limit` applies to the already-filtered result set.
+ * The entire file is read into memory first. For large files, consider implementing
+ * JSONL rotation (e.g., daily segments) to bound memory usage.
  */
 export async function read_session_log(
   entity_id: string,

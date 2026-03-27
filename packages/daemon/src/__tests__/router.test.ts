@@ -41,8 +41,11 @@ describe("parse_command", () => {
   it("returns null for non-commands", () => {
     expect(parse_command("hello world")).toBeNull();
     expect(parse_command("!lfx something")).toBeNull();
-    expect(parse_command("!lf")).toBeNull();
-    expect(parse_command("!lf ")).toBeNull();
+  });
+
+  it("returns help for bare !lf with no subcommand", () => {
+    expect(parse_command("!lf")).toEqual({ name: "help", args: [] });
+    expect(parse_command("!lf ")).toEqual({ name: "help", args: [] });
   });
 });
 

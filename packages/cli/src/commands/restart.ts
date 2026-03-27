@@ -25,12 +25,22 @@ export const restart_command = new Command("restart")
 
     console.log("Daemon restarting... tmux sessions preserved.");
 
-    // Give the new process a moment to start and write its PID file.
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // Poll for the new process to start and write its PID file.
+    const POLL_INTERVAL_MS = 500;
+    const TIMEOUT_MS = 10_000;
+    const start = Date.now();
+    let pid: number | null = null;
 
-    // Verify the daemon came back
-    const pid = await read_pid_file(pid_file_path());
-    if (pid !== null && is_process_running(pid)) {
+    while (Date.now() - start < TIMEOUT_MS) {
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+      pid = await read_pid_file(pid_file_path());
+      if (pid !== null && is_process_running(pid)) {
+        break;
+      }
+      pid = null;
+    }
+
+    if (pid !== null) {
       console.log(`Daemon is back online (PID ${pid}).`);
     } else {
       console.log("Warning: daemon may not have restarted. Check logs.");

@@ -7,7 +7,12 @@ const MODEL_IDS: Record<ModelName, string> = {
   haiku: "claude-haiku-4-5-20251001",
 };
 
-/** Map think levels to Claude CLI effort flags. */
+/**
+ * Map think levels to Claude CLI effort flags.
+ * "none" maps to "low" (not null) because Claude CLI's --effort low is the
+ * correct way to suppress extended thinking. Omitting --effort entirely would
+ * leave it at the model's default (which may include thinking).
+ */
 const EFFORT_MAP: Record<ThinkLevel, string | null> = {
   none: "low",
   standard: "medium",

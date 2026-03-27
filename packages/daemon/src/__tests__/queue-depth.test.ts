@@ -268,8 +268,8 @@ describe("Queue depth enforcement", () => {
     }, 15_000);
   });
 
-  describe("on_drain callback", () => {
-    it("calls the registered drain callback when a task completes", async () => {
+  describe("drain event", () => {
+    it("emits drain event when a task completes", async () => {
       const mock_claude = join(tmp, "mock-claude-fast");
       await writeFile(mock_claude, "#!/bin/bash\nexit 0\n", "utf-8");
       await chmod(mock_claude, 0o755);
@@ -282,7 +282,7 @@ describe("Queue depth enforcement", () => {
       const queue = new TaskQueue(mgr, config);
 
       let drain_called = 0;
-      queue.on_drain(() => {
+      queue.on("drain", () => {
         drain_called++;
       });
 

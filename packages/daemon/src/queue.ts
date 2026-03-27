@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import type {
   LobsterFarmConfig,
   ArchetypeRole,
@@ -63,17 +64,18 @@ const PRIORITY_ORDER: Record<Priority, number> = {
 
 // ── Task Queue ──
 
-export class TaskQueue {
+export class TaskQueue extends EventEmitter {
   private pending: QueuedTask[] = [];
   private active = new Map<string, QueuedTask>();
   private completed_count = 0;
   private failed_count = 0;
-  private on_drain_callback: (() => void) | null = null;
 
   constructor(
     private session_manager: ClaudeSessionManager,
     private config: LobsterFarmConfig,
   ) {
+    super();
+
     // When a session completes, mark the task and process the next one
     session_manager.on("session:completed", (result: SessionResult) => {
       this.on_session_completed(result.session_id, result.exit_code);
@@ -192,14 +194,6 @@ export class TaskQueue {
     return this.pending.length;
   }
 
-  /**
-   * Register a callback to be invoked when a task completes and capacity frees up.
-   * Used by FeatureManager to retry features blocked due to queue-full.
-   */
-  on_drain(callback: () => void): void {
-    this.on_drain_callback = callback;
-  }
-
   /** Get queue statistics for the /status endpoint. */
   get_stats(): QueueStats {
     return {
@@ -251,13 +245,7 @@ export class TaskQueue {
   }
 
   private notify_drain(): void {
-    if (this.on_drain_callback) {
-      try {
-        this.on_drain_callback();
-      } catch (err) {
-        console.error("[queue] Drain callback error:", err);
-      }
-    }
+    this.emit("drain");
   }
 
   private sort_pending(): void {

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
+import { resolve_model_id } from "./models.js";
 
 export interface CommanderHealth {
   state: "stopped" | "starting" | "running" | "crashed";
@@ -111,7 +112,7 @@ export class CommanderProcess extends EventEmitter {
       claude_bin,
       "--channels", "plugin:discord@claude-plugins-official",
       "--agent", agent_name,
-      "--model", "claude-opus-4-6",
+      "--model", resolve_model_id(this.config.defaults.models.planning),
       "--permission-mode", "bypassPermissions",
       "--add-dir", working_dir,
       "--add-dir", homedir(),

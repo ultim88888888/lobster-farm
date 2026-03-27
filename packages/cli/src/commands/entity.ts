@@ -24,17 +24,6 @@ entity_command
   .description("List all configured entities")
   .option("--prefix <dir>", "Use a custom prefix directory instead of ~/")
   .action(async (options: { prefix?: string }) => {
-    const path_overrides: Partial<PathConfig> | undefined = options.prefix
-      ? { lobsterfarm_dir: `${options.prefix}/.lobsterfarm` }
-      : undefined;
-
-    const ent_dir = join(
-      path_overrides?.lobsterfarm_dir
-        ? `${options.prefix!}/.lobsterfarm`
-        : entity_dir(undefined, "").replace(/\/[^/]*$/, ""),
-      "",
-    );
-
     // Simpler: just scan the entities directory
     const entities_base = join(
       options.prefix ? `${options.prefix}/.lobsterfarm` : `${process.env["HOME"] ?? "~"}/.lobsterfarm`,

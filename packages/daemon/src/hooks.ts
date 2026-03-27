@@ -80,7 +80,8 @@ export async function extract_session_learnings(
   ].join("\n");
 
   try {
-    const { stdout } = await exec("claude", [
+    const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
+    const { stdout } = await exec(claude_bin, [
       "-p",
       "--model", "haiku",
       "--no-session-persistence",

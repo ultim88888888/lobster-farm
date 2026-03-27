@@ -247,7 +247,8 @@ export class PRReviewCron {
         console.log(`[pr-cron] Review completed for PR #${String(pr.number)} in ${entity_id}`);
 
         // Persist completion so we don't re-review after restart
-        void this.persist_review_completion(entity_id, pr, repo_path);
+        void this.persist_review_completion(entity_id, pr, repo_path)
+          .catch(err => console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`));
       };
 
       const on_fail = (session_id: string, error: string) => {

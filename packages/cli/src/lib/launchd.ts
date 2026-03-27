@@ -111,6 +111,8 @@ ${env_section}`;
  */
 export function generate_wrapper_sh(node_path: string, daemon_path: string): string {
   const home = homedir();
+  // echo is intentional here — the #!/bin/zsh shebang guarantees zsh's echo builtin,
+  // which handles escape sequences consistently. printf would also work but is unnecessary.
   return `#!/bin/zsh
 # LobsterFarm daemon wrapper — managed by \`lf start\`, do not edit.
 # Sources env.sh for PATH and secrets, then exec's the daemon.

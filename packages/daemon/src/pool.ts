@@ -466,8 +466,14 @@ export class BotPool extends EventEmitter {
 
   /**
    * Check if a single bot is idle at the prompt (not actively processing).
-   * Returns true when the tmux pane shows a ❯ prompt or bypass permissions dialog.
-   * Fails open (returns true) when the tmux pane can't be read — safe for eviction checks.
+   *
+   * Semantics: returns true when the last line of the tmux pane contains a prompt
+   * character (❯) or a permissions dialog. This is a heuristic for "has prompt
+   * visible" — the bot is not actively generating output or running a command.
+   *
+   * Fails open (returns true) when the tmux pane can't be read, which is the safe
+   * default for eviction checks: we'd rather evict a bot we can't observe than
+   * refuse to evict when the pool is exhausted.
    */
   protected is_bot_idle(bot: PoolBot): boolean {
     try {
@@ -477,6 +483,8 @@ export class BotPool extends EventEmitter {
       );
       const lines = output.trim().split("\n");
       const last_line = lines[lines.length - 1] ?? "";
+      // "bypass permissions" matches the Claude Code workspace trust dialog text.
+      // This is UI-text dependent and may break if Claude Code changes the dialog wording.
       return last_line.includes("❯") || last_line.includes("bypass permissions");
     } catch {
       return true; // Can't check — assume idle (fail-open for eviction)

@@ -34,7 +34,7 @@ function parse_command(content: string): ParsedCommand | null {
   if (!trimmed.startsWith(COMMAND_PREFIX + " ") && trimmed !== COMMAND_PREFIX) return null;
 
   const after_prefix = trimmed.slice(COMMAND_PREFIX.length).trim();
-  if (!after_prefix) return null;
+  if (!after_prefix) return { name: "help", args: [] };
 
   // Parse args, respecting quoted strings
   const args: string[] = [];

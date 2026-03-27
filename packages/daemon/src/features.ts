@@ -151,7 +151,7 @@ export class FeatureManager extends EventEmitter {
     super();
 
     // When the queue drains (a task completes), retry features blocked due to queue-full
-    this.queue.on_drain(() => this.retry_queue_blocked());
+    this.queue.on("drain", () => this.retry_queue_blocked());
   }
 
   /**

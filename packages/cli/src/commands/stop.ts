@@ -1,5 +1,8 @@
 import { Command } from "commander";
 import { execFileSync } from "node:child_process";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { unload_service, is_service_loaded } from "../lib/launchd.js";
 import { read_pid_file, is_process_running } from "../lib/process.js";
 import { pid_file_path } from "@lobster-farm/shared";
@@ -16,11 +19,18 @@ export const stop_command = new Command("stop")
     // Kill all pool-N tmux sessions before stopping the daemon.
     // The daemon no longer kills tmux on SIGTERM (to support hot restart),
     // so `lf stop` is responsible for full cleanup.
-    for (let i = 0; i < 10; i++) {
-      try {
-        execFileSync("tmux", ["kill-session", "-t", `pool-${i}`], { stdio: "ignore" });
-      } catch { /* session may not exist */ }
-    }
+    // Scan for pool-* directories instead of hardcoding a count.
+    const channels_dir = join(homedir(), ".lobsterfarm", "channels");
+    try {
+      const entries = readdirSync(channels_dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith("pool-")) {
+          try {
+            execFileSync("tmux", ["kill-session", "-t", entry.name], { stdio: "ignore" });
+          } catch { /* session may not exist */ }
+        }
+      }
+    } catch { /* channels dir may not exist */ }
 
     // Unload the launchd service
     await unload_service();
