@@ -581,6 +581,8 @@ export class DiscordBot extends EventEmitter {
     // Intercept !reset — release current bot, next real message triggers fresh assignment
     if (message.content.trim().toLowerCase() === "!reset") {
       if (this._pool) {
+        // Clear session history so the next assignment starts fresh
+        this._pool.clear_session_history(entry.entity_id, message.channelId);
         await this._pool.release(message.channelId);
         await this.reply(message, "Session reset. Send a message to start fresh.");
       }

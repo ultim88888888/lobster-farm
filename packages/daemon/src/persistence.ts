@@ -99,28 +99,60 @@ export interface PersistedPoolBot {
   last_active: string | null;  // ISO timestamp
 }
 
-/** Save pool bot state to disk. Only assigned/parked bots should be included. */
+/** Persisted pool state: bots + session history for cross-eviction resume. */
+export interface PersistedPoolState {
+  bots: PersistedPoolBot[];
+  /** Maps "{entity_id}:{channel_id}" → session_id. Preserved across evictions
+   * so a channel can resume its old session when a bot is reassigned to it. */
+  session_history: Record<string, string>;
+}
+
+/** Save pool state (bots + session history) to disk. */
 export async function save_pool_state(
   bots: PersistedPoolBot[],
   config: LobsterFarmConfig,
+  session_history?: Record<string, string>,
 ): Promise<void> {
   const path = pool_state_path(config);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(bots, null, 2), "utf-8");
+  const state: PersistedPoolState = {
+    bots,
+    session_history: session_history ?? {},
+  };
+  await writeFile(path, JSON.stringify(state, null, 2), "utf-8");
 }
 
-/** Load pool bot state from disk. Returns empty array if file doesn't exist or is malformed. */
+/**
+ * Load pool state from disk.
+ * Backward-compatible: if the file contains a plain array (old format),
+ * treats it as bots-only with empty session history.
+ */
 export async function load_pool_state(
   config: LobsterFarmConfig,
-): Promise<PersistedPoolBot[]> {
+): Promise<PersistedPoolState> {
   const path = pool_state_path(config);
   try {
     const content = await readFile(path, "utf-8");
     const data: unknown = JSON.parse(content);
-    if (!Array.isArray(data)) return [];
-    return data as PersistedPoolBot[];
+
+    // Old format: plain array of bots
+    if (Array.isArray(data)) {
+      return { bots: data as PersistedPoolBot[], session_history: {} };
+    }
+
+    // New format: { bots, session_history }
+    if (typeof data === "object" && data !== null && "bots" in data) {
+      const obj = data as Record<string, unknown>;
+      const bots = Array.isArray(obj["bots"]) ? (obj["bots"] as PersistedPoolBot[]) : [];
+      const history = (typeof obj["session_history"] === "object" && obj["session_history"] !== null && !Array.isArray(obj["session_history"]))
+        ? (obj["session_history"] as Record<string, string>)
+        : {};
+      return { bots, session_history: history };
+    }
+
+    return { bots: [], session_history: {} };
   } catch {
-    return [];
+    return { bots: [], session_history: {} };
   }
 }
 

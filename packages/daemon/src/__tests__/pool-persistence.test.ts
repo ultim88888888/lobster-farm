@@ -144,47 +144,53 @@ describe("save_pool_state / load_pool_state", () => {
 
     await save_pool_state(bots, config);
 
-    // Verify the file is valid JSON
+    // Verify the file is valid JSON with new format
     const raw = await readFile(join(temp_dir, "state", "pool-state.json"), "utf-8");
-    const parsed = JSON.parse(raw) as unknown;
-    expect(Array.isArray(parsed)).toBe(true);
-    expect(parsed).toHaveLength(2);
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    expect(parsed).toHaveProperty("bots");
+    expect(parsed).toHaveProperty("session_history");
+    expect(Array.isArray(parsed["bots"])).toBe(true);
+    expect(parsed["bots"]).toHaveLength(2);
 
     // Load it back
     const loaded = await load_pool_state(config);
-    expect(loaded).toHaveLength(2);
-    expect(loaded[0]!.id).toBe(1);
-    expect(loaded[0]!.state).toBe("assigned");
-    expect(loaded[0]!.session_id).toBe("sess-abc");
-    expect(loaded[1]!.id).toBe(3);
-    expect(loaded[1]!.state).toBe("parked");
-    expect(loaded[1]!.channel_type).toBe("work_room");
+    expect(loaded.bots).toHaveLength(2);
+    expect(loaded.bots[0]!.id).toBe(1);
+    expect(loaded.bots[0]!.state).toBe("assigned");
+    expect(loaded.bots[0]!.session_id).toBe("sess-abc");
+    expect(loaded.bots[1]!.id).toBe(3);
+    expect(loaded.bots[1]!.state).toBe("parked");
+    expect(loaded.bots[1]!.channel_type).toBe("work_room");
   });
 
-  it("returns empty array when file does not exist", async () => {
+  it("returns empty state when file does not exist", async () => {
     const config = make_config();
     const result = await load_pool_state(config);
-    expect(result).toEqual([]);
+    expect(result).toEqual({ bots: [], session_history: {} });
   });
 
-  it("returns empty array for malformed JSON", async () => {
+  it("returns empty state for malformed JSON", async () => {
     const config = make_config();
     const state_path = join(temp_dir, "state");
     await mkdir(state_path, { recursive: true });
     await writeFile(join(state_path, "pool-state.json"), "not valid json{{{", "utf-8");
 
     const result = await load_pool_state(config);
-    expect(result).toEqual([]);
+    expect(result).toEqual({ bots: [], session_history: {} });
   });
 
-  it("returns empty array when file contains a non-array JSON value", async () => {
+  it("backward compat: loads old-format plain array as bots-only", async () => {
     const config = make_config();
     const state_path = join(temp_dir, "state");
     await mkdir(state_path, { recursive: true });
-    await writeFile(join(state_path, "pool-state.json"), '{"not": "array"}', "utf-8");
+    // Old format: plain array of bots
+    const old_bots = [make_persisted_bot({ id: 1, session_id: "sess-old" })];
+    await writeFile(join(state_path, "pool-state.json"), JSON.stringify(old_bots), "utf-8");
 
     const result = await load_pool_state(config);
-    expect(result).toEqual([]);
+    expect(result.bots).toHaveLength(1);
+    expect(result.bots[0]!.session_id).toBe("sess-old");
+    expect(result.session_history).toEqual({});
   });
 
   it("creates state directory if missing", async () => {
@@ -194,7 +200,7 @@ describe("save_pool_state / load_pool_state", () => {
     await save_pool_state([make_persisted_bot({ id: 1 })], config);
 
     const loaded = await load_pool_state(config);
-    expect(loaded).toHaveLength(1);
+    expect(loaded.bots).toHaveLength(1);
   });
 });
 
@@ -245,7 +251,7 @@ describe("BotPool persistence", () => {
 
       const saved = await load_pool_state(config);
       // Bot 2 is still free — should NOT appear in persisted state
-      const ids = saved.map(b => b.id);
+      const ids = saved.bots.map(b => b.id);
       expect(ids).not.toContain(2); // free bot excluded
 
       // Bots 1 (now assigned), 3 (assigned), 4 (parked) should be persisted
@@ -254,7 +260,7 @@ describe("BotPool persistence", () => {
       expect(ids).toContain(4);
 
       // Verify no free bots leak through
-      for (const bot of saved) {
+      for (const bot of saved.bots) {
         expect(bot.state).not.toBe("free");
         expect(bot.channel_id).toBeTruthy();
         expect(bot.entity_id).toBeTruthy();
@@ -269,8 +275,8 @@ describe("BotPool persistence", () => {
 
       // Verify state was written to disk
       const saved = await load_pool_state(config);
-      expect(saved.length).toBeGreaterThanOrEqual(1);
-      const assigned = saved.find(b => b.channel_id === "ch-1");
+      expect(saved.bots.length).toBeGreaterThanOrEqual(1);
+      const assigned = saved.bots.find(b => b.channel_id === "ch-1");
       expect(assigned).toBeDefined();
       expect(assigned!.state).toBe("assigned");
       expect(assigned!.entity_id).toBe("e1");
@@ -293,7 +299,7 @@ describe("BotPool persistence", () => {
 
       const saved = await load_pool_state(config);
       // After release, bot should be free — not in persisted state
-      const released = saved.find(b => b.id === 1);
+      const released = saved.bots.find(b => b.id === 1);
       expect(released).toBeUndefined();
     });
 
@@ -329,7 +335,7 @@ describe("BotPool persistence", () => {
 
       const saved = await load_pool_state(config);
       // The bot should now be assigned to ch-new
-      const bot = saved.find(b => b.id === 1);
+      const bot = saved.bots.find(b => b.id === 1);
       expect(bot).toBeDefined();
       expect(bot!.channel_id).toBe("ch-new");
       expect(bot!.state).toBe("assigned");
@@ -558,9 +564,9 @@ describe("BotPool persistence", () => {
 
       // Re-read persisted state — should only contain the valid entry
       const cleaned = await load_pool_state(config);
-      expect(cleaned).toHaveLength(1);
-      expect(cleaned[0]!.id).toBe(1);
-      expect(cleaned[0]!.entity_id).toBe("test-entity");
+      expect(cleaned.bots).toHaveLength(1);
+      expect(cleaned.bots[0]!.id).toBe(1);
+      expect(cleaned.bots[0]!.entity_id).toBe("test-entity");
     });
   });
 
@@ -587,8 +593,8 @@ describe("BotPool persistence", () => {
 
       // Verify persisted state
       const saved = await load_pool_state(config);
-      expect(saved).toHaveLength(1);
-      expect(saved[0]!.session_id).toBe("sess-original-123");
+      expect(saved.bots).toHaveLength(1);
+      expect(saved.bots[0]!.session_id).toBe("sess-original-123");
 
       // Phase 2: Simulate daemon restart — create fresh pool, restore state
       const channels_dir = join(temp_dir, "channels", "pool-1");
@@ -1027,7 +1033,7 @@ describe("BotPool persistence", () => {
 
       // Re-read persisted state from disk
       const saved = await load_pool_state(cfg);
-      const bot_entry = saved.find(b => b.id === 1);
+      const bot_entry = saved.bots.find(b => b.id === 1);
       expect(bot_entry).toBeDefined();
       expect(bot_entry!.state).toBe("assigned");
       expect(bot_entry!.channel_id).toBe("ch-1");

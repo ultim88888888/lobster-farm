@@ -116,6 +116,9 @@ export class BotPool extends EventEmitter {
   /** Bots that were actively assigned before shutdown and should be proactively resumed.
    * Populated during initialize(), consumed by resume_parked_bots(). */
   private resume_candidates: PersistedPoolBot[] = [];
+  /** Maps "{entity_id}:{channel_id}" → session_id. Preserves session context
+   * across evictions so a channel can resume its old session when reassigned. */
+  private session_history = new Map<string, string>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -208,11 +211,19 @@ export class BotPool extends EventEmitter {
     }
 
     // Restore persisted assignments from last run
-    const saved = await load_pool_state(this.config);
+    const saved_state = await load_pool_state(this.config);
     let restored = 0;
     this.resume_candidates = [];
 
-    for (const entry of saved) {
+    // Restore session history from persisted state
+    for (const [key, session_id] of Object.entries(saved_state.session_history)) {
+      this.session_history.set(key, session_id);
+    }
+    if (this.session_history.size > 0) {
+      console.log(`[pool] Restored ${String(this.session_history.size)} session history entries`);
+    }
+
+    for (const entry of saved_state.bots) {
       const bot = this.bots.find(b => b.id === entry.id);
       if (!bot) continue; // Bot directory removed since last run
 
@@ -425,6 +436,21 @@ export class BotPool extends EventEmitter {
         );
       }
 
+      // Check session_history for a previously evicted session on this channel.
+      // Only used if no explicit resume_session_id was provided and no parked bot
+      // was found (parked bots carry their own session_id).
+      if (!resume_session_id) {
+        const history_key = `${entity_id}:${channel_id}`;
+        const history_session = this.session_history.get(history_key);
+        if (history_session) {
+          resume_session_id = history_session;
+          console.log(
+            `[pool] Found session history for channel ${channel_id}: ` +
+            `${resume_session_id.slice(0, 8)}`,
+          );
+        }
+      }
+
       // Find a free bot if we don't have a returning one
       if (!bot) {
         bot = this.bots.find(b => b.state === "free");
@@ -489,6 +515,17 @@ export class BotPool extends EventEmitter {
         return null;
       }
 
+      // Stash session history for the evicted bot's channel before overwriting.
+      // Only stash if the bot is being reassigned away from a different channel
+      // (i.e., not a returning parked bot reclaiming its own channel, and not a free bot).
+      if (bot.channel_id && bot.entity_id && bot.session_id && bot.channel_id !== channel_id) {
+        const evict_key = `${bot.entity_id}:${bot.channel_id}`;
+        this.session_history.set(evict_key, bot.session_id);
+        console.log(
+          `[pool] Stashed session history for ${evict_key}: ${bot.session_id.slice(0, 8)}`,
+        );
+      }
+
       // Kill any existing tmux session
       this.kill_tmux(bot.tmux_session);
 
@@ -513,6 +550,13 @@ export class BotPool extends EventEmitter {
       bot.channel_type = channel_type ?? null;
       bot.session_id = session_id;
       bot.last_active = new Date();
+
+      // Consume session history entry now that it's been used
+      const assign_key = `${entity_id}:${channel_id}`;
+      if (this.session_history.has(assign_key)) {
+        this.session_history.delete(assign_key);
+        console.log(`[pool] Consumed session history for ${assign_key}`);
+      }
 
       await this.persist();
 
@@ -590,6 +634,14 @@ export class BotPool extends EventEmitter {
   /** Get the assignment for a channel. */
   get_assignment(channel_id: string): PoolBot | undefined {
     return this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
+  }
+
+  /** Clear session history for a specific channel. Used by !reset and feature completion. */
+  clear_session_history(entity_id: string, channel_id: string): void {
+    const key = `${entity_id}:${channel_id}`;
+    if (this.session_history.delete(key)) {
+      console.log(`[pool] Cleared session history for ${key}`);
+    }
   }
 
   /** Get pool status. */
@@ -786,8 +838,14 @@ export class BotPool extends EventEmitter {
         last_active: b.last_active?.toISOString() ?? null,
       }));
 
+    // Convert session_history Map to a plain object for serialization
+    const history_obj: Record<string, string> = {};
+    for (const [key, value] of this.session_history) {
+      history_obj[key] = value;
+    }
+
     try {
-      await save_pool_state(to_save, this.config);
+      await save_pool_state(to_save, this.config, history_obj);
     } catch (err) {
       // Non-fatal: log and continue. Next mutation will retry the write.
       console.error(`[pool] Failed to persist state: ${String(err)}`);
