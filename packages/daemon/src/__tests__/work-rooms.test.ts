@@ -98,6 +98,22 @@ function make_mock_feature_manager(features: FeatureState[] = []) {
   };
 }
 
+// ── Mock Bot Pool ──
+
+/**
+ * Create a mock pool where `assigned_channels` maps channel IDs to a pool bot stub.
+ * Channels not in the map return undefined from get_assignment().
+ */
+function make_mock_pool(assigned_channels: Record<string, { id: number; archetype: string }> = {}) {
+  return {
+    get_assignment: vi.fn((channel_id: string) => {
+      const entry = assigned_channels[channel_id];
+      if (!entry) return undefined;
+      return { id: entry.id, state: "assigned", channel_id, archetype: entry.archetype };
+    }),
+  };
+}
+
 // ── Tests ──
 
 describe("Work Room Assignment", () => {
@@ -107,6 +123,8 @@ describe("Work Room Assignment", () => {
     discord = make_mock_discord();
     // @ts-expect-error — mock does not implement full DiscordBot interface
     actions.set_discord_bot(discord);
+    // Reset pool to null so tests without pool awareness are unaffected
+    actions.set_pool(null);
   });
 
   describe("assign_work_room", () => {
@@ -269,6 +287,92 @@ describe("Work Room Assignment", () => {
       const room_id = await actions.assign_work_room(feature, entity);
 
       expect(room_id).toBeNull();
+    });
+
+    it("skips rooms with active pool bot assignments", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms());
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+      // Pool has a bot assigned to wr-1 (e.g., manual planner session)
+      // @ts-expect-error — mock pool
+      actions.set_pool(make_mock_pool({ "wr-1": { id: 0, archetype: "planner" } }));
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      expect(room_id).toBe("wr-2");
+    });
+
+    it("skips rooms occupied by both features and pool assignments", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const existing_feature = make_feature({
+        id: "alpha-10",
+        discordWorkRoom: "wr-1",
+        phase: "build",
+      });
+      const entity = make_entity_config(make_static_work_rooms());
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([existing_feature]));
+      // Pool has a bot in wr-2 (manual session), feature occupies wr-1
+      // @ts-expect-error — mock pool
+      actions.set_pool(make_mock_pool({ "wr-2": { id: 1, archetype: "planner" } }));
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      expect(room_id).toBe("wr-3");
+    });
+
+    it("creates dynamic room when all static rooms are pool-assigned", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms());
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+      // All three rooms have pool bots
+      // @ts-expect-error — mock pool
+      actions.set_pool(make_mock_pool({
+        "wr-1": { id: 0, archetype: "planner" },
+        "wr-2": { id: 1, archetype: "builder" },
+        "wr-3": { id: 2, archetype: "planner" },
+      }));
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      expect(room_id).toBe("dynamic-wr-4");
+      expect(discord.create_channel).toHaveBeenCalledWith(
+        "cat-123",
+        "work-room-4",
+        "Overflow for alpha-42",
+      );
+    });
+
+    it("does not check non-work-room channels for pool assignments", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms());
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+      // Pool has a bot in the general channel — should not affect work room assignment
+      const pool = make_mock_pool({ "gen-1": { id: 0, archetype: "planner" } });
+      // @ts-expect-error — mock pool
+      actions.set_pool(pool);
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      // Should still get wr-1 (general channel pool assignment is irrelevant)
+      expect(room_id).toBe("wr-1");
+      // get_assignment should only have been called for work_room channels
+      expect(pool.get_assignment).not.toHaveBeenCalledWith("gen-1");
+    });
+
+    it("does not block rooms when pool is null", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms());
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+      actions.set_pool(null);
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      expect(room_id).toBe("wr-1");
     });
   });
 

@@ -6,7 +6,7 @@ import type { ActiveSession, SessionResult } from "./session.js";
 import { TaskQueue } from "./queue.js";
 import { FeatureManager } from "./features.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
-import { set_discord_bot, set_feature_manager, reset_idle_work_room_topics } from "./actions.js";
+import { set_discord_bot, set_feature_manager, set_pool, reset_idle_work_room_topics } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
@@ -156,6 +156,9 @@ async function main(): Promise<void> {
 
   // Wire pool to feature manager for interactive builder sessions
   feature_manager.set_pool(pool);
+
+  // Wire pool to actions module so assign_work_room() checks pool state
+  set_pool(pool);
 
   // Start health monitor for detecting dead tmux sessions
   pool.start_health_monitor();

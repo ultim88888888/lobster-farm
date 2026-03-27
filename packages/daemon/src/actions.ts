@@ -5,6 +5,7 @@ import type { FeatureState, EntityConfig, ChannelType, ArchetypeRole, ChannelMap
 import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
 import type { FeatureManager } from "./features.js";
+import type { BotPool } from "./pool.js";
 import type { EntityRegistry } from "./registry.js";
 
 const exec = promisify(execFile);
@@ -178,12 +179,19 @@ let _discord: DiscordBot | null = null;
 /** Global feature manager reference, set by the daemon on startup. */
 let _features: FeatureManager | null = null;
 
+/** Global bot pool reference, set by the daemon on startup. */
+let _pool: BotPool | null = null;
+
 export function set_discord_bot(bot: DiscordBot | null): void {
   _discord = bot;
 }
 
 export function set_feature_manager(fm: FeatureManager | null): void {
   _features = fm;
+}
+
+export function set_pool(pool: BotPool | null): void {
+  _pool = pool;
 }
 
 /** Send a notification to an entity's Discord channel (or log if not connected). */
@@ -272,6 +280,19 @@ export async function assign_work_room(
   const occupied = new Set(
     active.map(f => f.discordWorkRoom).filter((id): id is string => Boolean(id)),
   );
+
+  // Also mark rooms with active pool assignments as occupied.
+  // This prevents feature deployments from overwriting manual pool sessions
+  // (e.g., an interactive planner assigned via POST /pool/assign).
+  if (_pool) {
+    for (const room of work_rooms) {
+      const assignment = _pool.get_assignment(room.id);
+      if (assignment) {
+        occupied.add(room.id);
+      }
+    }
+  }
+
   const free_room = work_rooms.find((r: ChannelMapping) => !occupied.has(r.id));
 
   let channel_id: string | null = null;
