@@ -256,6 +256,83 @@ describe("FeatureManager", () => {
     });
   });
 
+  describe("duplicate feature guard", () => {
+    it("rejects duplicate creation when existing feature is active", async () => {
+      await fm.create_feature({
+        entity_id: "alpha",
+        title: "Active Feature",
+        github_issue: 100,
+      });
+
+      // Same entity + issue should be rejected because the feature is in "plan" (active)
+      await expect(
+        fm.create_feature({
+          entity_id: "alpha",
+          title: "Active Feature Again",
+          github_issue: 100,
+        }),
+      ).rejects.toThrow('Feature "alpha-100" already exists and is active (phase: plan)');
+    });
+
+    it("rejects duplicate during non-terminal phases: build", async () => {
+      const feature = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Building Feature",
+        github_issue: 101,
+      });
+      // Simulate advancing to build phase
+      feature.phase = "build";
+
+      await expect(
+        fm.create_feature({
+          entity_id: "alpha",
+          title: "Building Feature Dup",
+          github_issue: 101,
+        }),
+      ).rejects.toThrow('Feature "alpha-101" already exists and is active (phase: build)');
+    });
+
+    it("allows re-creation after feature reaches done", async () => {
+      const original = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Completed Feature",
+        github_issue: 102,
+      });
+      // Simulate the feature reaching terminal state
+      original.phase = "done";
+
+      const recreated = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Completed Feature v2",
+        github_issue: 102,
+      });
+
+      expect(recreated.id).toBe("alpha-102");
+      expect(recreated.phase).toBe("plan");
+      expect(recreated.title).toBe("Completed Feature v2");
+    });
+
+    it("re-created feature replaces the old one in the map", async () => {
+      const original = await fm.create_feature({
+        entity_id: "alpha",
+        title: "Original",
+        github_issue: 103,
+      });
+      original.phase = "done";
+
+      await fm.create_feature({
+        entity_id: "alpha",
+        title: "Replacement",
+        github_issue: 103,
+      });
+
+      const features = fm.get_features_by_entity("alpha");
+      const matching = features.filter((f) => f.githubIssue === 103);
+      expect(matching).toHaveLength(1);
+      expect(matching[0]!.title).toBe("Replacement");
+    });
+  });
+
   describe("approve_phase", () => {
     it("approves a gated phase", async () => {
       await fm.create_feature({ entity_id: "alpha", title: "Test", github_issue: 1 });
