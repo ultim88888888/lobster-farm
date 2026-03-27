@@ -443,6 +443,279 @@ export const init_command = new Command("init")
     // ── Step 11: Tool Integrations ──
     const tools_config = await setup_tool_integrations(spin, non_interactive, options);
 
+    // ── Step 12: Peekaboo (computer use CLI) ──
+    if (machine.platform === "darwin" && !non_interactive) {
+      const { exec_command } = await import("../lib/process.js");
+      const { spawnSync } = await import("node:child_process");
+
+      spin.start("Checking Peekaboo...");
+      const peekaboo_which = await exec_command("which peekaboo");
+      const peekaboo_installed = peekaboo_which.exitCode === 0;
+      spin.stop(peekaboo_installed ? `Peekaboo: installed (${peekaboo_which.stdout.trim()})` : "Peekaboo: not installed");
+
+      if (!peekaboo_installed) {
+        const install_peekaboo = await p.confirm({
+          message: "Peekaboo enables GUI automation (screen capture, clicking, typing). Install it?",
+          initialValue: true,
+        });
+        if (p.isCancel(install_peekaboo)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+        if (install_peekaboo) {
+          // Check Swift toolchain is available
+          const swift_check = await exec_command("which swift");
+          if (swift_check.exitCode !== 0) {
+            p.log.warning("Swift toolchain not found — Peekaboo requires Xcode or Command Line Tools to build from source.");
+            p.log.info("Install Xcode from the App Store, then re-run this wizard.");
+          } else {
+            const home = process.env["HOME"] ?? "";
+            const tools_dir = `${home}/.lobsterfarm/tools`;
+            const peekaboo_dir = `${tools_dir}/Peekaboo`;
+
+            // Clone the repo
+            spin.start("Cloning Peekaboo v3.0.0-beta3...");
+            const { mkdir: mkdirFs } = await import("node:fs/promises");
+            await mkdirFs(tools_dir, { recursive: true });
+
+            const clone_result = await exec_command(
+              `git clone --depth 1 --branch v3.0.0-beta3 https://github.com/steipete/Peekaboo.git "${peekaboo_dir}"`,
+            );
+            if (clone_result.exitCode !== 0) {
+              spin.stop("Peekaboo clone failed");
+              p.log.warning(`Clone failed: ${clone_result.stderr.trim()}`);
+            } else {
+              spin.stop("Peekaboo cloned");
+
+              // Build from source (this takes several minutes)
+              spin.start("Building Peekaboo from source (this may take a few minutes)...");
+              const build_result = await exec_command(
+                `cd "${peekaboo_dir}/Apps/CLI" && swift build --arch arm64 -c release`,
+              );
+              if (build_result.exitCode !== 0) {
+                spin.stop("Peekaboo build failed");
+                p.log.warning(`Build failed: ${build_result.stderr.trim().split("\n").slice(-5).join("\n")}`);
+              } else {
+                spin.stop("Peekaboo built successfully");
+
+                // Copy binary to /usr/local/bin
+                spin.start("Installing peekaboo binary...");
+                const cp_result = spawnSync("sudo", [
+                  "cp",
+                  `${peekaboo_dir}/Apps/CLI/.build/arm64-apple-macosx/release/peekaboo`,
+                  "/usr/local/bin/peekaboo",
+                ], { stdio: "inherit" });
+
+                if (cp_result.status !== 0) {
+                  spin.stop("Failed to copy binary to /usr/local/bin");
+                  p.log.warning("Copy the binary manually: sudo cp Apps/CLI/.build/arm64-apple-macosx/release/peekaboo /usr/local/bin/peekaboo");
+                } else {
+                  // Verify
+                  const version_check = await exec_command("peekaboo --version");
+                  if (version_check.exitCode === 0) {
+                    spin.stop(`Peekaboo installed: ${version_check.stdout.trim()}`);
+                  } else {
+                    spin.stop("Peekaboo binary installed to /usr/local/bin/peekaboo");
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Grant Screen Recording + Accessibility permissions
+      const peekaboo_recheck = await exec_command("which peekaboo");
+      if (peekaboo_recheck.exitCode === 0) {
+        const setup_perms = await p.confirm({
+          message: "Grant Peekaboo permissions (Screen Recording + Accessibility)?",
+          initialValue: true,
+        });
+        if (p.isCancel(setup_perms)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+        if (setup_perms) {
+          const apps_to_grant = [
+            { name: "Terminal", bundle: "com.apple.Terminal" },
+            { name: "node", path: null as string | null },
+            { name: "tmux", path: null as string | null },
+          ];
+
+          const node_which = await exec_command("which node");
+          if (node_which.exitCode === 0) apps_to_grant[1]!.path = node_which.stdout.trim();
+          const tmux_which = await exec_command("which tmux");
+          if (tmux_which.exitCode === 0) apps_to_grant[2]!.path = tmux_which.stdout.trim();
+
+          const tcc_db = "/Library/Application Support/com.apple.TCC/TCC.db";
+          const tcc_services = ["kTCCServiceScreenCapture", "kTCCServiceAccessibility"];
+
+          spin.start("Attempting to grant Screen Recording + Accessibility via TCC database...");
+          let tcc_success = true;
+
+          for (const service of tcc_services) {
+            // Grant Terminal by bundle ID
+            const terminal_result = spawnSync("sudo", [
+              "sqlite3", tcc_db,
+              `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('${service}', 'com.apple.Terminal', 0, 2, 4, 1);`,
+            ], { stdio: "inherit" });
+            if (terminal_result.status !== 0) tcc_success = false;
+
+            // Grant node and tmux by path
+            for (const app of apps_to_grant.slice(1)) {
+              if (!app.path) continue;
+              const result = spawnSync("sudo", [
+                "sqlite3", tcc_db,
+                `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('${service}', '${app.path}', 1, 2, 4, 1);`,
+              ], { stdio: "inherit" });
+              if (result.status !== 0) tcc_success = false;
+            }
+          }
+
+          if (tcc_success) {
+            spin.stop("Screen Recording + Accessibility granted via TCC database");
+          } else {
+            spin.stop("TCC database method failed — opening System Settings");
+            p.log.info("Manually enable Screen Recording and Accessibility for Terminal, node, and tmux.");
+
+            spawnSync("open", [
+              "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            ]);
+            spawnSync("open", [
+              "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            ]);
+
+            const node_path = apps_to_grant[1]?.path ?? "not found";
+            const tmux_path = apps_to_grant[2]?.path ?? "not installed";
+            p.note(
+              "System Settings has been opened to Screen Recording and Accessibility.\n\n" +
+                "In each pane, click the + button and add:\n" +
+                `  • Terminal (should be listed)\n` +
+                `  • node: ${node_path}\n` +
+                `  • tmux: ${tmux_path}\n\n` +
+                "Tip: In the file picker, press Cmd+Shift+G to type a path directly.",
+              "Manual Setup Required",
+            );
+
+            const ack = await p.confirm({ message: "Done configuring Screen Recording + Accessibility?" });
+            if (p.isCancel(ack)) { p.cancel("Setup cancelled."); process.exit(0); }
+          }
+        }
+
+        // Create Peekaboo skill file
+        const { writeFile: writeSkill, mkdir: mkdirSkill } = await import("node:fs/promises");
+        const home = process.env["HOME"] ?? "";
+        const skill_dir = `${home}/.claude/skills/peekaboo`;
+        await mkdirSkill(skill_dir, { recursive: true });
+
+        const skill_content = `---
+name: peekaboo
+description: >
+  Computer use via Peekaboo CLI. Use when a task requires GUI interaction
+  and no CLI/API alternative exists. Covers screen capture, UI element
+  detection, clicking, typing, keyboard shortcuts, and window management.
+---
+
+# Peekaboo — Computer Use
+
+_GUI automation for macOS via the Peekaboo CLI. Use \`peekaboo learn\` for the full interactive guide._
+
+## When to Use
+
+- **GUI-only tasks** — no CLI/API alternative exists
+- **Visual verification** — confirming what's on screen
+- **App automation** — clicking buttons, filling forms in native apps
+
+Do NOT use when a CLI command, API call, or shell script can do the job.
+
+## Core Commands
+
+\`\`\`bash
+# See — capture screen + detect UI elements (returns JSON with element IDs)
+peekaboo see --json
+peekaboo see --app "Safari" --json
+
+# Capture screenshot to a file
+peekaboo image --mode screen --format png --path /tmp/pb-capture.png
+
+# Click — by element ID (from see output) or coordinates
+peekaboo click --on elem_42 --snapshot <snapshot_id>
+peekaboo click --coords 500,300
+
+# Type — human-cadence text input
+peekaboo type "Hello world"
+peekaboo type "search query" --app "Safari"
+
+# Press — individual keys (plain names)
+peekaboo press return
+peekaboo press tab tab return
+
+# Hotkey — keyboard shortcuts (comma-separated modifiers)
+peekaboo hotkey "cmd,c"
+peekaboo hotkey "cmd,shift,g"
+
+# App management
+peekaboo list --apps
+peekaboo app --action launch --name "Calculator"
+peekaboo app --action switch --to "Safari"
+peekaboo open "https://example.com"
+\`\`\`
+
+## Cleanup Rules
+
+Always clean up after yourself:
+- Delete screenshot files: \`rm /tmp/pb-*.png\`
+- Delete annotated \`see\` screenshots: \`rm ~/Desktop/peekaboo_see_*.png\`
+- Clear snapshot cache: \`peekaboo clean --all-snapshots\`
+- Use \`/tmp/pb-\` prefix for all screenshot paths
+
+## Gotchas
+
+- Snapshot IDs expire when UI changes — always take fresh \`see\` before clicking
+- \`see\` targets the frontmost app — use \`--app\` for background apps
+- Never type passwords — stop and ask the user
+- macOS may require monthly re-grant of Screen Recording permission
+`;
+
+        await writeSkill(`${skill_dir}/SKILL.md`, skill_content);
+        p.log.success("Peekaboo skill file created: ~/.claude/skills/peekaboo/SKILL.md");
+
+        // Append Peekaboo section to tools.md
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const tools_path = `${lf_dir(path_overrides)}/tools.md`;
+        try {
+          const { readFile: readTools, writeFile: writeTools } = await import("node:fs/promises");
+          const tools_content = await readTools(tools_path, "utf-8");
+          if (!tools_content.includes("Peekaboo")) {
+            const peekaboo_section =
+              "\n## Computer Use (Peekaboo)\n\n" +
+              "- **Binary:** `/usr/local/bin/peekaboo` (v3.0.0-beta3, arm64)\n" +
+              "- **Source:** `~/.lobsterfarm/tools/Peekaboo/` (pinned to v3.0.0-beta3)\n" +
+              "- **Skill:** `~/.claude/skills/peekaboo/SKILL.md` — load when GUI interaction is needed\n" +
+              "- **Permissions:** Screen Recording + Accessibility granted for Terminal, node, tmux\n" +
+              "- **When to use:** GUI-only tasks where no CLI/API alternative exists. Not the default — always prefer CLI/API.\n" +
+              "- **Cleanup:** Always delete screenshots after use (`/tmp/pb-*.png`, `~/Desktop/peekaboo_see_*.png`)\n";
+
+            // Insert before the "Shared Services" section if it exists, otherwise append before the footer
+            if (tools_content.includes("## Shared Services")) {
+              const updated = tools_content.replace("## Shared Services", peekaboo_section + "\n## Shared Services");
+              await writeTools(tools_path, updated);
+            } else {
+              // Append before the closing italics line, or at the end
+              const footer_marker = "_This file grows";
+              if (tools_content.includes(footer_marker)) {
+                const updated = tools_content.replace(footer_marker, peekaboo_section + "\n" + footer_marker);
+                await writeTools(tools_path, updated);
+              } else {
+                const { appendFile } = await import("node:fs/promises");
+                await appendFile(tools_path, peekaboo_section);
+              }
+            }
+            p.log.success("Peekaboo section added to tools.md");
+          }
+        } catch {
+          // tools.md doesn't exist yet — that's fine, it'll be created by generate_config_files
+          p.log.info("tools.md not found — Peekaboo entry will need to be added manually after setup.");
+        }
+      }
+    }
+
     // ── Prompts (skipped in non-interactive mode) ──
     // Check if Discord tokens already exist
     let has_existing_discord_token = false;
