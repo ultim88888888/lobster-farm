@@ -439,6 +439,33 @@ export async function update_work_room_topic(
   await _discord.set_channel_topic(feature.discordWorkRoom, topic);
 }
 
+// ── Merge error classification ──
+
+export type MergeErrorKind = "conflict" | "other";
+
+/** Patterns in gh/GitHub error output that indicate a merge conflict. */
+const CONFLICT_PATTERNS = [
+  "merge conflict",
+  "not mergeable",
+  "conflicting",
+  "conflicts must be resolved",
+  "pull request is not mergeable",
+] as const;
+
+/**
+ * Classify a merge error as a resolvable conflict or an unrecoverable failure.
+ * Checks the error message (case-insensitive) for known conflict patterns.
+ */
+export function classify_merge_error(error: string): MergeErrorKind {
+  const lower = error.toLowerCase();
+  for (const pattern of CONFLICT_PATTERNS) {
+    if (lower.includes(pattern)) {
+      return "conflict";
+    }
+  }
+  return "other";
+}
+
 // ── Startup cleanup ──
 
 /**

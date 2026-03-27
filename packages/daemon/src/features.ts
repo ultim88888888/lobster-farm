@@ -309,6 +309,7 @@ export class FeatureManager extends EventEmitter {
       poolBotId: null,
       prNumber: null,
       reviewBounceCount: 0,
+      mergeAttempts: 0,
       agentDone: false,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -421,7 +422,7 @@ export class FeatureManager extends EventEmitter {
     console.log(`[features] ${feature_id}: ${old_phase} → ${next_phase}`);
 
     // Run entry actions for the new phase
-    await this.run_entry_actions(feature, next_phase);
+    await this.run_entry_actions(feature, next_phase, old_phase);
 
     // Spawn agent if this phase has one
     const next_config = PHASE_CONFIG[next_phase];
@@ -431,10 +432,16 @@ export class FeatureManager extends EventEmitter {
 
     // If this phase has no agent and no approval gate, auto-advance
     if (!next_config.archetype && !next_config.needs_approval && next_phase !== "done") {
-      // Ship phase: run ship actions then advance to done
+      // Ship phase: run ship actions then advance to done (unless merge failed and was handled)
       if (next_phase === "ship") {
-        await this.run_ship_actions(feature);
-        return this.advance_feature(feature_id, "done");
+        const merged = await this.run_ship_actions(feature);
+        if (merged) {
+          return this.advance_feature(feature_id, "done");
+        }
+        // Merge failed — run_ship_actions already handled it (bounce or block).
+        // Persist and return without advancing to done.
+        this.persist_queue.enqueue();
+        return feature;
       }
     }
 
@@ -950,14 +957,22 @@ export class FeatureManager extends EventEmitter {
     const is_builder_bounce = phase_config.archetype === "builder" && Boolean(feature.lastBuilderSessionId);
     const resume_id = is_builder_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
 
-    // On review->build bounce, use the review feedback as the prompt instead of the generic build template
+    // Prompt selection priority:
+    // 1. Conflict bounce (ship→build after merge conflict) — use conflict resolution prompt
+    // 2. Review bounce with cached comments — use review fix prompt
+    // 3. Normal build — use standard phase template
+    const is_conflict_bounce = phase_config.archetype === "builder" && (feature.mergeAttempts ?? 0) > 0;
     let prompt: string;
-    const cached_comments = this.last_review_comments.get(feature.id);
-    if (is_builder_bounce && feature.prNumber && cached_comments) {
-      this.last_review_comments.delete(feature.id);
-      prompt = build_review_fix_prompt(feature.prNumber, feature.title, cached_comments);
+    if (is_conflict_bounce) {
+      prompt = this.build_conflict_prompt(feature);
     } else {
-      prompt = resolve_prompt(phase_config.prompt_template, feature);
+      const cached_comments = this.last_review_comments.get(feature.id);
+      if (is_builder_bounce && feature.prNumber && cached_comments) {
+        this.last_review_comments.delete(feature.id);
+        prompt = build_review_fix_prompt(feature.prNumber, feature.title, cached_comments);
+      } else {
+        prompt = resolve_prompt(phase_config.prompt_template, feature);
+      }
     }
 
     let task_id: string;
@@ -1010,15 +1025,20 @@ export class FeatureManager extends EventEmitter {
     if (!this.pool || !feature.discordWorkRoom || !phase_config.prompt_template) return;
 
     // Pool-based builders don't go through the queue, so lastBuilderSessionId is never set for them.
-    // Use poolBotId as the bounce signal: if a bot was previously assigned, this is a review->build bounce.
+    // Use poolBotId as the bounce signal: if a bot was previously assigned, this is a bounce.
     const is_bounce = feature.phase === "build" && feature.poolBotId !== null;
+    const is_conflict_bounce = feature.phase === "build" && (feature.mergeAttempts ?? 0) > 0;
 
-    // On review->build bounce, check if the pool bot is still assigned to this work room
+    // On review->build or conflict bounce, check if the pool bot is still assigned to this work room
     if (is_bounce) {
       const existing = this.pool.get_assignment(feature.discordWorkRoom);
       if (existing && existing.id === feature.poolBotId) {
-        // Bot still alive in the work room — bridge review feedback directly
-        await this.bridge_review_feedback(feature, existing);
+        // Bot still alive in the work room — bridge feedback directly
+        if (is_conflict_bounce) {
+          await this.bridge_conflict_feedback(feature, existing);
+        } else {
+          await this.bridge_review_feedback(feature, existing);
+        }
         feature.activeArchetype = phase_config.archetype;
         feature.activeDna = phase_config.dna;
         return;
@@ -1083,9 +1103,15 @@ export class FeatureManager extends EventEmitter {
       resume: Boolean(resume_id),
     }, this.config);
 
-    // Bridge the build prompt to the pool bot
-    if (is_bounce && feature.prNumber) {
-      // Bounce: send review feedback
+    // Bridge the appropriate prompt to the pool bot
+    if (is_conflict_bounce && feature.prNumber) {
+      // Conflict bounce: send conflict-resolution prompt
+      await this.bridge_conflict_feedback_to_tmux(
+        assignment.tmux_session,
+        feature,
+      );
+    } else if (is_bounce && feature.prNumber) {
+      // Review bounce: send review feedback
       await this.bridge_review_feedback_to_tmux(
         assignment.tmux_session,
         feature,
@@ -1236,15 +1262,93 @@ export class FeatureManager extends EventEmitter {
     }
   }
 
+  /**
+   * Bridge conflict-resolution feedback to an existing pool bot.
+   * Used when a ship->build conflict bounce finds the bot still alive.
+   */
+  private async bridge_conflict_feedback(
+    feature: FeatureState,
+    bot: { tmux_session: string },
+  ): Promise<void> {
+    await this.bridge_conflict_feedback_to_tmux(bot.tmux_session, feature);
+    console.log(`[features] Bridged conflict feedback to existing bot for ${feature.id}`);
+  }
+
+  /**
+   * Bridge conflict-resolution feedback to a pool bot via tmux send-keys.
+   * Used for ship->build bounce — tells the builder to rebase and resolve conflicts.
+   */
+  private async bridge_conflict_feedback_to_tmux(
+    tmux_session: string,
+    feature: FeatureState,
+  ): Promise<void> {
+    if (!feature.prNumber) return;
+
+    const feedback_path = `/tmp/lf-conflict-${feature.id}.txt`;
+    const feedback = this.build_conflict_prompt(feature);
+
+    try {
+      await writeFileAsync(feedback_path, feedback, "utf-8");
+
+      // Poll for the bot to be ready (same pattern as bridge_build_prompt)
+      const start = Date.now();
+      const timeout = 30_000;
+      let ready = false;
+
+      while (Date.now() - start < timeout) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        try {
+          const output = execFileSync(
+            "tmux", ["capture-pane", "-t", tmux_session, "-p"],
+            { encoding: "utf-8", timeout: 2000 },
+          );
+          if (output.includes("Listening for channel messages") && output.includes("❯")) {
+            ready = true;
+            break;
+          }
+        } catch { /* ignore */ }
+      }
+
+      if (!ready) {
+        console.log(`[features] Bot ${tmux_session} not ready after ${String(timeout)}ms -- conflict feedback not bridged`);
+        return;
+      }
+
+      // Small extra delay for the plugin to fully connect
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const instruction = `Read ${feedback_path} for merge conflict resolution instructions and begin working.`;
+      execFileSync("tmux", ["send-keys", "-t", tmux_session, instruction, "Enter"], {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+
+      console.log(`[features] Bridged conflict feedback to ${tmux_session} for ${feature.id}`);
+
+      setTimeout(() => { void unlink(feedback_path).catch(() => {}); }, 60_000);
+    } catch (err) {
+      console.error(`[features] Failed to bridge conflict feedback: ${String(err)}`);
+    }
+  }
+
   private async run_entry_actions(
     feature: FeatureState,
     phase: Phase,
+    from_phase?: Phase,
   ): Promise<void> {
     const entity = this.registry.get(feature.entity);
     if (!entity) return;
 
     switch (phase) {
       case "build": {
+        // Reset merge attempts counter when entering build from any source except
+        // a ship→build conflict bounce. This prevents the counter from carrying over
+        // from a previous build→review→build cycle while preserving it across
+        // ship→build→review→ship retries.
+        if (from_phase !== "ship") {
+          feature.mergeAttempts = 0;
+        }
+
         // Create worktree
         const worktree_path = await actions.create_worktree(feature, entity);
         feature.worktreePath = worktree_path;
@@ -1294,24 +1398,81 @@ export class FeatureManager extends EventEmitter {
     );
   }
 
-  private async run_ship_actions(feature: FeatureState): Promise<void> {
+  /**
+   * Run ship-phase actions: merge the PR, clean up worktree, release work room.
+   * Returns true if the merge succeeded and the feature should advance to done.
+   * Returns false if the merge failed and was handled (bounced to build or blocked).
+   */
+  private async run_ship_actions(feature: FeatureState): Promise<boolean> {
     const entity = this.registry.get(feature.entity);
-    if (!entity) return;
+    if (!entity) return false;
 
     // Capture work room before any mutations so pool cleanup works regardless of outcome.
     const work_room = feature.discordWorkRoom;
+    let merged = false;
 
     try {
       // Merge PR
       if (feature.prNumber) {
         try {
           await actions.merge_pr(feature, entity);
+          merged = true;
         } catch (err) {
-          console.error(`[features] Failed to merge PR: ${String(err)}`);
-          feature.blocked = true;
-          feature.blockedReason = `Merge failed: ${String(err)}`;
-          return;
+          const error_msg = String(err);
+          console.error(`[features] Failed to merge PR: ${error_msg}`);
+
+          const error_kind = actions.classify_merge_error(error_msg);
+          feature.mergeAttempts = (feature.mergeAttempts ?? 0) + 1;
+
+          if (error_kind === "conflict" && feature.mergeAttempts < 2) {
+            // Resolvable conflict — bounce back to build for the Builder to rebase
+            console.log(
+              `[features] Merge conflict for ${feature.id} (attempt ${String(feature.mergeAttempts)}) — bouncing to build`,
+            );
+
+            await actions.notify_feature(
+              feature,
+              `PR #${String(feature.prNumber)} has merge conflicts (attempt ${String(feature.mergeAttempts)}/2). ` +
+                `Bouncing back to build for conflict resolution.`,
+              entity,
+              { also_alerts: false },
+            );
+
+            // Bounce to build — advance_feature will call run_entry_actions
+            // which preserves mergeAttempts because from_phase is "ship"
+            try {
+              await this.advance_feature(feature.id, "build");
+            } catch (bounce_err) {
+              console.error(`[features] Failed to bounce ${feature.id} to build: ${String(bounce_err)}`);
+              feature.blocked = true;
+              feature.blockedReason = `Merge conflict bounce failed: ${String(bounce_err)}`;
+            }
+            return false;
+          }
+
+          // Either not a conflict, or max attempts exhausted — block and escalate
+          if (error_kind === "conflict") {
+            feature.blocked = true;
+            feature.blockedReason =
+              `Merge conflicts persist after ${String(feature.mergeAttempts)} attempts on PR #${String(feature.prNumber)}. Manual resolution required.`;
+            console.log(`[features] Merge conflict recovery exhausted for ${feature.id} — escalating`);
+          } else {
+            feature.blocked = true;
+            feature.blockedReason = `Merge failed: ${error_msg}`;
+          }
+
+          await actions.notify_feature(
+            feature,
+            `${feature.id} blocked: ${feature.blockedReason}`,
+            entity,
+            { also_alerts: true },
+          );
+
+          return false;
         }
+      } else {
+        // No PR to merge — treat as success (shouldn't happen in practice)
+        merged = true;
       }
 
       // Cleanup worktree
@@ -1331,9 +1492,11 @@ export class FeatureManager extends EventEmitter {
       await actions.release_work_room(feature, entity);
       feature.discordWorkRoom = null;
     } finally {
-      // Always release pool bot, even if merge fails — otherwise the slot is permanently occupied.
-      // pool.release() kills the tmux session, so do this after any work room messaging is done.
-      if (this.pool && work_room) {
+      // Always release pool bot on successful merge — otherwise the slot is permanently occupied.
+      // On conflict bounce, keep the pool bot since the feature returns to build
+      // and will reuse the work room. Only release on merge success or non-conflict block.
+      const should_release_pool = merged || (feature.blocked && !feature.blockedReason?.includes("conflict"));
+      if (should_release_pool && this.pool && work_room) {
         // Clear session history for the work room — feature is done, no context to preserve
         this.pool.clear_session_history(feature.entity, work_room);
 
@@ -1342,11 +1505,27 @@ export class FeatureManager extends EventEmitter {
           await this.pool.release(work_room);
         }
       }
-      if (feature.poolBotId !== null) {
+      if (should_release_pool && feature.poolBotId !== null) {
         this.pool_bot_to_feature.delete(feature.poolBotId);
         feature.poolBotId = null;
       }
     }
+
+    return merged;
+  }
+
+  /**
+   * Build the conflict-resolution prompt for the Builder.
+   * Used when a ship→build bounce needs the Builder to rebase and resolve conflicts.
+   */
+  private build_conflict_prompt(feature: FeatureState): string {
+    return (
+      `PR #${String(feature.prNumber)} for feature #${String(feature.githubIssue)} has merge conflicts with main.\n` +
+      `Rebase the branch on main, resolve all conflicts, and push.\n` +
+      `Do NOT force push. Do NOT modify the PR description.\n` +
+      `Branch: ${feature.branch}\n` +
+      `Worktree: ${feature.worktreePath ?? "(unknown)"}`
+    );
   }
 }
 

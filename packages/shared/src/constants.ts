@@ -59,7 +59,7 @@ export const PHASE_TRANSITIONS: Record<Phase, Phase[]> = {
   design: ["build"],
   build: ["review"],
   review: ["ship", "build"],
-  ship: ["done"],
+  ship: ["done", "build"],
   done: [],
 } as const;
 

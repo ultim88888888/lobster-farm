@@ -666,6 +666,7 @@ describe("Interactive builder sessions", () => {
         labels: [],
         poolBotId: 4,
         prNumber: null,
+        mergeAttempts: 0,
         agentDone: false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
