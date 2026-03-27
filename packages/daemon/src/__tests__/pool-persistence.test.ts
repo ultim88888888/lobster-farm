@@ -755,4 +755,66 @@ describe("BotPool persistence", () => {
       expect(bots.find(b => b.id === 51)!.channel_id).toBe("ch-b");
     });
   });
+
+  describe("access.json reconciliation on initialize", () => {
+    it("clears access.json for free bots with stale channel configs", async () => {
+      const config = make_config();
+
+      // Create pool-60 with a stale access.json (channel from a previous assignment)
+      const dir = join(temp_dir, "channels", "pool-60");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token-60");
+      await writeFile(join(dir, "access.json"), JSON.stringify({
+        dmPolicy: "allowlist",
+        allowFrom: [],
+        groups: { "stale-channel-id": { requireMention: false, allowFrom: [] } },
+        pending: {},
+        ackReaction: "👀",
+        replyToMode: "first",
+        textChunkLimit: 2000,
+        chunkMode: "newline",
+      }));
+
+      // No persisted state — pool-60 should be free
+      const pool = new TestBotPool(config);
+      await pool.initialize();
+
+      // access.json should have been rewritten with empty groups
+      const access = JSON.parse(await readFile(join(dir, "access.json"), "utf-8")) as Record<string, unknown>;
+      expect(access.groups).toEqual({});
+    });
+
+    it("preserves access.json channel for assigned bots only", async () => {
+      const config = make_config();
+
+      // Create pool-60 (will be parked) and pool-61 (no persisted state = free)
+      for (const id of [60, 61]) {
+        const dir = join(temp_dir, "channels", `pool-${String(id)}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, ".env"), `DISCORD_BOT_TOKEN=fake-token-${String(id)}`);
+      }
+
+      // Pool-60 was parked with a channel — its access.json should be cleared
+      // because parked bots don't have live tmux sessions listening
+      await save_pool_state([
+        make_persisted_bot({ id: 60, state: "parked", channel_id: "ch-parked", entity_id: "e1", archetype: "planner" }),
+      ], config);
+
+      const pool = new TestBotPool(config);
+      await pool.initialize();
+
+      // Parked bot: channel preserved in memory but access.json cleared
+      const bots = pool.get_bots();
+      const bot60 = bots.find(b => b.id === 60)!;
+      expect(bot60.state).toBe("parked");
+      expect(bot60.channel_id).toBe("ch-parked"); // In-memory: preserved for resume
+
+      const access60 = JSON.parse(await readFile(join(temp_dir, "channels", "pool-60", "access.json"), "utf-8")) as Record<string, unknown>;
+      expect(access60.groups).toEqual({}); // On disk: cleared
+
+      // Free bot: access.json also cleared
+      const access61 = JSON.parse(await readFile(join(temp_dir, "channels", "pool-61", "access.json"), "utf-8")) as Record<string, unknown>;
+      expect(access61.groups).toEqual({});
+    });
+  });
 });

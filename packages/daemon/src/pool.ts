@@ -272,6 +272,20 @@ export class BotPool extends EventEmitter {
       }
     }
 
+    // Reconcile access.json for every bot to match the daemon's resolved state.
+    // This is the critical step: the daemon is the single source of truth for channel
+    // assignments. access.json files may be stale from a previous run (e.g., a bot that
+    // was reassigned or freed but whose tmux survived the restart). Rewriting them all
+    // ensures the Discord plugin only listens to channels the daemon actually assigned.
+    for (const bot of this.bots) {
+      // Only assigned bots (with live tmux) should listen on their channel.
+      // Parked and free bots get empty access.json — their channel claim is
+      // preserved in memory/pool-state.json for resume, not in access.json.
+      const expected_channel = bot.state === "assigned" ? bot.channel_id : null;
+      await this.write_access_json(bot.state_dir, expected_channel);
+    }
+    console.log(`[pool] Reconciled access.json for ${String(this.bots.length)} bots`);
+
     // Persist cleaned state (stale entries removed, duplicates resolved, current snapshot)
     await this.persist();
 
