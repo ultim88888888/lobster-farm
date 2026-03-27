@@ -112,6 +112,9 @@ export class BotPool extends EventEmitter {
   private releasing_channels = new Set<string>();
   private bot_user_ids = new Map<number, string>();
   private nickname_handler: NicknameHandler | null = null;
+  /** Bots that were actively assigned before shutdown and should be proactively resumed.
+   * Populated during initialize(), consumed by resume_parked_bots(). */
+  private resume_candidates: PersistedPoolBot[] = [];
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -206,6 +209,7 @@ export class BotPool extends EventEmitter {
     // Restore persisted assignments from last run
     const saved = await load_pool_state(this.config);
     let restored = 0;
+    this.resume_candidates = [];
 
     for (const entry of saved) {
       const bot = this.bots.find(b => b.id === entry.id);
@@ -239,6 +243,13 @@ export class BotPool extends EventEmitter {
         bot.channel_type = entry.channel_type;
         bot.session_id = entry.session_id;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
+
+        // If this bot was actively assigned (not already parked) before shutdown
+        // and has a session_id, it's a candidate for proactive resume.
+        // Bots saved as "parked" were already idle — don't resume those.
+        if (entry.state === "assigned" && entry.session_id) {
+          this.resume_candidates.push(entry);
+        }
       }
 
       restored++;
@@ -295,6 +306,69 @@ export class BotPool extends EventEmitter {
       `${String(this.bots.filter(b => b.state === "parked").length)} parked, ` +
       `${String(this.bots.filter(b => b.state === "assigned").length)} assigned)`,
     );
+  }
+
+  /**
+   * Proactively resume bots that were actively assigned before daemon shutdown.
+   * Call AFTER Discord is connected so notifications can be sent.
+   *
+   * For each resume candidate: write access.json, set nickname, start tmux
+   * with --resume, update state to assigned, emit bot:resumed.
+   * Clears resume_candidates when done (or on skip) to prevent stale state.
+   */
+  async resume_parked_bots(): Promise<void> {
+    if (this.resume_candidates.length === 0) return;
+
+    console.log(
+      `[pool] Proactively resuming ${String(this.resume_candidates.length)} bot(s) ` +
+      `that were assigned before shutdown`,
+    );
+
+    let resumed = 0;
+    for (const candidate of this.resume_candidates) {
+      const bot = this.bots.find(
+        b => b.id === candidate.id && b.state === "parked" && b.channel_id === candidate.channel_id,
+      );
+      if (!bot) continue;
+
+      try {
+        // Write access.json so the Discord plugin listens on this channel
+        await this.write_access_json(bot.state_dir, candidate.channel_id);
+
+        // Set Discord nickname to match the archetype
+        await this.set_bot_nickname(bot, candidate.archetype);
+
+        // Start tmux with --resume to restore the previous session
+        const working_dir = entity_dir(this.config.paths, candidate.entity_id);
+        await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!);
+
+        // Update bot state to assigned
+        bot.state = "assigned";
+        bot.last_active = new Date();
+
+        resumed++;
+
+        this.emit("bot:resumed", {
+          bot_id: bot.id,
+          channel_id: bot.channel_id,
+          entity_id: bot.entity_id,
+        });
+      } catch (err) {
+        console.error(
+          `[pool] Failed to resume pool-${String(bot.id)}: ${String(err)}`,
+        );
+        // Leave the bot parked — it can still be resumed on next message
+      }
+    }
+
+    // Clear candidates regardless of success — prevents stale resumes
+    // if the daemon stays running through another restart cycle
+    this.resume_candidates = [];
+
+    if (resumed > 0) {
+      await this.persist();
+      console.log(`[pool] Proactively resumed ${String(resumed)} bot(s)`);
+    }
   }
 
   /** Assign a pool bot to a channel with a specific archetype. */

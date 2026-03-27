@@ -57,6 +57,10 @@ class TestBotPool extends BotPool {
     return (this as unknown as { bots: PoolBot[] }).bots;
   }
 
+  get_resume_candidates(): PersistedPoolBot[] {
+    return (this as unknown as { resume_candidates: PersistedPoolBot[] }).resume_candidates;
+  }
+
   set_bot_idle(bot_id: number, idle: boolean): void {
     this.idle_overrides.set(bot_id, idle);
   }
@@ -815,6 +819,308 @@ describe("BotPool persistence", () => {
       // Free bot: access.json also cleared
       const access61 = JSON.parse(await readFile(join(temp_dir, "channels", "pool-61", "access.json"), "utf-8")) as Record<string, unknown>;
       expect(access61.groups).toEqual({});
+    });
+  });
+
+  describe("proactive resume on startup", () => {
+    /** Helper: seed pool-state.json, create pool-N dirs, and initialize a fresh pool. */
+    async function setup_resume_pool(
+      persisted: PersistedPoolBot[],
+      bot_ids: number[],
+      registry_entities?: EntityConfig[],
+    ): Promise<TestBotPool> {
+      const cfg = make_config();
+      await save_pool_state(persisted, cfg);
+
+      for (const id of bot_ids) {
+        const dir = join(temp_dir, "channels", `pool-${String(id)}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, ".env"), `DISCORD_BOT_TOKEN=fake-token-${String(id)}`, "utf-8");
+      }
+
+      const p = new TestBotPool(cfg);
+      vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(false);
+      vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
+        .mockResolvedValue(undefined);
+
+      const reg = registry_entities
+        ? make_registry(registry_entities)
+        : undefined;
+
+      await p.initialize(reg);
+      return p;
+    }
+
+    it("resumes bot saved as 'assigned' with session_id", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-abc",
+          }),
+        ],
+        [1],
+        [make_entity_config("test-entity", ["ch-1"])],
+      );
+
+      // Should have one resume candidate
+      expect(p.get_resume_candidates()).toHaveLength(1);
+
+      // Track bot:resumed events
+      const events: Array<{ bot_id: number; channel_id: string; entity_id: string }> = [];
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) => events.push(evt));
+
+      await p.resume_parked_bots();
+
+      // Bot should now be assigned
+      const bots = p.get_bots();
+      const bot = bots.find(b => b.id === 1)!;
+      expect(bot.state).toBe("assigned");
+      expect(bot.channel_id).toBe("ch-1");
+      expect(bot.entity_id).toBe("test-entity");
+
+      // start_tmux called with --resume session_id
+      const start_tmux_spy = p["start_tmux" as keyof typeof p] as unknown as { mock: { calls: unknown[][] } };
+      const call = start_tmux_spy.mock.calls[0]!;
+      expect(call[4]).toBe("sess-abc"); // resume_session_id argument
+
+      // Event emitted
+      expect(events).toHaveLength(1);
+      expect(events[0]!.bot_id).toBe(1);
+      expect(events[0]!.channel_id).toBe("ch-1");
+
+      // Candidates cleared
+      expect(p.get_resume_candidates()).toHaveLength(0);
+    });
+
+    it("does NOT resume bot saved as 'parked'", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "parked",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-old",
+          }),
+        ],
+        [1],
+        [make_entity_config("test-entity", ["ch-1"])],
+      );
+
+      // No resume candidates — bot was already parked before shutdown
+      expect(p.get_resume_candidates()).toHaveLength(0);
+
+      const events: unknown[] = [];
+      p.on("bot:resumed", (evt: unknown) => events.push(evt));
+
+      await p.resume_parked_bots();
+
+      // Bot stays parked
+      const bots = p.get_bots();
+      expect(bots[0]!.state).toBe("parked");
+
+      // No events
+      expect(events).toHaveLength(0);
+    });
+
+    it("does NOT resume bot saved as 'assigned' with null session_id", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: null,
+          }),
+        ],
+        [1],
+        [make_entity_config("test-entity", ["ch-1"])],
+      );
+
+      // No resume candidates — can't --resume without a session_id
+      expect(p.get_resume_candidates()).toHaveLength(0);
+
+      await p.resume_parked_bots();
+
+      // Bot stays parked (not proactively resumed)
+      const bots = p.get_bots();
+      expect(bots[0]!.state).toBe("parked");
+    });
+
+    it("resumes multiple candidates", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "entity-a",
+            archetype: "builder",
+            session_id: "sess-1",
+          }),
+          make_persisted_bot({
+            id: 2,
+            state: "assigned",
+            channel_id: "ch-2",
+            entity_id: "entity-b",
+            archetype: "planner",
+            session_id: "sess-2",
+          }),
+        ],
+        [1, 2],
+        [
+          make_entity_config("entity-a", ["ch-1"]),
+          make_entity_config("entity-b", ["ch-2"]),
+        ],
+      );
+
+      expect(p.get_resume_candidates()).toHaveLength(2);
+
+      const events: Array<{ bot_id: number; channel_id: string }> = [];
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string }) => events.push(evt));
+
+      await p.resume_parked_bots();
+
+      // Both bots should be assigned
+      const bots = p.get_bots();
+      expect(bots.find(b => b.id === 1)!.state).toBe("assigned");
+      expect(bots.find(b => b.id === 2)!.state).toBe("assigned");
+
+      // Two events emitted
+      expect(events).toHaveLength(2);
+      expect(events.map(e => e.bot_id).sort()).toEqual([1, 2]);
+    });
+
+    it("after resume, persist() reflects correct assigned state", async () => {
+      const cfg = make_config();
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-abc",
+          }),
+        ],
+        [1],
+        [make_entity_config("test-entity", ["ch-1"])],
+      );
+
+      await p.resume_parked_bots();
+
+      // Re-read persisted state from disk
+      const saved = await load_pool_state(cfg);
+      const bot_entry = saved.find(b => b.id === 1);
+      expect(bot_entry).toBeDefined();
+      expect(bot_entry!.state).toBe("assigned");
+      expect(bot_entry!.channel_id).toBe("ch-1");
+      expect(bot_entry!.session_id).toBe("sess-abc");
+    });
+
+    it("bot:resumed event fires with correct metadata", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 3,
+            state: "assigned",
+            channel_id: "ch-work",
+            entity_id: "ent-x",
+            archetype: "designer",
+            session_id: "sess-design",
+            channel_type: "work_room",
+          }),
+        ],
+        [3],
+        [make_entity_config("ent-x", ["ch-work"])],
+      );
+
+      const events: Array<{ bot_id: number; channel_id: string; entity_id: string }> = [];
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) => events.push(evt));
+
+      await p.resume_parked_bots();
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toEqual({
+        bot_id: 3,
+        channel_id: "ch-work",
+        entity_id: "ent-x",
+      });
+    });
+
+    it("resume_candidates cleared after resume completes", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-abc",
+          }),
+        ],
+        [1],
+        [make_entity_config("test-entity", ["ch-1"])],
+      );
+
+      expect(p.get_resume_candidates()).toHaveLength(1);
+
+      await p.resume_parked_bots();
+
+      expect(p.get_resume_candidates()).toHaveLength(0);
+
+      // Calling again is a no-op
+      const events: unknown[] = [];
+      p.on("bot:resumed", (evt: unknown) => events.push(evt));
+      await p.resume_parked_bots();
+      expect(events).toHaveLength(0);
+    });
+
+    it("existing assign-on-message flow still works for non-resumed parked bots", async () => {
+      const p = await setup_resume_pool(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "parked",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "planner",
+            session_id: "sess-old",
+          }),
+        ],
+        [1],
+        [make_entity_config("test-entity", ["ch-1"])],
+      );
+
+      // Not a resume candidate
+      expect(p.get_resume_candidates()).toHaveLength(0);
+
+      // Simulate a message arriving — assign() should reclaim the parked bot
+      const assignment = await p.assign("ch-1", "test-entity", "planner", undefined, "general");
+      expect(assignment).not.toBeNull();
+      expect(assignment!.bot_id).toBe(1);
+      expect(assignment!.session_id).toBe("sess-old");
+
+      // Bot is now assigned
+      const bots = p.get_bots();
+      expect(bots[0]!.state).toBe("assigned");
     });
   });
 });

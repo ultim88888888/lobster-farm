@@ -189,6 +189,19 @@ async function main(): Promise<void> {
     await reset_idle_work_room_topics(registry);
   }
 
+  // Proactively resume bots that were assigned before shutdown.
+  // Must happen after Discord connects so we can send "back online" notifications.
+  // Listen for bot:resumed events and notify each channel via the daemon bot.
+  pool.on("bot:resumed", ({ channel_id }: { channel_id: string }) => {
+    if (discord_connected) {
+      void discord.send(channel_id, "Session restored after daemon restart.");
+    }
+  });
+
+  if (discord_connected) {
+    await pool.resume_parked_bots();
+  }
+
   // Initialize Commander (persistent Claude Code session with Discord channel)
   const commander = new CommanderProcess(config);
   if (await commander.has_token()) {
