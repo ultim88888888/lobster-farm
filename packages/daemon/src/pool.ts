@@ -9,6 +9,7 @@ import type { ChannelType } from "@lobster-farm/shared";
 import { save_pool_state, load_pool_state } from "./persistence.js";
 import type { PersistedPoolBot } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
+import { sq } from "./shell.js";
 
 // ── Types ──
 
@@ -678,17 +679,17 @@ export class BotPool extends EventEmitter {
     const agent_name = resolve_agent_name(archetype, this.config);
 
     const claude_args = [
-      claude_bin,
+      sq(claude_bin),
       "--channels", "plugin:discord@claude-plugins-official",
-      "--agent", agent_name,
+      "--agent", sq(agent_name),
       "--model", "claude-opus-4-6",
       "--permission-mode", "bypassPermissions",
-      "--add-dir", working_dir,
-      "--add-dir", homedir(),
+      "--add-dir", sq(working_dir),
+      "--add-dir", sq(homedir()),
     ];
 
     if (resume_session_id) {
-      claude_args.push("--resume", resume_session_id);
+      claude_args.push("--resume", sq(resume_session_id));
     }
 
     // Note: entity context is NOT injected via --append-system-prompt for pool bots.
@@ -696,7 +697,7 @@ export class BotPool extends EventEmitter {
     // naturally via CLAUDE.md, skills, and entity memory in the working directory.
 
     const display_name = resolve_agent_display_name(archetype, this.config);
-    const git_env = `GIT_AUTHOR_NAME="${display_name} (LobsterFarm)" GIT_AUTHOR_EMAIL="${agent_name}@lobsterfarm.dev" GIT_COMMITTER_NAME="${display_name} (LobsterFarm)" GIT_COMMITTER_EMAIL="${agent_name}@lobsterfarm.dev"`;
+    const git_env = `GIT_AUTHOR_NAME=${sq(`${display_name} (LobsterFarm)`)} GIT_AUTHOR_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)} GIT_COMMITTER_NAME=${sq(`${display_name} (LobsterFarm)`)} GIT_COMMITTER_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)}`;
     const claude_cmd = claude_args.join(" ");
 
     return new Promise<void>((resolve, reject) => {
@@ -704,7 +705,7 @@ export class BotPool extends EventEmitter {
         "new-session", "-d",
         "-s", bot.tmux_session,
         "-x", "200", "-y", "50",
-        `DISCORD_STATE_DIR=${bot.state_dir} ${git_env} ${claude_cmd}`,
+        `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${claude_cmd}`,
       ], {
         cwd: working_dir,
         stdio: "ignore",
