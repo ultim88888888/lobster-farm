@@ -265,10 +265,12 @@ async function main(): Promise<void> {
       }
     }
 
-    // Stop health monitor but preserve tmux sessions — `lf restart` relies
-    // on tmux bots surviving daemon restarts.  `lf stop` handles tmux cleanup
-    // from the CLI side before unloading the service.
-    pool.stop_health_monitor();
+    // Kill all pool bot tmux sessions. Assigned bots are persisted to
+    // pool-state.json on every mutation, so on restart they'll be restored
+    // as parked and resumed with --resume {session_id} — no context lost.
+    // Previous approach (preserving tmux) caused state desync between
+    // surviving tmux sessions and the daemon's pool metadata.
+    await pool.shutdown();
 
     // Stop Commander
     await commander.stop();
