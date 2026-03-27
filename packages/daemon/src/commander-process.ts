@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { resolve_model_id } from "./models.js";
+import { sq } from "./shell.js";
 
 export interface CommanderHealth {
   state: "stopped" | "starting" | "running" | "crashed";
@@ -109,13 +110,13 @@ export class CommanderProcess extends EventEmitter {
     const working_dir = lobsterfarm_dir(this.config.paths);
 
     const claude_cmd = [
-      claude_bin,
+      sq(claude_bin),
       "--channels", "plugin:discord@claude-plugins-official",
-      "--agent", agent_name,
+      "--agent", sq(agent_name),
       "--model", resolve_model_id(this.config.defaults.models.planning),
       "--permission-mode", "bypassPermissions",
-      "--add-dir", working_dir,
-      "--add-dir", homedir(),
+      "--add-dir", sq(working_dir),
+      "--add-dir", sq(homedir()),
     ].join(" ");
 
     console.log(`[commander] Starting ${agent_name} in tmux session "${TMUX_SESSION}"...`);
@@ -126,7 +127,7 @@ export class CommanderProcess extends EventEmitter {
       "new-session", "-d",
       "-s", TMUX_SESSION,
       "-x", "200", "-y", "50",
-      `DISCORD_STATE_DIR=${this.state_dir()} GIT_AUTHOR_NAME="Pat (LobsterFarm)" GIT_AUTHOR_EMAIL="pat@lobsterfarm.dev" GIT_COMMITTER_NAME="Pat (LobsterFarm)" GIT_COMMITTER_EMAIL="pat@lobsterfarm.dev" ${claude_cmd}`,
+      `DISCORD_STATE_DIR=${sq(this.state_dir())} GIT_AUTHOR_NAME=${sq("Pat (LobsterFarm)")} GIT_AUTHOR_EMAIL=${sq("pat@lobsterfarm.dev")} GIT_COMMITTER_NAME=${sq("Pat (LobsterFarm)")} GIT_COMMITTER_EMAIL=${sq("pat@lobsterfarm.dev")} ${claude_cmd}`,
     ], {
       cwd: working_dir,
       stdio: "ignore",
