@@ -149,7 +149,6 @@ export const init_command = new Command("init")
     // Check if Claude Code is logged in
     if (claude.installed || !non_interactive) {
       const { exec_command } = await import("../lib/process.js");
-      const auth_check = await exec_command("claude --version 2>&1");
       // Try a quick auth test
       const auth_test = await exec_command("echo 'test' | claude -p --print --no-session-persistence 2>&1");
       if (auth_test.stderr.includes("login") || auth_test.stderr.includes("Not logged in") || auth_test.stdout.includes("Not logged in")) {
@@ -444,6 +443,7 @@ export const init_command = new Command("init")
     const tools_config = await setup_tool_integrations(spin, non_interactive, options);
 
     // ── Step 12: Peekaboo (computer use CLI) ──
+    let peekaboo_status = "skipped (non-macOS or non-interactive)";
     if (machine.platform === "darwin" && !non_interactive) {
       const { exec_command } = await import("../lib/process.js");
       const { spawnSync } = await import("node:child_process");
@@ -453,6 +453,10 @@ export const init_command = new Command("init")
       const peekaboo_installed = peekaboo_which.exitCode === 0;
       spin.stop(peekaboo_installed ? `Peekaboo: installed (${peekaboo_which.stdout.trim()})` : "Peekaboo: not installed");
 
+      if (peekaboo_installed) {
+        peekaboo_status = `installed (${peekaboo_which.stdout.trim()})`;
+      }
+
       if (!peekaboo_installed) {
         const install_peekaboo = await p.confirm({
           message: "Peekaboo enables GUI automation (screen capture, clicking, typing). Install it?",
@@ -460,12 +464,17 @@ export const init_command = new Command("init")
         });
         if (p.isCancel(install_peekaboo)) { p.cancel("Setup cancelled."); process.exit(0); }
 
+        if (!install_peekaboo) {
+          peekaboo_status = "skipped (user declined)";
+        }
+
         if (install_peekaboo) {
           // Check Swift toolchain is available
           const swift_check = await exec_command("which swift");
           if (swift_check.exitCode !== 0) {
             p.log.warning("Swift toolchain not found — Peekaboo requires Xcode or Command Line Tools to build from source.");
             p.log.info("Install Xcode from the App Store, then re-run this wizard.");
+            peekaboo_status = "not installed (Swift toolchain missing)";
           } else {
             const home = process.env["HOME"] ?? "";
             const tools_dir = `${home}/.lobsterfarm/tools`;
@@ -482,17 +491,25 @@ export const init_command = new Command("init")
             if (clone_result.exitCode !== 0) {
               spin.stop("Peekaboo clone failed");
               p.log.warning(`Clone failed: ${clone_result.stderr.trim()}`);
+              peekaboo_status = "not installed (clone failed)";
             } else {
               spin.stop("Peekaboo cloned");
 
               // Build from source (this takes several minutes)
+              // Detect architecture — arm64 for Apple Silicon, x86_64 for Intel
+              const arch = process.arch === "x64" ? "x86_64" : "arm64";
+
               spin.start("Building Peekaboo from source (this may take a few minutes)...");
-              const build_result = await exec_command(
-                `cd "${peekaboo_dir}/Apps/CLI" && swift build --arch arm64 -c release`,
-              );
-              if (build_result.exitCode !== 0) {
+              // Use spawnSync instead of exec_command — Swift builds routinely produce
+              // 2-10MB of output which overflows execFile's default 1MB maxBuffer.
+              const build_result = spawnSync("swift", ["build", "--arch", arch, "-c", "release"], {
+                cwd: `${peekaboo_dir}/Apps/CLI`,
+                stdio: "inherit",
+              });
+              if (build_result.status !== 0) {
                 spin.stop("Peekaboo build failed");
-                p.log.warning(`Build failed: ${build_result.stderr.trim().split("\n").slice(-5).join("\n")}`);
+                p.log.warning("Build failed — check the output above for details.");
+                peekaboo_status = "not installed (build failed)";
               } else {
                 spin.stop("Peekaboo built successfully");
 
@@ -500,20 +517,23 @@ export const init_command = new Command("init")
                 spin.start("Installing peekaboo binary...");
                 const cp_result = spawnSync("sudo", [
                   "cp",
-                  `${peekaboo_dir}/Apps/CLI/.build/arm64-apple-macosx/release/peekaboo`,
+                  `${peekaboo_dir}/Apps/CLI/.build/${arch}-apple-macosx/release/peekaboo`,
                   "/usr/local/bin/peekaboo",
                 ], { stdio: "inherit" });
 
                 if (cp_result.status !== 0) {
                   spin.stop("Failed to copy binary to /usr/local/bin");
-                  p.log.warning("Copy the binary manually: sudo cp Apps/CLI/.build/arm64-apple-macosx/release/peekaboo /usr/local/bin/peekaboo");
+                  p.log.warning(`Copy the binary manually: sudo cp Apps/CLI/.build/${arch}-apple-macosx/release/peekaboo /usr/local/bin/peekaboo`);
+                  peekaboo_status = "built but not installed (copy failed)";
                 } else {
                   // Verify
                   const version_check = await exec_command("peekaboo --version");
                   if (version_check.exitCode === 0) {
                     spin.stop(`Peekaboo installed: ${version_check.stdout.trim()}`);
+                    peekaboo_status = `installed (${version_check.stdout.trim()})`;
                   } else {
                     spin.stop("Peekaboo binary installed to /usr/local/bin/peekaboo");
+                    peekaboo_status = "installed (/usr/local/bin/peekaboo)";
                   }
                 }
               }
@@ -598,10 +618,10 @@ export const init_command = new Command("init")
           }
         }
 
-        // Create Peekaboo skill file
+        // Create Peekaboo skill file — respect path_overrides.claude_dir
         const { writeFile: writeSkill, mkdir: mkdirSkill } = await import("node:fs/promises");
-        const home = process.env["HOME"] ?? "";
-        const skill_dir = `${home}/.claude/skills/peekaboo`;
+        const { skills_dir: get_skills_dir } = await import("@lobster-farm/shared");
+        const skill_dir = `${get_skills_dir(path_overrides)}/peekaboo`;
         await mkdirSkill(skill_dir, { recursive: true });
 
         const skill_content = `---
@@ -674,7 +694,7 @@ Always clean up after yourself:
 `;
 
         await writeSkill(`${skill_dir}/SKILL.md`, skill_content);
-        p.log.success("Peekaboo skill file created: ~/.claude/skills/peekaboo/SKILL.md");
+        p.log.success(`Peekaboo skill file created: ${skill_dir}/SKILL.md`);
 
         // Append Peekaboo section to tools.md
         const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
@@ -683,11 +703,12 @@ Always clean up after yourself:
           const { readFile: readTools, writeFile: writeTools } = await import("node:fs/promises");
           const tools_content = await readTools(tools_path, "utf-8");
           if (!tools_content.includes("Peekaboo")) {
+            const tools_arch = process.arch === "x64" ? "x86_64" : "arm64";
             const peekaboo_section =
               "\n## Computer Use (Peekaboo)\n\n" +
-              "- **Binary:** `/usr/local/bin/peekaboo` (v3.0.0-beta3, arm64)\n" +
+              `- **Binary:** \`/usr/local/bin/peekaboo\` (v3.0.0-beta3, ${tools_arch})\n` +
               "- **Source:** `~/.lobsterfarm/tools/Peekaboo/` (pinned to v3.0.0-beta3)\n" +
-              "- **Skill:** `~/.claude/skills/peekaboo/SKILL.md` — load when GUI interaction is needed\n" +
+              `- **Skill:** \`${skill_dir}/SKILL.md\` — load when GUI interaction is needed\n` +
               "- **Permissions:** Screen Recording + Accessibility granted for Terminal, node, tmux\n" +
               "- **When to use:** GUI-only tasks where no CLI/API alternative exists. Not the default — always prefer CLI/API.\n" +
               "- **Cleanup:** Always delete screenshots after use (`/tmp/pb-*.png`, `~/Desktop/peekaboo_see_*.png`)\n";
@@ -916,6 +937,7 @@ Always clean up after yourself:
     summary_lines.push(`Bun:        ${bun.status}`);
     summary_lines.push(`tmux:       ${tmux.status}`);
     summary_lines.push(`GitHub CLI: ${gh.status}`);
+    summary_lines.push(`Peekaboo:   ${peekaboo_status}`);
 
     if (discord_setup) {
       const tokens = [discord_setup.daemon_bot_token ? "daemon" : ""].filter(Boolean);
