@@ -23,6 +23,7 @@ import {
   entity_files_dir,
   entity_config_path,
   entity_memory_path,
+  expand_home,
   write_yaml,
 } from "@lobster-farm/shared";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -34,6 +35,19 @@ import type { TaskQueue } from "./queue.js";
 import type { BotPool } from "./pool.js";
 
 const exec = promisify(execFile);
+
+/**
+ * Extract GitHub owner/repo (nwo) from a repo URL.
+ * Handles both SSH (git@github.com:owner/repo.git) and
+ * HTTPS (https://github.com/owner/repo.git) formats.
+ * Returns undefined if the URL doesn't match either pattern.
+ */
+function nwo_from_url(url: string): string | undefined {
+  // SSH: git@github.com:owner/repo.git
+  const ssh_match = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
+  if (ssh_match) return ssh_match[1];
+  return undefined;
+}
 
 // ── Channel index entry ──
 
@@ -775,8 +789,48 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // Generate a GitHub issue number (placeholder — in production, create the actual issue)
-    const issue_number = Date.now() % 10000;
+    // Resolve the GitHub repo for issue creation
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) {
+      await this.reply(message, `Entity "${entity_id}" not found.`);
+      return;
+    }
+
+    const repo = entity_config.entity.repos[0];
+    if (!repo) {
+      await this.reply(message, `Entity "${entity_id}" has no repos configured. Cannot create GitHub issue.`);
+      return;
+    }
+
+    const nwo = nwo_from_url(repo.url);
+    if (!nwo) {
+      await this.reply(message, `Could not parse GitHub owner/repo from URL: ${repo.url}`);
+      return;
+    }
+
+    // Create a real GitHub issue
+    let issue_number: number;
+    try {
+      const repo_path = expand_home(repo.path);
+      const { stdout } = await exec("gh", [
+        "issue", "create",
+        "--repo", nwo,
+        "--title", title,
+        "--body", "",
+      ], { cwd: repo_path, timeout: 30_000 });
+
+      // gh issue create outputs the issue URL, e.g. https://github.com/owner/repo/issues/42
+      const url_match = stdout.trim().match(/\/issues\/(\d+)$/);
+      if (!url_match) {
+        await this.reply(message, `GitHub issue created but could not parse issue number from: ${stdout.trim()}`);
+        return;
+      }
+      issue_number = Number(url_match[1]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.reply(message, `Failed to create GitHub issue: ${msg}`);
+      return;
+    }
 
     try {
       const feature = await features.create_feature({
