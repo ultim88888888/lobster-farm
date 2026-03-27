@@ -83,7 +83,8 @@ function resolve_agent_display_name(
   }
 }
 
-/** Extract bot user ID from a Discord bot token (first segment is base64-encoded user ID). */
+/** Extract bot user ID from a Discord bot token (first segment is base64-encoded user ID).
+ * Returns only the non-secret user ID — the token itself is not retained. */
 function bot_user_id_from_token(token: string): string | null {
   try {
     const first_segment = token.split(".")[0];
@@ -93,6 +94,10 @@ function bot_user_id_from_token(token: string): string | null {
     return null;
   }
 }
+
+/** Callback for setting a bot's Discord nickname. Provided by the Discord module
+ * so the pool doesn't need direct access to bot tokens or the Discord API. */
+export type NicknameHandler = (user_id: string, display_name: string) => Promise<void>;
 
 // ── Pool Manager ──
 
@@ -105,10 +110,19 @@ export class BotPool extends EventEmitter {
   private assigning_channels = new Set<string>();
   /** In-flight lock: channels currently being released. Prevents double-release races. */
   private releasing_channels = new Set<string>();
+  private bot_user_ids = new Map<number, string>();
+  private nickname_handler: NicknameHandler | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
     this.config = config;
+  }
+
+  /** Register a callback for setting bot nicknames via Discord.
+   * Called by the Discord module after connecting — allows the pool to
+   * set nicknames through the daemon bot without touching pool bot tokens. */
+  set_nickname_handler(handler: NicknameHandler): void {
+    this.nickname_handler = handler;
   }
 
   /** Enter drain mode — no new assignments accepted. */
@@ -152,12 +166,19 @@ export class BotPool extends EventEmitter {
       const id = parseInt(dir_name.replace("pool-", ""), 10);
       const state_dir = join(channels_dir, dir_name);
 
-      // Verify the bot has a token
+      // Verify the bot has a token and extract its user ID for nickname management.
+      // Only the non-secret user ID (base64 first segment) is retained — the full
+      // token is never stored in daemon memory or used for API calls.
       try {
         const env_content = await readFile(join(state_dir, ".env"), "utf-8");
-        if (!env_content.includes("DISCORD_BOT_TOKEN=")) {
+        const token_match = env_content.match(/DISCORD_BOT_TOKEN=(.+)/);
+        if (!token_match?.[1]?.trim()) {
           console.log(`[pool] Skipping ${dir_name}: no bot token`);
           continue;
+        }
+        const user_id = bot_user_id_from_token(token_match[1].trim());
+        if (user_id) {
+          this.bot_user_ids.set(id, user_id);
         }
       } catch {
         console.log(`[pool] Skipping ${dir_name}: no .env file`);
@@ -362,7 +383,7 @@ export class BotPool extends EventEmitter {
       await this.write_access_json(bot.state_dir, channel_id);
 
       // Set Discord nickname to match the archetype
-      await this.set_bot_nickname(bot.state_dir, archetype);
+      await this.set_bot_nickname(bot, archetype);
 
       // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
       const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
@@ -776,40 +797,31 @@ export class BotPool extends EventEmitter {
     });
   }
 
-  /** Set the bot's server nickname via Discord API. */
+  /** Set a pool bot's server nickname via the daemon bot's Discord client.
+   * Uses the cached user ID (extracted during initialize) and the nickname
+   * handler (provided by the Discord module) — never reads bot tokens at runtime. */
   private async set_bot_nickname(
-    state_dir: string,
+    bot: PoolBot,
     archetype: ArchetypeRole,
   ): Promise<void> {
     const display_name = resolve_agent_display_name(archetype, this.config);
-    const server_id = this.config.discord?.server_id;
-    if (!server_id) return;
+
+    if (!this.nickname_handler) {
+      console.log(`[pool] No nickname handler registered — skipping nickname set for pool-${String(bot.id)}`);
+      return;
+    }
+
+    const user_id = this.bot_user_ids.get(bot.id);
+    if (!user_id) {
+      console.log(`[pool] No cached user ID for pool-${String(bot.id)} — skipping nickname set`);
+      return;
+    }
 
     try {
-      const env_content = await readFile(join(state_dir, ".env"), "utf-8");
-      const token_match = env_content.match(/DISCORD_BOT_TOKEN=(.+)/);
-      const token = token_match?.[1]?.trim();
-      if (!token) return;
-
-      const res = await fetch(
-        `https://discord.com/api/v10/guilds/${server_id}/members/@me`,
-        {
-          method: "PATCH",
-          headers: {
-            Authorization: `Bot ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ nick: display_name }),
-        },
-      );
-
-      if (res.ok) {
-        console.log(`[pool] Set nickname to "${display_name}"`);
-      } else {
-        console.log(`[pool] Failed to set nickname: ${String(res.status)}`);
-      }
+      await this.nickname_handler(user_id, display_name);
+      console.log(`[pool] Set pool-${String(bot.id)} nickname to "${display_name}"`);
     } catch (err) {
-      console.log(`[pool] Nickname set failed: ${String(err)}`);
+      console.log(`[pool] Nickname set failed for pool-${String(bot.id)}: ${String(err)}`);
     }
   }
 

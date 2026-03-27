@@ -49,6 +49,7 @@ function nwo_from_url(url: string): string | undefined {
   return undefined;
 }
 
+
 // ── Channel index entry ──
 
 interface ChannelEntry {
@@ -496,6 +497,15 @@ export class DiscordBot extends EventEmitter {
 
   set_pool(pool: BotPool): void {
     this._pool = pool;
+
+    // Register nickname handler so pool can set bot nicknames through the
+    // daemon's Discord client — no pool bot tokens needed at runtime.
+    pool.set_nickname_handler(async (user_id: string, display_name: string) => {
+      const guild = await this.get_guild();
+      if (!guild) return;
+      const member = await guild.members.fetch(user_id);
+      await member.setNickname(display_name);
+    });
 
     // When a waiting-for-human bot is evicted, notify the channel
     pool.on("bot:parked_with_context", (info: { bot_id: number; channel_id: string | null; entity_id: string | null }) => {
@@ -1178,9 +1188,11 @@ export class DiscordBot extends EventEmitter {
 // ── Token resolution ──
 
 /** Resolve the Discord bot token. Resolution order:
- * 1. DISCORD_BOT_TOKEN env var
+ * 1. DISCORD_BOT_TOKEN env var (preferred — set via env.sh or op run)
  * 2. ~/.lobsterfarm/.env file (written by setup wizard)
- * 3. 1Password reference (if configured)
+ *
+ * If a 1Password reference is configured but the token isn't in the
+ * environment, logs guidance on using `op run` to inject it safely.
  */
 export async function resolve_bot_token(
   config: LobsterFarmConfig,
@@ -1207,19 +1219,17 @@ export async function resolve_bot_token(
     // .env file doesn't exist — continue
   }
 
-  // 3. 1Password reference
+  // 3. 1Password: `op read` is not used here because it exposes the token
+  // to stdout (which gets logged in session JSONL files). Instead, the token
+  // must be injected via env.sh (sourced before daemon startup) using:
+  //   op run --env-file ~/.lobsterfarm/.env.op -- <daemon start command>
+  // This keeps the secret in the process environment without stdout exposure.
   const op_ref = config.discord?.bot_token_ref;
   if (op_ref) {
-    try {
-      const { stdout } = await exec("op", ["read", op_ref]);
-      const token = stdout.trim();
-      if (token) {
-        console.log("[discord] Using bot token from 1Password");
-        return token;
-      }
-    } catch {
-      console.log("[discord] Failed to read bot token from 1Password");
-    }
+    console.log(
+      `[discord] 1Password reference configured (${op_ref}) but DISCORD_BOT_TOKEN is not set. ` +
+      `Ensure env.sh or the daemon launcher uses 'op run --env-file .env.op' to inject the token.`,
+    );
   }
 
   return null;
