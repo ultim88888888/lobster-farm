@@ -1492,10 +1492,10 @@ export class FeatureManager extends EventEmitter {
       await actions.release_work_room(feature, entity);
       feature.discordWorkRoom = null;
     } finally {
-      // Always release pool bot on successful merge — otherwise the slot is permanently occupied.
-      // On conflict bounce, keep the pool bot since the feature returns to build
-      // and will reuse the work room. Only release on merge success or non-conflict block.
-      const should_release_pool = merged || (feature.blocked && !feature.blockedReason?.includes("conflict"));
+      // Release pool bot when the feature is finished — either merged or blocked.
+      // A conflict bounce returns early (before reaching here) without setting blocked,
+      // so this correctly keeps the pool bot during active conflict recovery.
+      const should_release_pool = merged || feature.blocked;
       if (should_release_pool && this.pool && work_room) {
         // Clear session history for the work room — feature is done, no context to preserve
         this.pool.clear_session_history(feature.entity, work_room);
