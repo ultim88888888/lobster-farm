@@ -697,4 +697,62 @@ describe("BotPool persistence", () => {
       expect(bot3.channel_id).toBeNull();
     });
   });
+
+  describe("channel deduplication on initialize", () => {
+    // Use high pool IDs (50+) to avoid collisions with real tmux sessions on the host
+    it("frees duplicate parked bots claiming the same channel", async () => {
+      const config = make_config();
+
+      for (const id of [50, 51, 52]) {
+        const dir = join(temp_dir, "channels", `pool-${String(id)}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, ".env"), `DISCORD_BOT_TOKEN=fake-token-${String(id)}`);
+      }
+
+      // Persist state: pool-50 and pool-51 both claim the same channel (from a prior race)
+      await save_pool_state([
+        make_persisted_bot({ id: 50, state: "parked", channel_id: "ch-duped", entity_id: "e1", archetype: "planner" }),
+        make_persisted_bot({ id: 51, state: "parked", channel_id: "ch-duped", entity_id: "e1", archetype: "planner" }),
+      ], config);
+
+      const pool = new TestBotPool(config);
+      await pool.initialize();
+
+      const bots = pool.get_bots();
+
+      // Pool-50 (lower ID, seen first) keeps the channel
+      const bot0 = bots.find(b => b.id === 50)!;
+      expect(bot0.state).toBe("parked");
+      expect(bot0.channel_id).toBe("ch-duped");
+
+      // Pool-51 (duplicate) is freed
+      const bot1 = bots.find(b => b.id === 51)!;
+      expect(bot1.state).toBe("free");
+      expect(bot1.channel_id).toBeNull();
+    });
+
+    it("keeps non-duplicate bots on different channels", async () => {
+      const config = make_config();
+
+      for (const id of [50, 51]) {
+        const dir = join(temp_dir, "channels", `pool-${String(id)}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, ".env"), `DISCORD_BOT_TOKEN=fake-token-${String(id)}`);
+      }
+
+      await save_pool_state([
+        make_persisted_bot({ id: 50, state: "parked", channel_id: "ch-a", entity_id: "e1", archetype: "planner" }),
+        make_persisted_bot({ id: 51, state: "parked", channel_id: "ch-b", entity_id: "e1", archetype: "builder" }),
+      ], config);
+
+      const pool = new TestBotPool(config);
+      await pool.initialize();
+
+      const bots = pool.get_bots();
+      expect(bots.find(b => b.id === 50)!.state).toBe("parked");
+      expect(bots.find(b => b.id === 50)!.channel_id).toBe("ch-a");
+      expect(bots.find(b => b.id === 51)!.state).toBe("parked");
+      expect(bots.find(b => b.id === 51)!.channel_id).toBe("ch-b");
+    });
+  });
 });

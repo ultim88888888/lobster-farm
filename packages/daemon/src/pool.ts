@@ -248,7 +248,31 @@ export class BotPool extends EventEmitter {
       console.log(`[pool] Restored ${String(restored)} bot assignment(s) from persisted state`);
     }
 
-    // Persist cleaned state (stale entries removed, current snapshot)
+    // Deduplicate: if multiple bots claim the same channel (from a prior race condition),
+    // keep only the first (lowest pool-id) and free the rest. This prevents stale
+    // persisted state from causing duplicate assignments on restart.
+    const seen_channels = new Set<string>();
+    for (const bot of this.bots) {
+      if (bot.state === "free" || !bot.channel_id) continue;
+      if (seen_channels.has(bot.channel_id)) {
+        console.log(
+          `[pool] Dedup: pool-${String(bot.id)} has duplicate claim on channel ${bot.channel_id} — freeing`,
+        );
+        bot.state = "free";
+        bot.channel_id = null;
+        bot.entity_id = null;
+        bot.archetype = null;
+        bot.channel_type = null;
+        bot.session_id = null;
+        bot.last_active = null;
+        // Clear the stale access.json so the bot doesn't listen on the old channel
+        await this.write_access_json(bot.state_dir, null);
+      } else {
+        seen_channels.add(bot.channel_id);
+      }
+    }
+
+    // Persist cleaned state (stale entries removed, duplicates resolved, current snapshot)
     await this.persist();
 
     console.log(
@@ -459,7 +483,10 @@ export class BotPool extends EventEmitter {
   private async park_bot(bot: PoolBot): Promise<void> {
     this.kill_tmux(bot.tmux_session);
     bot.state = "parked";
-    // session_id, channel_id, entity_id, archetype preserved for resume
+    // session_id, channel_id, entity_id, archetype preserved for resume in memory.
+    // Clear access.json on disk so no stale channel config survives if the bot's
+    // tmux session is somehow restarted outside the normal assign() path.
+    await this.write_access_json(bot.state_dir, null);
     await this.persist();
     console.log(
       `[pool] Parked pool-${String(bot.id)} ` +
