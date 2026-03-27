@@ -69,11 +69,14 @@ export class DiscordBot extends EventEmitter {
   async connect(token: string): Promise<void> {
     this.build_channel_map();
 
-    this.client.on("ready", () => {
-      const tag = this.client.user?.tag ?? "unknown";
-      console.log(`[discord] Connected as ${tag}`);
-      this.connected = true;
-      this.emit("connected");
+    const ready = new Promise<void>(resolve => {
+      this.client.once("ready", () => {
+        const tag = this.client.user?.tag ?? "unknown";
+        console.log(`[discord] Connected as ${tag}`);
+        this.connected = true;
+        this.emit("connected");
+        resolve();
+      });
     });
 
     this.client.on("messageCreate", (message: Message) => {
@@ -81,6 +84,7 @@ export class DiscordBot extends EventEmitter {
     });
 
     await this.client.login(token);
+    await ready;
   }
 
   /** Disconnect from Discord. */
