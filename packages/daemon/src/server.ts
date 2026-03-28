@@ -10,6 +10,7 @@ import type { CommanderProcess } from "./commander-process.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
 import type { ArchetypeRole } from "@lobster-farm/shared";
+import { persist_entity_config } from "./actions.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -466,6 +467,73 @@ const handle_pool_release: RouteHandler = async (req, res, ctx) => {
   json_response(res, 200, { ok: true });
 };
 
+// ── Channel routes ──
+
+const PROTECTED_CHANNEL_TYPES = ["general", "alerts"];
+
+const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.discord) {
+    json_response(res, 503, { error: "Discord bot not connected" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { channel_id?: string; entity_id?: string };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!params.channel_id || !params.entity_id) {
+    json_response(res, 400, { error: "Missing required fields: channel_id, entity_id" });
+    return;
+  }
+
+  // Validate entity exists
+  const entity = ctx.registry.get(params.entity_id);
+  if (!entity) {
+    json_response(res, 404, { error: `Entity "${params.entity_id}" not found` });
+    return;
+  }
+
+  // Validate channel belongs to entity
+  const channel_entry = entity.entity.channels.list.find(c => c.id === params.channel_id);
+  if (!channel_entry) {
+    json_response(res, 404, { error: "Channel not in entity config" });
+    return;
+  }
+
+  // Don't allow deleting general or alerts
+  if (PROTECTED_CHANNEL_TYPES.includes(channel_entry.type)) {
+    json_response(res, 400, { error: `Cannot delete ${channel_entry.type} channels` });
+    return;
+  }
+
+  // Release any pool bot assigned to this channel
+  if (ctx.pool) {
+    const assignment = ctx.pool.get_assignment(params.channel_id);
+    if (assignment) await ctx.pool.release(params.channel_id);
+  }
+
+  // Delete Discord channel
+  const deleted = await ctx.discord.delete_channel(params.channel_id);
+  if (!deleted) {
+    json_response(res, 502, { error: "Failed to delete Discord channel" });
+    return;
+  }
+
+  // Remove from entity config
+  entity.entity.channels.list = entity.entity.channels.list.filter(c => c.id !== params.channel_id);
+  await persist_entity_config(entity);
+
+  // Rebuild channel map
+  ctx.discord.build_channel_map();
+
+  json_response(res, 200, { ok: true, deleted: params.channel_id });
+};
+
 // ── Router ──
 
 const routes: Route[] = [
@@ -483,6 +551,7 @@ const routes: Route[] = [
   { method: "GET", pattern: /^\/pool$/, handler: handle_pool_status },
   { method: "POST", pattern: /^\/pool\/assign$/, handler: handle_pool_assign },
   { method: "POST", pattern: /^\/pool\/release$/, handler: handle_pool_release },
+  { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
   { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
   { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },

@@ -264,16 +264,18 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  /** Delete a channel by ID. No-op if disconnected or DM channel. */
-  async delete_channel(channel_id: string): Promise<void> {
-    if (!this.connected) return;
+  /** Delete a channel by ID. Returns true on success, false on failure. No-op (returns true) if disconnected or DM channel. */
+  async delete_channel(channel_id: string): Promise<boolean> {
+    if (!this.connected) return true;
     try {
       const channel = await this.client.channels.fetch(channel_id);
-      if (!channel || channel.isDMBased()) return;
+      if (!channel || channel.isDMBased()) return true;
       await channel.delete("LobsterFarm work room cleanup");
       console.log(`[discord] Deleted channel ${channel_id}`);
+      return true;
     } catch (err) {
       console.error(`[discord] Failed to delete channel ${channel_id}: ${String(err)}`);
+      return false;
     }
   }
 
