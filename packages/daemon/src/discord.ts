@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import {
   Client,
@@ -914,6 +914,7 @@ export class DiscordBot extends EventEmitter {
             "• `!lf approve <feature-id>` — approve current phase gate\n" +
             "• `!lf advance <feature-id>` — advance to next phase\n" +
             "• `!lf swap <agent>` — swap active agent in this channel (gary, bob, pearl, ray)\n" +
+            "• `!lf compact` — trigger context compaction on the active session\n" +
             "• `!lf status` — daemon status\n" +
             "• `!lf features [entity]` — list features\n" +
             "• `!lf scaffold server` — create GLOBAL Discord channels\n" +
@@ -948,6 +949,10 @@ export class DiscordBot extends EventEmitter {
 
       case "swap":
         await this.handle_swap_command(args, message);
+        break;
+
+      case "compact":
+        await this.handle_compact_command(message);
         break;
 
       default:
@@ -1392,6 +1397,29 @@ export class DiscordBot extends EventEmitter {
       await this.reply(message, `Swapping to ${agent_display}...`);
     } else {
       await this.reply(message, "No pool bots available for swap.");
+    }
+  }
+
+  private async handle_compact_command(message: Message): Promise<void> {
+    if (!this._pool) {
+      await this.reply(message, "Bot pool not available.");
+      return;
+    }
+
+    const assignment = this._pool.get_assignment(message.channelId);
+    if (!assignment) {
+      await this.reply(message, "No active session in this channel.");
+      return;
+    }
+
+    try {
+      execFileSync("tmux", ["send-keys", "-t", assignment.tmux_session, "/compact", "Enter"], {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+      await message.react("\u2705");
+    } catch {
+      await this.reply(message, "Failed to send compact — session may be unresponsive.");
     }
   }
 
