@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -12,6 +12,7 @@ import type { PersistedPoolBot, PersistedBotAvatarState } from "./persistence.js
 import type { EntityRegistry } from "./registry.js";
 import { resolve_model_id, resolve_effort } from "./models.js";
 import { sq } from "./shell.js";
+import { resolve_binary } from "./env.js";
 import * as sentry from "./sentry.js";
 
 // ── Types ──
@@ -144,6 +145,9 @@ export class BotPool extends EventEmitter {
   /** Maps "{entity_id}:{channel_id}" → session_id. Preserves session context
    * across evictions so a channel can resume its old session when reassigned. */
   private session_history = new Map<string, string>();
+  /** Entity registry reference — set during initialize(), used by start_tmux()
+   * to look up per-entity config (e.g., github_token_ref). */
+  private registry: EntityRegistry | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -177,6 +181,9 @@ export class BotPool extends EventEmitter {
 
   /** Discover pool bot directories, restore persisted state, and initialize. */
   async initialize(registry?: EntityRegistry): Promise<void> {
+    if (registry) {
+      this.registry = registry;
+    }
     const channels_dir = join(lobsterfarm_dir(this.config.paths), "channels");
     const pool_dirs: string[] = [];
 
@@ -1170,14 +1177,42 @@ export class BotPool extends EventEmitter {
 
     const display_name = resolve_agent_display_name(archetype, this.config);
     const git_env = `GIT_AUTHOR_NAME=${sq(`${display_name} (LobsterFarm)`)} GIT_AUTHOR_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)} GIT_COMMITTER_NAME=${sq(`${display_name} (LobsterFarm)`)} GIT_COMMITTER_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)}`;
+
+    // Check if this entity has a per-entity GitHub token reference.
+    // If so, wrap the claude command with `op run` to inject GH_TOKEN at runtime.
+    const env_op_path = `/tmp/lf-env-pool-${String(bot.id)}.op`;
+    const github_token_ref = this.resolve_github_token_ref(entity_id);
+    let op_prefix = "";
+
+    if (github_token_ref) {
+      try {
+        await writeFile(env_op_path, `GH_TOKEN=${github_token_ref}\n`, "utf-8");
+        const op_bin = resolve_binary("op");
+        op_prefix = `${sq(op_bin)} run --env-file ${sq(env_op_path)} -- `;
+        console.log(
+          `[pool] pool-${String(bot.id)}: wrapping with op run for entity "${entity_id}" GH_TOKEN`,
+        );
+      } catch (err) {
+        // Non-fatal: session starts without GH_TOKEN, inheriting global gh auth
+        console.warn(
+          `[pool] pool-${String(bot.id)}: failed to set up op run for GH_TOKEN: ${String(err)}`,
+        );
+        sentry.captureException(err, {
+          tags: { module: "pool", bot_id: String(bot.id), action: "gh_token_setup" },
+        });
+        op_prefix = "";
+      }
+    }
+
     const claude_cmd = claude_args.join(" ");
+    const full_cmd = `${op_prefix}${claude_cmd}`;
 
     return new Promise<void>((resolve, reject) => {
       const proc = spawn("tmux", [
         "new-session", "-d",
         "-s", bot.tmux_session,
         "-x", "200", "-y", "50",
-        `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${claude_cmd}`,
+        `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${full_cmd}`,
       ], {
         cwd: working_dir,
         stdio: "ignore",
@@ -1192,6 +1227,12 @@ export class BotPool extends EventEmitter {
       });
 
       proc.on("close", (code) => {
+        // Clean up the temp .env.op file after tmux has started (op run reads
+        // the file then execs the command, so it's safe to remove).
+        if (github_token_ref) {
+          unlink(env_op_path).catch(() => { /* best effort cleanup */ });
+        }
+
         if (code !== 0) {
           console.error(`[pool] tmux new-session failed for pool-${String(bot.id)} (code ${String(code)})`);
           sentry.captureException(new Error(`tmux new-session failed for pool-${String(bot.id)} with code ${String(code)}`), {
@@ -1222,6 +1263,15 @@ export class BotPool extends EventEmitter {
         }
       });
     });
+  }
+
+  /** Look up the github_token_ref for an entity from the registry.
+   * Returns the 1Password reference string if configured, or null. */
+  private resolve_github_token_ref(entity_id: string): string | null {
+    if (!this.registry) return null;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return null;
+    return entity_config.entity.secrets.github_token_ref ?? null;
   }
 
   /** Set a pool bot's server nickname via the daemon bot's Discord client.
