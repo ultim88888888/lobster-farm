@@ -35,6 +35,8 @@ import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
 import type { TaskQueue } from "./queue.js";
 import type { BotPool, PoolBot } from "./pool.js";
+import { query_context_usage, query_subscription_usage } from "./tmux-query.js";
+import type { ContextUsage, SubscriptionUsage } from "./tmux-query.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -1136,8 +1138,20 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // Full session status — bot is assigned to this channel
-    const lines = this.format_session_status(assignment, routed, features);
+    // Full session status — bot is assigned to this channel.
+    // Query context/usage from the live tmux session (best-effort, non-blocking).
+    // Queries run sequentially — both target the same tmux pane, so parallel injection
+    // would interleave commands and corrupt output.
+    let context_usage: ContextUsage | null = null;
+    let subscription_usage: SubscriptionUsage | null = null;
+    try {
+      context_usage = await query_context_usage(assignment.tmux_session);
+      subscription_usage = await query_subscription_usage(assignment.tmux_session);
+    } catch {
+      // Non-fatal: tmux queries are best-effort
+    }
+
+    const lines = this.format_session_status(assignment, routed, features, context_usage, subscription_usage);
     if (pool_summary) lines.push("", pool_summary);
     await this.reply(message, lines.join("\n"));
   }
@@ -1147,6 +1161,8 @@ export class DiscordBot extends EventEmitter {
     bot: PoolBot,
     routed: RoutedMessage,
     features: FeatureManager | null,
+    context_usage?: ContextUsage | null,
+    subscription_usage?: SubscriptionUsage | null,
   ): string[] {
     const identity = bot.archetype
       ? this.resolve_agent_identity(bot.archetype)
@@ -1173,6 +1189,21 @@ export class DiscordBot extends EventEmitter {
     }
 
     lines.push(`Bot: pool-${String(bot.id)} (lf-${String(bot.id)})`);
+
+    if (bot.model) {
+      lines.push(`Model: ${bot.model}`);
+    }
+    if (bot.effort) {
+      lines.push(`Effort: ${bot.effort}`);
+    }
+
+    // Context and subscription usage from live tmux query
+    if (context_usage) {
+      lines.push(`Context: ${context_usage.summary}`);
+    }
+    if (subscription_usage) {
+      lines.push(`Subscription: ${subscription_usage.summary}`);
+    }
 
     // Active features for this entity
     if (features && bot.entity_id) {

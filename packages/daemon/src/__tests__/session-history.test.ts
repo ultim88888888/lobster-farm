@@ -50,6 +50,8 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     last_active: null,
     assigned_at: null,
     state_dir: `/tmp/test-pool-${String(overrides.id)}`,
+    model: null,
+    effort: null,
     last_avatar_archetype: null,
     last_avatar_set_at: null,
     ...overrides,
