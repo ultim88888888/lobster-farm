@@ -74,6 +74,10 @@ export const EntityConfigSchema = z.object({
     secrets: z.object({
       vault: z.string().default("1password"),
       vault_name: z.string(),
+      // 1Password reference for entity-specific GitHub token.
+      // When set, injected as GH_TOKEN into agent tmux sessions via `op run`.
+      // e.g., "op://entity-my-app/github/credential"
+      github_token_ref: z.string().optional(),
     }),
   }),
 });
