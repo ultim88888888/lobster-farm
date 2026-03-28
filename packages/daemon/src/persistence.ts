@@ -88,20 +88,6 @@ export async function load_pr_reviews(
 
 // ── Pool State ──
 
-/** Serializable mirror of ContextUsage from tmux-query.ts — no import needed. */
-export interface PersistedContextUsage {
-  summary: string;
-  used_tokens: number | null;
-  total_tokens: number | null;
-  percent: number | null;
-}
-
-/** Serializable mirror of SubscriptionUsage from tmux-query.ts — no import needed. */
-export interface PersistedSubscriptionUsage {
-  summary: string;
-  weekly_percent: number | null;
-}
-
 export interface PersistedPoolBot {
   id: number;
   state: "assigned" | "parked";  // free bots are not persisted
@@ -119,12 +105,6 @@ export interface PersistedPoolBot {
   /** The archetype whose avatar is currently set on this bot's Discord profile.
    * Persisted so we don't redundantly set avatars on restart. */
   last_avatar_archetype?: ArchetypeRole | null;
-  /** Cached /context output. Survives restarts so /status has data immediately. */
-  cached_context?: PersistedContextUsage | null;
-  /** Cached /usage output. Survives restarts so /status has data immediately. */
-  cached_subscription?: PersistedSubscriptionUsage | null;
-  /** When the cache was last updated. ISO timestamp. */
-  cache_updated_at?: string | null;
 }
 
 /** Per-bot avatar state, persisted for ALL bots (including free ones).

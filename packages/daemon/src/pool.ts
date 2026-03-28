@@ -13,8 +13,6 @@ import type { EntityRegistry } from "./registry.js";
 import { resolve_model_id, resolve_effort } from "./models.js";
 import { sq } from "./shell.js";
 import * as sentry from "./sentry.js";
-import { query_context_usage, query_subscription_usage } from "./tmux-query.js";
-import type { ContextUsage, SubscriptionUsage } from "./tmux-query.js";
 
 // ── Types ──
 
@@ -41,14 +39,6 @@ export interface PoolBot {
   /** When the avatar was last set via the Discord API. Used for rate limit safety
    * (~2 changes per hour per bot, we enforce a 30-minute cooldown). */
   last_avatar_set_at: Date | null;
-  /** Cached context usage from the last successful /context query.
-   * Updated by the health monitor every 30s when the session is idle. */
-  cached_context: ContextUsage | null;
-  /** Cached subscription usage from the last successful /usage query.
-   * Updated by the health monitor every 30s when the session is idle. */
-  cached_subscription: SubscriptionUsage | null;
-  /** When the cache was last successfully updated. Used for staleness display. */
-  cache_updated_at: Date | null;
 }
 
 export interface PoolAssignment {
@@ -254,9 +244,6 @@ export class BotPool extends EventEmitter {
         effort: null,
         last_avatar_archetype: null,
         last_avatar_set_at: null,
-        cached_context: null,
-        cached_subscription: null,
-        cache_updated_at: null,
       });
     }
 
@@ -333,9 +320,6 @@ export class BotPool extends EventEmitter {
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
         bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
-        bot.cached_context = entry.cached_context ?? null;
-        bot.cached_subscription = entry.cached_subscription ?? null;
-        bot.cache_updated_at = entry.cache_updated_at ? new Date(entry.cache_updated_at) : null;
 
         // Add to resume candidates — the live tmux session has a dead MCP socket.
         // resume_parked_bots() will kill it and spawn fresh with --resume.
@@ -361,9 +345,6 @@ export class BotPool extends EventEmitter {
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
         bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
-        bot.cached_context = entry.cached_context ?? null;
-        bot.cached_subscription = entry.cached_subscription ?? null;
-        bot.cache_updated_at = entry.cache_updated_at ? new Date(entry.cache_updated_at) : null;
 
         // If this bot was actively assigned (not already parked) before shutdown
         // and has a session_id, it's a candidate for proactive resume.
@@ -757,9 +738,6 @@ export class BotPool extends EventEmitter {
       bot.effort = null;
       bot.last_active = null;
       bot.assigned_at = null;
-      bot.cached_context = null;
-      bot.cached_subscription = null;
-      bot.cache_updated_at = null;
 
       // Clear access.json
       await this.write_access_json(bot.state_dir, null);
@@ -1006,37 +984,10 @@ export class BotPool extends EventEmitter {
       bot.effort = null;
       bot.last_active = null;
       bot.assigned_at = null;
-      bot.cached_context = null;
-      bot.cached_subscription = null;
-      bot.cache_updated_at = null;
       changed = true;
 
       this.emit("bot:session_ended", event_data);
       this.emit("bot:released", { bot_id: bot.id });
-    }
-
-    // Update context/usage cache for live assigned bots.
-    // Queries are sequential per bot (same tmux pane). If the session is busy
-    // (returns null), we skip — stale cache is better than no cache.
-    for (const bot of this.bots) {
-      if (bot.state !== "assigned") continue;
-
-      try {
-        const context = await query_context_usage(bot.tmux_session);
-        const subscription = await query_subscription_usage(bot.tmux_session);
-
-        // Only update cache if at least one query succeeded — partial updates
-        // are fine (e.g., /context works but /usage doesn't), but skip entirely
-        // if both fail (session was busy)
-        if (context || subscription) {
-          if (context) bot.cached_context = context;
-          if (subscription) bot.cached_subscription = subscription;
-          bot.cache_updated_at = new Date();
-          changed = true;
-        }
-      } catch {
-        // Non-fatal: tmux queries are best-effort
-      }
     }
 
     if (changed) await this.persist();
@@ -1081,9 +1032,6 @@ export class BotPool extends EventEmitter {
         last_active: b.last_active?.toISOString() ?? null,
         assigned_at: b.assigned_at?.toISOString() ?? null,
         last_avatar_archetype: b.last_avatar_archetype,
-        cached_context: b.cached_context,
-        cached_subscription: b.cached_subscription,
-        cache_updated_at: b.cache_updated_at?.toISOString() ?? null,
       }));
 
     // Convert session_history Map to a plain object for serialization
