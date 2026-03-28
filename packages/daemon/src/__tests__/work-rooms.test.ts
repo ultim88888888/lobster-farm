@@ -10,6 +10,14 @@ import * as actions from "../actions.js";
 
 // ── Helpers ──
 
+// Fake snowflake IDs for testing. These pass the is_discord_snowflake check
+// (17-20 digit numeric strings) so they exercise the same code paths as real IDs.
+const GEN_ID = "10000000000000001";
+const WR_IDS = ["10000000000000010", "10000000000000020", "10000000000000030"] as const;
+const DYN_WR = "10000000000000040"; // Returned by mock create_channel for dynamic rooms
+const AL_ID  = "10000000000000099";
+const CAT_ID = "10000000000000100";
+
 function make_config(): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
@@ -24,7 +32,7 @@ function make_entity_config(channels: ChannelMapping[] = []): EntityConfig {
       name: "Alpha Project",
       repos: [{ name: "alpha", url: "git@github.com:test/alpha.git", path: "/tmp/test-repo" }],
       channels: {
-        category_id: "cat-123",
+        category_id: CAT_ID,
         list: channels,
       },
       memory: { path: "/tmp/.memory" },
@@ -63,19 +71,19 @@ function make_feature(overrides: Partial<FeatureState> = {}): FeatureState {
 }
 
 /** Create channel list with N static work rooms (default 0 — dynamic-only).
- * Also includes general and alerts. */
+ * Also includes general and alerts. Uses valid snowflake IDs. */
 function make_static_work_rooms(count = 0): ChannelMapping[] {
   const channels: ChannelMapping[] = [
-    { type: "general", id: "gen-1" },
+    { type: "general", id: GEN_ID },
   ];
   for (let i = 1; i <= count; i++) {
     channels.push({
       type: "work_room",
-      id: `wr-${String(i)}`,
+      id: WR_IDS[i - 1]!,
       purpose: `Work room ${String(i)}`,
     });
   }
-  channels.push({ type: "alerts", id: "al-1" });
+  channels.push({ type: "alerts", id: AL_ID });
   return channels;
 }
 
@@ -87,7 +95,7 @@ function make_mock_discord() {
     send_as_agent: vi.fn().mockResolvedValue(undefined),
     send_to_entity: vi.fn().mockResolvedValue(undefined),
     set_channel_topic: vi.fn().mockResolvedValue(undefined),
-    create_channel: vi.fn().mockResolvedValue("dynamic-wr-4"),
+    create_channel: vi.fn().mockResolvedValue(DYN_WR),
     delete_channel: vi.fn().mockResolvedValue(true),
     build_channel_map: vi.fn(),
     is_connected: vi.fn().mockReturnValue(true),
@@ -142,9 +150,9 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-1");
+      expect(room_id).toBe(WR_IDS[0]);
       // Verify assigned_feature was set on the channel entry
-      const wr1 = entity.entity.channels.list.find(c => c.id === "wr-1");
+      const wr1 = entity.entity.channels.list.find(c => c.id === WR_IDS[0]);
       expect(wr1?.assigned_feature).toBe("alpha-42");
     });
 
@@ -152,7 +160,7 @@ describe("Work Room Assignment", () => {
       const feature = make_feature({ id: "alpha-42" });
       const existing_feature = make_feature({
         id: "alpha-10",
-        discordWorkRoom: "wr-1",
+        discordWorkRoom: WR_IDS[0],
         phase: "build",
       });
       const entity = make_entity_config(make_static_work_rooms(3));
@@ -161,14 +169,14 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-2");
+      expect(room_id).toBe(WR_IDS[1]);
     });
 
     it("skips rooms occupied by multiple active features", async () => {
       const feature = make_feature({ id: "alpha-42" });
       const features = [
-        make_feature({ id: "alpha-10", discordWorkRoom: "wr-1", phase: "build" }),
-        make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "review" }),
+        make_feature({ id: "alpha-10", discordWorkRoom: WR_IDS[0], phase: "build" }),
+        make_feature({ id: "alpha-11", discordWorkRoom: WR_IDS[1], phase: "review" }),
       ];
       const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
@@ -176,15 +184,15 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-3");
+      expect(room_id).toBe(WR_IDS[2]);
     });
 
     it("creates a dynamic room when all static rooms are occupied", async () => {
       const feature = make_feature({ id: "alpha-42" });
       const features = [
-        make_feature({ id: "alpha-10", discordWorkRoom: "wr-1", phase: "build" }),
-        make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "review" }),
-        make_feature({ id: "alpha-12", discordWorkRoom: "wr-3", phase: "build" }),
+        make_feature({ id: "alpha-10", discordWorkRoom: WR_IDS[0], phase: "build" }),
+        make_feature({ id: "alpha-11", discordWorkRoom: WR_IDS[1], phase: "review" }),
+        make_feature({ id: "alpha-12", discordWorkRoom: WR_IDS[2], phase: "build" }),
       ];
       const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
@@ -192,9 +200,9 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("dynamic-wr-4");
+      expect(room_id).toBe(DYN_WR);
       expect(discord.create_channel).toHaveBeenCalledWith(
-        "cat-123",
+        CAT_ID,
         "work-room-4",
         "Overflow for alpha-42",
       );
@@ -203,9 +211,9 @@ describe("Work Room Assignment", () => {
     it("tags dynamic room with dynamic: true in entity config", async () => {
       const feature = make_feature({ id: "alpha-42" });
       const features = [
-        make_feature({ id: "alpha-10", discordWorkRoom: "wr-1", phase: "build" }),
-        make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "build" }),
-        make_feature({ id: "alpha-12", discordWorkRoom: "wr-3", phase: "build" }),
+        make_feature({ id: "alpha-10", discordWorkRoom: WR_IDS[0], phase: "build" }),
+        make_feature({ id: "alpha-11", discordWorkRoom: WR_IDS[1], phase: "build" }),
+        make_feature({ id: "alpha-12", discordWorkRoom: WR_IDS[2], phase: "build" }),
       ];
       const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
@@ -213,7 +221,7 @@ describe("Work Room Assignment", () => {
 
       await actions.assign_work_room(feature, entity);
 
-      const dynamic_entry = entity.entity.channels.list.find(c => c.id === "dynamic-wr-4");
+      const dynamic_entry = entity.entity.channels.list.find(c => c.id === DYN_WR);
       expect(dynamic_entry).toBeDefined();
       expect(dynamic_entry?.dynamic).toBe(true);
       expect(dynamic_entry?.type).toBe("work_room");
@@ -225,7 +233,7 @@ describe("Work Room Assignment", () => {
       // The done feature should not count as occupying wr-1
       const done_feature = make_feature({
         id: "alpha-10",
-        discordWorkRoom: "wr-1",
+        discordWorkRoom: WR_IDS[0],
         phase: "done",
       });
       const entity = make_entity_config(make_static_work_rooms(3));
@@ -234,7 +242,7 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-1");
+      expect(room_id).toBe(WR_IDS[0]);
     });
 
     it("sets channel topic with title on assignment", async () => {
@@ -246,7 +254,7 @@ describe("Work Room Assignment", () => {
       await actions.assign_work_room(feature, entity);
 
       expect(discord.set_channel_topic).toHaveBeenCalledWith(
-        "wr-1",
+        WR_IDS[0],
         "🔨 #42: Test Feature",
       );
     });
@@ -262,7 +270,7 @@ describe("Work Room Assignment", () => {
 
       const expected_title = "A".repeat(57) + "...";
       expect(discord.set_channel_topic).toHaveBeenCalledWith(
-        "wr-1",
+        WR_IDS[0],
         `🔨 #42: ${expected_title}`,
       );
     });
@@ -281,9 +289,9 @@ describe("Work Room Assignment", () => {
     it("returns null when no discord bot is available for dynamic room creation", async () => {
       const feature = make_feature({ id: "alpha-42" });
       const features = [
-        make_feature({ id: "alpha-10", discordWorkRoom: "wr-1", phase: "build" }),
-        make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "build" }),
-        make_feature({ id: "alpha-12", discordWorkRoom: "wr-3", phase: "build" }),
+        make_feature({ id: "alpha-10", discordWorkRoom: WR_IDS[0], phase: "build" }),
+        make_feature({ id: "alpha-11", discordWorkRoom: WR_IDS[1], phase: "build" }),
+        make_feature({ id: "alpha-12", discordWorkRoom: WR_IDS[2], phase: "build" }),
       ];
       const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
@@ -302,18 +310,18 @@ describe("Work Room Assignment", () => {
       actions.set_feature_manager(make_mock_feature_manager([]));
       // Pool has a bot assigned to wr-1 (e.g., manual planner session)
       // @ts-expect-error — mock pool
-      actions.set_pool(make_mock_pool({ "wr-1": { id: 0, archetype: "planner" } }));
+      actions.set_pool(make_mock_pool({ [WR_IDS[0]]: { id: 0, archetype: "planner" } }));
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-2");
+      expect(room_id).toBe(WR_IDS[1]);
     });
 
     it("skips rooms occupied by both features and pool assignments", async () => {
       const feature = make_feature({ id: "alpha-42" });
       const existing_feature = make_feature({
         id: "alpha-10",
-        discordWorkRoom: "wr-1",
+        discordWorkRoom: WR_IDS[0],
         phase: "build",
       });
       const entity = make_entity_config(make_static_work_rooms(3));
@@ -321,11 +329,11 @@ describe("Work Room Assignment", () => {
       actions.set_feature_manager(make_mock_feature_manager([existing_feature]));
       // Pool has a bot in wr-2 (manual session), feature occupies wr-1
       // @ts-expect-error — mock pool
-      actions.set_pool(make_mock_pool({ "wr-2": { id: 1, archetype: "planner" } }));
+      actions.set_pool(make_mock_pool({ [WR_IDS[1]]: { id: 1, archetype: "planner" } }));
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-3");
+      expect(room_id).toBe(WR_IDS[2]);
     });
 
     it("creates dynamic room when all static rooms are pool-assigned", async () => {
@@ -336,16 +344,16 @@ describe("Work Room Assignment", () => {
       // All three rooms have pool bots
       // @ts-expect-error — mock pool
       actions.set_pool(make_mock_pool({
-        "wr-1": { id: 0, archetype: "planner" },
-        "wr-2": { id: 1, archetype: "builder" },
-        "wr-3": { id: 2, archetype: "planner" },
+        [WR_IDS[0]]: { id: 0, archetype: "planner" },
+        [WR_IDS[1]]: { id: 1, archetype: "builder" },
+        [WR_IDS[2]]: { id: 2, archetype: "planner" },
       }));
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("dynamic-wr-4");
+      expect(room_id).toBe(DYN_WR);
       expect(discord.create_channel).toHaveBeenCalledWith(
-        "cat-123",
+        CAT_ID,
         "work-room-4",
         "Overflow for alpha-42",
       );
@@ -357,16 +365,16 @@ describe("Work Room Assignment", () => {
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
       // Pool has a bot in the general channel — should not affect work room assignment
-      const pool = make_mock_pool({ "gen-1": { id: 0, archetype: "planner" } });
+      const pool = make_mock_pool({ [GEN_ID]: { id: 0, archetype: "planner" } });
       // @ts-expect-error — mock pool
       actions.set_pool(pool);
 
       const room_id = await actions.assign_work_room(feature, entity);
 
       // Should still get wr-1 (general channel pool assignment is irrelevant)
-      expect(room_id).toBe("wr-1");
+      expect(room_id).toBe(WR_IDS[0]);
       // get_assignment should only have been called for work_room channels
-      expect(pool.get_assignment).not.toHaveBeenCalledWith("gen-1");
+      expect(pool.get_assignment).not.toHaveBeenCalledWith(GEN_ID);
     });
 
     it("does not block rooms when pool is null", async () => {
@@ -378,7 +386,7 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("wr-1");
+      expect(room_id).toBe(WR_IDS[0]);
     });
   });
 
@@ -391,9 +399,9 @@ describe("Work Room Assignment", () => {
 
       const room_id = await actions.assign_work_room(feature, entity);
 
-      expect(room_id).toBe("dynamic-wr-4");
+      expect(room_id).toBe(DYN_WR);
       expect(discord.create_channel).toHaveBeenCalledWith(
-        "cat-123",
+        CAT_ID,
         "work-room-1",
         "Overflow for alpha-42",
       );
@@ -407,7 +415,7 @@ describe("Work Room Assignment", () => {
 
       await actions.assign_work_room(feature, entity);
 
-      const dynamic_entry = entity.entity.channels.list.find(c => c.id === "dynamic-wr-4");
+      const dynamic_entry = entity.entity.channels.list.find(c => c.id === DYN_WR);
       expect(dynamic_entry).toBeDefined();
       expect(dynamic_entry?.dynamic).toBe(true);
       expect(dynamic_entry?.type).toBe("work_room");
@@ -428,46 +436,46 @@ describe("Work Room Assignment", () => {
 
   describe("release_work_room", () => {
     it("resets static room topic to Available", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const channels = make_static_work_rooms(3);
       channels[1]!.assigned_feature = "alpha-42";
       const entity = make_entity_config(channels);
 
       await actions.release_work_room(feature, entity);
 
-      expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
+      expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[0], "🟢 Available");
     });
 
     it("clears assigned_feature on static room", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const channels = make_static_work_rooms(3);
       channels[1]!.assigned_feature = "alpha-42";
       const entity = make_entity_config(channels);
 
       await actions.release_work_room(feature, entity);
 
-      const wr1 = entity.entity.channels.list.find(c => c.id === "wr-1");
+      const wr1 = entity.entity.channels.list.find(c => c.id === WR_IDS[0]);
       expect(wr1?.assigned_feature).toBeNull();
     });
 
     it("sends farewell message in static room", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
 
       expect(discord.send).toHaveBeenCalledWith(
-        "wr-1",
+        WR_IDS[0],
         "Feature alpha-42 complete. This work room is now available.",
       );
     });
 
     it("deletes dynamic room", async () => {
-      const feature = make_feature({ discordWorkRoom: "dynamic-wr-4" });
+      const feature = make_feature({ discordWorkRoom: DYN_WR });
       const channels = make_static_work_rooms(3);
       channels.push({
         type: "work_room",
-        id: "dynamic-wr-4",
+        id: DYN_WR,
         purpose: "Dynamic workspace",
         assigned_feature: "alpha-42",
         dynamic: true,
@@ -476,15 +484,15 @@ describe("Work Room Assignment", () => {
 
       await actions.release_work_room(feature, entity);
 
-      expect(discord.delete_channel).toHaveBeenCalledWith("dynamic-wr-4");
+      expect(discord.delete_channel).toHaveBeenCalledWith(DYN_WR);
     });
 
     it("removes dynamic room from entity config", async () => {
-      const feature = make_feature({ discordWorkRoom: "dynamic-wr-4" });
+      const feature = make_feature({ discordWorkRoom: DYN_WR });
       const channels = make_static_work_rooms(3);
       channels.push({
         type: "work_room",
-        id: "dynamic-wr-4",
+        id: DYN_WR,
         purpose: "Dynamic workspace",
         assigned_feature: "alpha-42",
         dynamic: true,
@@ -493,16 +501,16 @@ describe("Work Room Assignment", () => {
 
       await actions.release_work_room(feature, entity);
 
-      const remaining = entity.entity.channels.list.find(c => c.id === "dynamic-wr-4");
+      const remaining = entity.entity.channels.list.find(c => c.id === DYN_WR);
       expect(remaining).toBeUndefined();
     });
 
     it("sends farewell message before deleting dynamic room", async () => {
-      const feature = make_feature({ discordWorkRoom: "dynamic-wr-4" });
+      const feature = make_feature({ discordWorkRoom: DYN_WR });
       const channels = make_static_work_rooms(3);
       channels.push({
         type: "work_room",
-        id: "dynamic-wr-4",
+        id: DYN_WR,
         dynamic: true,
         assigned_feature: "alpha-42",
       });
@@ -517,7 +525,7 @@ describe("Work Room Assignment", () => {
     });
 
     it("rebuilds channel map after release", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
@@ -537,13 +545,13 @@ describe("Work Room Assignment", () => {
     });
 
     it("does not keep static room in list after release", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-2" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[1] });
       const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
 
       // Static room should still be in the list
-      const wr2 = entity.entity.channels.list.find(c => c.id === "wr-2");
+      const wr2 = entity.entity.channels.list.find(c => c.id === WR_IDS[1]);
       expect(wr2).toBeDefined();
       expect(wr2?.type).toBe("work_room");
     });
@@ -562,13 +570,13 @@ describe("Notification Routing", () => {
   describe("notify_feature", () => {
     it("routes to work room when assigned", async () => {
       const feature = make_feature({
-        discordWorkRoom: "wr-1",
+        discordWorkRoom: WR_IDS[0],
         activeArchetype: "builder",
       });
 
       await actions.notify_feature(feature, "Build started");
 
-      expect(discord.send_as_agent).toHaveBeenCalledWith("wr-1", "Build started", "builder");
+      expect(discord.send_as_agent).toHaveBeenCalledWith(WR_IDS[0], "Build started", "builder");
     });
 
     it("does not send to Discord when no work room assigned (no work_log fallback)", async () => {
@@ -583,13 +591,13 @@ describe("Notification Routing", () => {
     });
 
     it("also sends to alerts when also_alerts is true", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Awaiting approval", entity, { also_alerts: true });
 
       // Primary: work room
-      expect(discord.send_as_agent).toHaveBeenCalledWith("wr-1", "Awaiting approval", "builder");
+      expect(discord.send_as_agent).toHaveBeenCalledWith(WR_IDS[0], "Awaiting approval", "builder");
       // Secondary: alerts
       expect(discord.send_to_entity).toHaveBeenCalledWith(
         "alpha", "alerts", "Awaiting approval", "builder",
@@ -597,13 +605,13 @@ describe("Notification Routing", () => {
     });
 
     it("also sends to general when also_general is true", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Shipped!", entity, { also_general: true });
 
       // Primary: work room
-      expect(discord.send_as_agent).toHaveBeenCalledWith("wr-1", "Shipped!", "builder");
+      expect(discord.send_as_agent).toHaveBeenCalledWith(WR_IDS[0], "Shipped!", "builder");
       // Secondary: general
       expect(discord.send_to_entity).toHaveBeenCalledWith(
         "alpha", "general", "Shipped!", "builder",
@@ -611,7 +619,7 @@ describe("Notification Routing", () => {
     });
 
     it("sends to both alerts and general when both options are true", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Urgent!", entity, {
@@ -625,13 +633,13 @@ describe("Notification Routing", () => {
 
     it("uses 'system' archetype when feature has no active archetype", async () => {
       const feature = make_feature({
-        discordWorkRoom: "wr-1",
+        discordWorkRoom: WR_IDS[0],
         activeArchetype: null,
       });
 
       await actions.notify_feature(feature, "Phase change");
 
-      expect(discord.send_as_agent).toHaveBeenCalledWith("wr-1", "Phase change", "system");
+      expect(discord.send_as_agent).toHaveBeenCalledWith(WR_IDS[0], "Phase change", "system");
     });
 
     it("still sends to alerts when no work room but also_alerts is true", async () => {
@@ -664,11 +672,11 @@ describe("Notification Routing", () => {
 
     it("routes to specific channel ID, not first work_room", async () => {
       // Verify it routes to wr-2, not wr-1 (which send_to_entity would pick)
-      const feature = make_feature({ discordWorkRoom: "wr-2" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[1] });
 
       await actions.notify_feature(feature, "Test message");
 
-      expect(discord.send_as_agent).toHaveBeenCalledWith("wr-2", "Test message", "builder");
+      expect(discord.send_as_agent).toHaveBeenCalledWith(WR_IDS[1], "Test message", "builder");
       // Should NOT have called send_to_entity
       expect(discord.send_to_entity).not.toHaveBeenCalled();
     });
@@ -686,12 +694,12 @@ describe("Channel Topic Updates", () => {
 
   describe("update_work_room_topic", () => {
     it("updates topic when work room is assigned", async () => {
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
 
       await actions.update_work_room_topic(feature, "🟣 alpha-42 — #42 — In Review");
 
       expect(discord.set_channel_topic).toHaveBeenCalledWith(
-        "wr-1",
+        WR_IDS[0],
         "🟣 alpha-42 — #42 — In Review",
       );
     });
@@ -706,7 +714,7 @@ describe("Channel Topic Updates", () => {
 
     it("is a no-op when no discord bot is available", async () => {
       actions.set_discord_bot(null);
-      const feature = make_feature({ discordWorkRoom: "wr-1" });
+      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
 
       await actions.update_work_room_topic(feature, "some topic");
 
@@ -738,16 +746,16 @@ describe("Startup Topic Reset", () => {
     await actions.reset_idle_work_room_topics(registry);
 
     // All 3 work rooms should be reset
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-2", "🟢 Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-3", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[0], "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[1], "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[2], "🟢 Available");
     expect(discord.set_channel_topic).toHaveBeenCalledTimes(3);
   });
 
   it("preserves topic on work rooms with active features", async () => {
     const active_feature = make_feature({
       id: "alpha-10",
-      discordWorkRoom: "wr-1",
+      discordWorkRoom: WR_IDS[0],
       phase: "build",
     });
     // @ts-expect-error — mock feature manager
@@ -762,17 +770,17 @@ describe("Startup Topic Reset", () => {
     await actions.reset_idle_work_room_topics(registry);
 
     // wr-1 has an active feature — should NOT be reset
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wr-1", "🟢 Available");
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(WR_IDS[0], "🟢 Available");
     // wr-2 and wr-3 should be reset
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-2", "🟢 Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-3", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[1], "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[2], "🟢 Available");
     expect(discord.set_channel_topic).toHaveBeenCalledTimes(2);
   });
 
   it("does not reset rooms for features in review phase", async () => {
     const review_feature = make_feature({
       id: "alpha-10",
-      discordWorkRoom: "wr-2",
+      discordWorkRoom: WR_IDS[1],
       phase: "review",
     });
     // @ts-expect-error — mock feature manager
@@ -787,16 +795,16 @@ describe("Startup Topic Reset", () => {
     await actions.reset_idle_work_room_topics(registry);
 
     // wr-2 has a review feature — should NOT be reset
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wr-2", "🟢 Available");
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(WR_IDS[1], "🟢 Available");
     // wr-1 and wr-3 should be reset
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-3", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[0], "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[2], "🟢 Available");
   });
 
   it("resets rooms for done features (they are no longer active)", async () => {
     const done_feature = make_feature({
       id: "alpha-10",
-      discordWorkRoom: "wr-1",
+      discordWorkRoom: WR_IDS[0],
       phase: "done",
     });
     // @ts-expect-error — mock feature manager
@@ -811,7 +819,7 @@ describe("Startup Topic Reset", () => {
     await actions.reset_idle_work_room_topics(registry);
 
     // wr-1 has a done feature — should be reset
-    expect(discord.set_channel_topic).toHaveBeenCalledWith("wr-1", "🟢 Available");
+    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[0], "🟢 Available");
     expect(discord.set_channel_topic).toHaveBeenCalledTimes(3);
   });
 
@@ -858,8 +866,8 @@ describe("Startup Topic Reset", () => {
     await actions.reset_idle_work_room_topics(registry);
 
     // Should not be called for gen-1 or al-1
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("gen-1", expect.anything());
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("al-1", expect.anything());
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(GEN_ID, expect.anything());
+    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(AL_ID, expect.anything());
   });
 
   it("is a no-op with 0 static work rooms", async () => {
@@ -882,7 +890,7 @@ describe("Startup Topic Reset", () => {
 describe("Schema — ChannelMapping", () => {
   it("accepts dynamic: true", () => {
     const entity = make_entity_config([
-      { type: "work_room", id: "wr-1", dynamic: true },
+      { type: "work_room", id: WR_IDS[0], dynamic: true },
     ]);
     const wr = entity.entity.channels.list[0];
     expect(wr?.dynamic).toBe(true);
@@ -890,7 +898,7 @@ describe("Schema — ChannelMapping", () => {
 
   it("accepts dynamic: false", () => {
     const entity = make_entity_config([
-      { type: "work_room", id: "wr-1", dynamic: false },
+      { type: "work_room", id: WR_IDS[0], dynamic: false },
     ]);
     const wr = entity.entity.channels.list[0];
     expect(wr?.dynamic).toBe(false);
@@ -898,7 +906,7 @@ describe("Schema — ChannelMapping", () => {
 
   it("defaults to undefined when dynamic is omitted", () => {
     const entity = make_entity_config([
-      { type: "work_room", id: "wr-1" },
+      { type: "work_room", id: WR_IDS[0] },
     ]);
     const wr = entity.entity.channels.list[0];
     expect(wr?.dynamic).toBeUndefined();

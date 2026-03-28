@@ -7,6 +7,7 @@ import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import type { CommanderProcess } from "./commander-process.js";
+import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
 import type { ArchetypeRole } from "@lobster-farm/shared";
@@ -611,6 +612,11 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
 
   if (!params.channel_id || !params.entity_id) {
     json_response(res, 400, { error: "Missing required fields: channel_id, entity_id" });
+    return;
+  }
+
+  if (!is_discord_snowflake(params.channel_id)) {
+    json_response(res, 400, { error: `Invalid channel ID "${params.channel_id}" — not a Discord snowflake` });
     return;
   }
 

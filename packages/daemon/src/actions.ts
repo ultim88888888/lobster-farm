@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { FeatureState, EntityConfig, ChannelType, ArchetypeRole, ChannelMapping } from "@lobster-farm/shared";
 import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/shared";
+import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { FeatureManager } from "./features.js";
 import type { BotPool } from "./pool.js";
@@ -232,7 +233,7 @@ export async function notify_feature(
 
   // Primary: send to work room (by channel ID). No work_log fallback —
   // interactive builders post their own progress in work rooms.
-  if (feature.discordWorkRoom && _discord) {
+  if (feature.discordWorkRoom && _discord && is_discord_snowflake(feature.discordWorkRoom)) {
     await _discord.send_as_agent(feature.discordWorkRoom, message, archetype);
     console.log(`[actions:notify] [work_room:${feature.discordWorkRoom}] ${message}`);
   } else {
@@ -276,7 +277,11 @@ export async function assign_work_room(
   }
 
   const channels = entity_config.entity.channels;
-  const work_rooms = channels.list.filter((c: ChannelMapping) => c.type === "work_room");
+  // Only consider work rooms with valid Discord snowflake IDs — placeholder IDs
+  // (e.g. "wr-1" from alpha entity) would cause API errors downstream.
+  const work_rooms = channels.list.filter(
+    (c: ChannelMapping) => c.type === "work_room" && is_discord_snowflake(c.id),
+  );
 
   // Find rooms not assigned to an active (non-done) feature
   const active = _features?.get_features_by_entity(feature.entity)
@@ -364,7 +369,7 @@ export async function release_work_room(
 
   if (entry?.dynamic) {
     // Dynamic room — farewell message, then delete
-    if (_discord) {
+    if (_discord && is_discord_snowflake(channel_id)) {
       await _discord.send(
         channel_id,
         `Feature ${feature.id} complete. Cleaning up this work room.`,
@@ -376,7 +381,7 @@ export async function release_work_room(
   } else if (entry) {
     // Static room — reset topic and clear assignment
     entry.assigned_feature = null;
-    if (_discord) {
+    if (_discord && is_discord_snowflake(channel_id)) {
       await _discord.set_channel_topic(channel_id, "🟢 Available");
       await _discord.send(
         channel_id,
@@ -444,6 +449,7 @@ export async function update_work_room_topic(
   topic: string,
 ): Promise<void> {
   if (!feature.discordWorkRoom || !_discord) return;
+  if (!is_discord_snowflake(feature.discordWorkRoom)) return;
   await _discord.set_channel_topic(feature.discordWorkRoom, topic);
 }
 
@@ -494,11 +500,15 @@ export async function reset_idle_work_room_topics(
     }
   }
 
-  // Reset unoccupied work rooms
+  // Reset unoccupied work rooms (skip placeholder IDs like "wr-1" from alpha entity)
   let reset_count = 0;
   for (const entity_config of registry.get_active()) {
     for (const channel of entity_config.entity.channels.list) {
-      if (channel.type === "work_room" && !active_rooms.has(channel.id)) {
+      if (
+        channel.type === "work_room" &&
+        !active_rooms.has(channel.id) &&
+        is_discord_snowflake(channel.id)
+      ) {
         await _discord.set_channel_topic(channel.id, "🟢 Available");
         reset_count++;
       }

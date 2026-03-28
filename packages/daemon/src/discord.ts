@@ -1850,8 +1850,8 @@ export class DiscordBot extends EventEmitter {
     await this.persist_entity_config(entity_config);
     this.build_channel_map();
 
-    // Send farewell to general
-    if (general_channel) {
+    // Send farewell to general (skip if general has a placeholder ID)
+    if (general_channel && is_discord_snowflake(general_channel.id)) {
       await this.send(
         general_channel.id,
         `Session archived as \`${room_name}\`. Use \`!lf resume ${room_name}\` to restore.`,
