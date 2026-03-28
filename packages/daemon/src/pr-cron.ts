@@ -22,6 +22,7 @@ interface OpenPR {
   headRefName: string;
   updatedAt: string;
   url: string;
+  body: string;
   author: { login: string };
 }
 
@@ -148,7 +149,7 @@ export class PRReviewCron {
       const { stdout } = await exec("gh", [
         "pr", "list",
         "--state", "open",
-        "--json", "number,title,headRefName,updatedAt,url,author",
+        "--json", "number,title,headRefName,updatedAt,url,body,author",
       ], { cwd: repo_path, timeout: 30_000 });
 
       prs = JSON.parse(stdout) as OpenPR[];
@@ -299,7 +300,14 @@ export class PRReviewCron {
       last_checked: new Date(),
     });
 
-    const prompt = [
+    // Fetch linked issue context if PR body references one (Closes #N, Fixes #N)
+    let issue_context = "";
+    const linked_issue = this.extract_linked_issue(pr.body);
+    if (linked_issue) {
+      issue_context = await this.fetch_issue_context(repo_path, linked_issue);
+    }
+
+    const prompt_lines = [
       `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}.`,
       `Repository: ${repo_path}`,
       ``,
@@ -317,7 +325,13 @@ export class PRReviewCron {
       `- If you approved, merge the PR:`,
       `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
       `- If you requested changes, do NOT merge.`,
-    ].join("\n");
+    ];
+
+    if (issue_context) {
+      prompt_lines.push(``, `## Linked Issue Context`, ``, issue_context);
+    }
+
+    const prompt = prompt_lines.join("\n");
 
     console.log(`[pr-cron] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
 
@@ -539,6 +553,28 @@ export class PRReviewCron {
       return stdout.trim() === "MERGED";
     } catch {
       return false;
+    }
+  }
+
+  /** Extract "Closes #N" or "Fixes #N" references from PR body. */
+  private extract_linked_issue(body: string | null): number | null {
+    if (!body) return null;
+    const match = body.match(/(?:closes|fixes|resolves)\s+#(\d+)/i);
+    return match ? parseInt(match[1]!, 10) : null;
+  }
+
+  /** Fetch issue title + body via gh CLI for reviewer context. */
+  private async fetch_issue_context(repo_path: string, issue_number: number): Promise<string> {
+    try {
+      const { stdout } = await exec("gh", [
+        "issue", "view", String(issue_number),
+        "--json", "title,body",
+        "--jq", `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
+      ], { cwd: repo_path, timeout: 15_000 });
+      return stdout.trim();
+    } catch (err) {
+      console.log(`[pr-cron] Could not fetch issue #${String(issue_number)}: ${String(err)}`);
+      return "";
     }
   }
 }
