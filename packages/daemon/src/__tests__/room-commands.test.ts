@@ -75,7 +75,7 @@ describe("Room archive I/O", () => {
       session_id: "sess-abc",
       entity_id: "alpha",
       archetype: "planner",
-      created_at: "2026-03-28T02:00:00Z",
+      archived_at: "2026-03-28T02:00:00Z",
       closed_at: "2026-03-28T03:00:00Z",
       ...overrides,
     };

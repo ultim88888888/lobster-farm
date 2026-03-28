@@ -979,7 +979,7 @@ export class DiscordBot extends EventEmitter {
         break;
 
       case "close":
-        await this.handle_close_command(routed, message);
+        await this.handle_close_command(args, routed, message);
         break;
 
       case "resume":
@@ -1641,11 +1641,14 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * !lf close
+   * !lf close [--force]
    * Archives the current work room's session and deletes the channel.
    * Only works in work_room channels.
+   * If there's an active feature lifecycle in this room, warns the user
+   * and requires --force to proceed.
    */
   private async handle_close_command(
+    args: string[],
     routed: RoutedMessage,
     message: Message,
   ): Promise<void> {
@@ -1670,18 +1673,34 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
+    // Guard: warn if there's an active feature lifecycle in this room
+    if (this._features) {
+      const active_features = this._features.get_features_by_entity(routed.entity_id).filter(
+        f => f.discordWorkRoom === channel_id && !["done", "cancelled"].includes(f.phase),
+      );
+      if (active_features.length > 0 && !args.includes("--force")) {
+        const title = active_features[0]!.title ?? active_features[0]!.id;
+        await this.reply(
+          message,
+          `This room has an active feature (**${title}**). Close anyway? Use \`!lf close --force\`.`,
+        );
+        return;
+      }
+    }
+
     // Determine the room name from the purpose field or the channel name
     const room_name = channel_entry.purpose ?? `room-${channel_id}`;
 
     // Archive the session
+    const now = new Date().toISOString();
     const archive_entry: RoomArchive = {
       name: room_name,
       channel_id,
       session_id: null,
       entity_id: routed.entity_id,
       archetype: "planner",
-      created_at: new Date().toISOString(),
-      closed_at: new Date().toISOString(),
+      archived_at: now,
+      closed_at: now,
     };
 
     // Get session info from pool bot if assigned
@@ -1701,9 +1720,8 @@ export class DiscordBot extends EventEmitter {
       await this._pool.release(channel_id);
     }
 
-    // Send farewell before deleting (can't send after deletion)
-    // The channel is about to be deleted, so we notify the source-adjacent channel instead.
     // Find the entity's general channel for the farewell message.
+    // The work room channel is deleted below, so the farewell goes to #general instead.
     const general_channel = entity_config.entity.channels.list.find(
       (c: ChannelMapping) => c.type === "general",
     );
@@ -1828,7 +1846,7 @@ export class DiscordBot extends EventEmitter {
     const assignment = await this._pool.assign(
       channel_id,
       routed.entity_id,
-      archive.archetype as ArchetypeRole ?? "planner",
+      (archive.archetype || "planner") as ArchetypeRole,
       resume_session_id,
       "work_room",
     );
@@ -1845,7 +1863,7 @@ export class DiscordBot extends EventEmitter {
 
   /** Persist an entity's config back to YAML. */
   private async persist_entity_config(entity_config: { entity: { id: string } } & Record<string, unknown>): Promise<void> {
-    const config_path = entity_config_path(undefined, entity_config.entity.id);
+    const config_path = entity_config_path(this.config.paths, entity_config.entity.id);
     await write_yaml(config_path, entity_config);
     console.log(`[discord] Persisted entity config for ${entity_config.entity.id}`);
   }
@@ -1891,7 +1909,8 @@ export interface RoomArchive {
   session_id: string | null;
   entity_id: string;
   archetype: string;
-  created_at: string;
+  /** When the room was archived (same as closed_at for backward compat with older archives). */
+  archived_at: string;
   closed_at: string;
 }
 
