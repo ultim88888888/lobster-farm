@@ -30,9 +30,35 @@ interface ActiveReview {
   last_checked: Date;
 }
 
+// ── GitHub API response shapes (subset of what gh pr view --json returns) ──
+
+interface GHReview {
+  submittedAt: string;
+  author: { login: string };
+  state: string;
+}
+
+interface GHComment {
+  createdAt: string;
+  author: { login: string };
+}
+
+interface GHCommit {
+  committedDate: string;
+}
+
+interface PRFeedbackData {
+  reviews: GHReview[];
+  comments: GHComment[];
+  commits: GHCommit[];
+}
+
 // ── PR Cron ──
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Buffer in ms to avoid re-reviewing when commit and review timestamps are very close. */
+const TIMESTAMP_BUFFER_MS = 60_000; // 60 seconds
 
 export class PRReviewCron {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -164,10 +190,9 @@ export class PRReviewCron {
 
       console.log(`[pr-cron] Found open PR #${String(pr.number)} in ${entity_id}: "${pr.title}"`);
 
-      // Check if PR already has a review
-      const has_review = await this.pr_has_review(repo_path, pr.number);
-      if (has_review) {
-        console.log(`[pr-cron] PR #${String(pr.number)} already reviewed, skipping`);
+      // Check if PR needs (re-)review by comparing commit vs feedback timestamps
+      const skip = await this.should_skip_pr(repo_path, pr.number);
+      if (skip) {
         continue;
       }
 
@@ -176,18 +201,80 @@ export class PRReviewCron {
     }
   }
 
-  /** Check if a PR already has a review (formal reviews OR comments). */
-  private async pr_has_review(repo_path: string, pr_number: number): Promise<boolean> {
+  /**
+   * Decide whether to skip a PR based on commit vs review/comment timestamps.
+   *
+   * - No feedback at all: don't skip (never reviewed)
+   * - Latest commit is newer than latest feedback + buffer: don't skip (needs re-review)
+   * - Latest feedback is at or after latest commit: skip (already reviewed)
+   */
+  private async should_skip_pr(repo_path: string, pr_number: number): Promise<boolean> {
+    const data = await this.fetch_pr_feedback(repo_path, pr_number);
+    if (!data) {
+      // Can't fetch PR data — don't skip, let the reviewer attempt proceed
+      return false;
+    }
+
+    // Extract feedback timestamps from reviews and comments.
+    // Note: we don't filter by author here. In this codebase all reviews come from
+    // the same GitHub account (ultim88888888). If CI bots start posting comments,
+    // add author filtering (e.g., skip authors with [bot] suffix or known CI logins).
+    const feedback_timestamps: number[] = [];
+
+    for (const review of data.reviews) {
+      if (review.submittedAt) {
+        feedback_timestamps.push(new Date(review.submittedAt).getTime());
+      }
+    }
+    for (const comment of data.comments) {
+      if (comment.createdAt) {
+        feedback_timestamps.push(new Date(comment.createdAt).getTime());
+      }
+    }
+
+    // No feedback at all — never reviewed
+    if (feedback_timestamps.length === 0) {
+      return false;
+    }
+
+    const latest_feedback = Math.max(...feedback_timestamps);
+
+    // Get latest commit timestamp — commits are returned in chronological order
+    const commits = data.commits;
+    if (commits.length === 0) {
+      // No commits somehow — don't skip, something is off
+      return false;
+    }
+
+    const last_commit = commits[commits.length - 1]!;
+    const latest_commit_ts = new Date(last_commit.committedDate).getTime();
+
+    // Re-review if commits are newer than feedback (with buffer for timestamp rounding)
+    if (latest_commit_ts > latest_feedback + TIMESTAMP_BUFFER_MS) {
+      console.log(
+        `[pr-cron] PR #${String(pr_number)} has commits newer than latest feedback — needs re-review`,
+      );
+      return false;
+    }
+
+    console.log(`[pr-cron] PR #${String(pr_number)} already reviewed, skipping`);
+    return true;
+  }
+
+  /** Fetch reviews, comments, and commits for a PR via gh CLI. Returns null on error. */
+  protected async fetch_pr_feedback(
+    repo_path: string,
+    pr_number: number,
+  ): Promise<PRFeedbackData | null> {
     try {
       const { stdout } = await exec("gh", [
         "pr", "view", String(pr_number),
-        "--json", "reviews,comments",
-        "--jq", "(.reviews | length) + (.comments | length)",
+        "--json", "reviews,comments,commits",
       ], { cwd: repo_path, timeout: 15_000 });
 
-      return parseInt(stdout.trim(), 10) > 0;
+      return JSON.parse(stdout) as PRFeedbackData;
     } catch {
-      return false;
+      return null;
     }
   }
 
