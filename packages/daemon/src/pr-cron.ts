@@ -305,11 +305,18 @@ export class PRReviewCron {
       ``,
       `Run /review to do a comprehensive code review.`,
       `Post your review on the PR using gh cli.`,
-      `If the code is clean — approve the PR with: gh pr review ${String(pr.number)} --approve --body "Looks good."`,
-      `If changes are needed — request changes with: gh pr review ${String(pr.number)} --request-changes --body "<your findings>"`,
       ``,
-      `After posting your review, if you approved, merge the PR:`,
-      `gh pr merge ${String(pr.number)} --squash --delete-branch`,
+      `Review standards:`,
+      `- Every piece of actionable feedback should be included.`,
+      `- If there is ANY actionable feedback, request changes:`,
+      `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
+      `- If the code is genuinely clean with no improvements needed, approve:`,
+      `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
+      ``,
+      `After posting your review:`,
+      `- If you approved, merge the PR:`,
+      `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
+      `- If you requested changes, do NOT merge.`,
     ].join("\n");
 
     console.log(`[pr-cron] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
