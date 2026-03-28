@@ -62,6 +62,29 @@ export const LobsterFarmConfigSchema = z.object({
     operator: AgentNameSchema.default({ name: "Ray" }),
     commander: AgentNameSchema.default({ name: "Pat" }),
   }).default({}),
+
+  tools: z.object({
+    tailscale: z.object({
+      installed: z.boolean().default(false),
+      hostname: z.string().optional(),
+      ip: z.string().optional(),
+    }).optional(),
+    docker: z.object({
+      installed: z.boolean().default(false),
+      runtime: z.enum(["colima", "docker-desktop", "other"]).optional(),
+    }).optional(),
+    vercel: z.object({
+      installed: z.boolean().default(false),
+      username: z.string().optional(),
+    }).optional(),
+    supabase: z.object({
+      installed: z.boolean().default(false),
+    }).optional(),
+    sentry: z.object({
+      installed: z.boolean().default(false),
+      org: z.string().optional(),
+    }).optional(),
+  }).optional(),
 });
 
 export type LobsterFarmConfig = z.infer<typeof LobsterFarmConfigSchema>;

@@ -8,6 +8,7 @@ import {
   type PathConfig,
 } from "@lobster-farm/shared";
 import { detect_machine, check_sudo, check_onepassword, check_claude_code, check_bun, check_tmux, check_github_cli } from "./init/detect.js";
+import { setup_tool_integrations } from "./init/tools.js";
 import {
   prompt_user_name,
   prompt_agent_names,
@@ -54,7 +55,19 @@ export const init_command = new Command("init")
   .option("--prefix <dir>", "Write output to <dir>/.claude/ and <dir>/.lobsterfarm/ instead of ~/")
   .option("--name <name>", "User name (skips interactive prompt)")
   .option("--non-interactive", "Use defaults for all prompts (requires --name)")
-  .action(async (options: { prefix?: string; name?: string; nonInteractive?: boolean }) => {
+  .option("--tools <list>", "Comma-separated list of tools to install (tailscale,docker,vercel,supabase,sentry)")
+  .option("--tailscale-authkey <key>", "Tailscale auth key for non-interactive setup")
+  .option("--sentry-token <token>", "Sentry auth token")
+  .option("--supabase-token <token>", "Supabase access token")
+  .action(async (options: {
+    prefix?: string;
+    name?: string;
+    nonInteractive?: boolean;
+    tools?: string;
+    tailscaleAuthkey?: string;
+    sentryToken?: string;
+    supabaseToken?: string;
+  }) => {
     const prefix = options.prefix;
     const non_interactive = options.nonInteractive ?? false;
     const path_overrides: Partial<PathConfig> | undefined = prefix
@@ -427,7 +440,10 @@ export const init_command = new Command("init")
       }
     }
 
-    // ── Step 8-10: Prompts (skipped in non-interactive mode) ──
+    // ── Step 11: Tool Integrations ──
+    const tools_config = await setup_tool_integrations(spin, non_interactive, options);
+
+    // ── Prompts (skipped in non-interactive mode) ──
     // Check if Discord tokens already exist
     let has_existing_discord_token = false;
     try {
@@ -499,6 +515,10 @@ export const init_command = new Command("init")
 
     if (discord_setup) {
       config_input["discord"] = { server_id: discord_setup.server_id };
+    }
+
+    if (tools_config && Object.keys(tools_config).length > 0) {
+      config_input["tools"] = tools_config;
     }
 
     const config: LobsterFarmConfig = LobsterFarmConfigSchema.parse(config_input);
@@ -632,6 +652,26 @@ export const init_command = new Command("init")
 
     if (github.username) {
       summary_lines.push(`GitHub:     ${github.username}`);
+    }
+
+    // Tool integration statuses
+    if (tools_config?.tailscale?.installed) {
+      const ts = tools_config.tailscale;
+      summary_lines.push(`Tailscale:  connected as ${ts.hostname ?? "unknown"} (${ts.ip ?? "unknown"})`);
+    }
+    if (tools_config?.docker?.installed) {
+      summary_lines.push(`Docker:     ${tools_config.docker.runtime ?? "colima"} ready`);
+    }
+    if (tools_config?.vercel?.installed) {
+      const v = tools_config.vercel;
+      summary_lines.push(`Vercel:     authenticated as ${v.username ?? "unknown"}`);
+    }
+    if (tools_config?.supabase?.installed) {
+      summary_lines.push(`Supabase:   authenticated`);
+    }
+    if (tools_config?.sentry?.installed) {
+      const s = tools_config.sentry;
+      summary_lines.push(`Sentry:     authenticated${s.org ? ` (org: ${s.org})` : ""}`);
     }
 
     p.note(summary_lines.join("\n"), "Setup Complete");
