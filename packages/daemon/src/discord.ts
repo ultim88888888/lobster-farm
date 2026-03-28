@@ -27,7 +27,7 @@ import {
   expand_home,
   write_yaml,
 } from "@lobster-farm/shared";
-import { mkdir, writeFile, readFile, readdir, rename } from "node:fs/promises";
+import { access, mkdir, writeFile, readFile, readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
@@ -116,7 +116,7 @@ export async function set_bot_profile_avatar(
   for (const ext of AVATAR_EXTENSIONS) {
     const candidate = join(base_dir, `${agent_name}${ext}`);
     try {
-      await readFile(candidate, { flag: "r" }).then(() => null); // existence check
+      await access(candidate);
       avatar_path = candidate;
       break;
     } catch {
@@ -134,19 +134,28 @@ export async function set_bot_profile_avatar(
   const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
   const data_uri = `data:${mime};base64,${avatar_buffer.toString("base64")}`;
 
-  // PATCH /users/@me with the bot's own token
-  const response = await fetch("https://discord.com/api/v10/users/@me", {
-    method: "PATCH",
-    headers: {
-      "Authorization": `Bot ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ avatar: data_uri }),
-  });
+  // PATCH /users/@me with the bot's own token.
+  // 10s timeout prevents a hung connection from bricking the assignment path.
+  const controller = new AbortController();
+  const timeout_id = setTimeout(() => controller.abort(), 10_000);
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Discord API ${String(response.status)}: ${body}`);
+  try {
+    const response = await fetch("https://discord.com/api/v10/users/@me", {
+      method: "PATCH",
+      headers: {
+        "Authorization": `Bot ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ avatar: data_uri }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Discord API ${String(response.status)}: ${body}`);
+    }
+  } finally {
+    clearTimeout(timeout_id);
   }
 }
 

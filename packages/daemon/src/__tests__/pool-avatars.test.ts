@@ -234,17 +234,18 @@ describe("Pool bot avatar management", () => {
 
       await pool.assign("ch-1", "e1", "planner");
 
-      // On next assignment with different archetype, avatar handler should be
-      // called again because the failure means we didn't record the archetype
+      // On next assignment with the same archetype, avatar handler should be
+      // called again because the failure means we didn't record the archetype.
+      // Release the bot and reassign the SAME bot instance — no inject_bots,
+      // which would replace it with a fresh null-state object and make the
+      // assertion trivially true.
       avatar_handler.mockClear();
       avatar_handler.mockResolvedValue(undefined);
 
-      // Release and reassign
       await pool.release("ch-1");
-      pool.inject_bots([make_bot({ id: 1, state: "free" })]);
       await pool.assign("ch-2", "e1", "planner");
 
-      // Should try again since last attempt failed
+      // Should try again since last attempt failed and last_avatar_archetype was not set
       expect(avatar_handler).toHaveBeenCalledOnce();
     });
   });
