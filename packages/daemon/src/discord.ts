@@ -5,11 +5,14 @@ import {
   Client,
   ChannelType as DiscordChannelType,
   GatewayIntentBits,
+  SlashCommandBuilder,
   type TextChannel,
   type Message,
   type Webhook,
   type Guild,
   type CategoryChannel,
+  type ChatInputCommandInteraction,
+  type AutocompleteInteraction,
 } from "discord.js";
 import type {
   LobsterFarmConfig,
@@ -79,6 +82,236 @@ interface ChannelEntry {
   entity_id: string;
   channel_type: ChannelType;
   assigned_feature?: string | null;
+}
+
+// ── Command target abstraction ──
+// Unified interface that command handlers use to reply to the user.
+// Both text messages and slash commands produce a CommandTarget.
+
+export interface CommandTarget {
+  /** Reply to the user. Handles ephemeral for slash commands. */
+  reply: (content: string) => Promise<void>;
+  /** The channel ID where the command was issued. */
+  channel_id: string;
+  /** React to the original message/interaction (no-op for slash commands). */
+  react: (emoji: string) => Promise<void>;
+  /** Display name of the command author. */
+  author_name: string;
+}
+
+// ── Slash command definitions ──
+
+export function build_slash_commands(): SlashCommandBuilder[] {
+  return [
+    new SlashCommandBuilder()
+      .setName("help")
+      .setDescription("Show available LobsterFarm commands"),
+
+    new SlashCommandBuilder()
+      .setName("status")
+      .setDescription("Show session and entity status")
+      .addStringOption(opt =>
+        opt.setName("scope").setDescription("Scope").addChoices(
+          { name: "entity", value: "entity" },
+          { name: "all", value: "all" },
+        ),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("features")
+      .setDescription("List active features"),
+
+    new SlashCommandBuilder()
+      .setName("plan")
+      .setDescription("Create a new feature in the plan phase")
+      .addStringOption(opt =>
+        opt.setName("title").setDescription("Feature title").setRequired(true),
+      ) as SlashCommandBuilder,
+
+    // NOTE: Spec defines `feature` as optional for /approve and /advance, but we
+    // mark it required because there's no "infer from active channel" mechanism yet.
+    // Requiring the ID is safer than silently failing. Tracked as a deliberate
+    // deviation — revisit when per-channel feature inference is implemented.
+    new SlashCommandBuilder()
+      .setName("approve")
+      .setDescription("Approve the current phase gate for a feature")
+      .addStringOption(opt =>
+        opt.setName("feature").setDescription("Feature ID").setRequired(true),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("advance")
+      .setDescription("Advance a feature to the next phase")
+      .addStringOption(opt =>
+        opt.setName("feature").setDescription("Feature ID").setRequired(true),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("swap")
+      .setDescription("Swap the active agent in this channel")
+      .addStringOption(opt =>
+        opt.setName("agent").setDescription("Agent to swap to").setRequired(true).addChoices(
+          { name: "Gary (planner)", value: "planner" },
+          { name: "Bob (builder)", value: "builder" },
+          { name: "Pearl (designer)", value: "designer" },
+          { name: "Ray (operator)", value: "operator" },
+        ),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("scaffold")
+      .setDescription("Scaffold Discord channels")
+      .addStringOption(opt =>
+        opt.setName("name").setDescription("Entity ID or 'server'").setRequired(true),
+      )
+      .addStringOption(opt =>
+        opt.setName("blueprint").setDescription("Blueprint name (default: software)"),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("room")
+      .setDescription("Create an on-demand work room with a pool bot")
+      .addStringOption(opt =>
+        opt.setName("name").setDescription("Room name").setRequired(true),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("close")
+      .setDescription("Archive and close the current work room")
+      .addBooleanOption(opt =>
+        opt.setName("force").setDescription("Force close even if a feature is active"),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("resume")
+      .setDescription("Restore an archived work room session")
+      .addStringOption(opt =>
+        opt.setName("name").setDescription("Archived room name").setRequired(true).setAutocomplete(true),
+      ) as SlashCommandBuilder,
+
+    new SlashCommandBuilder()
+      .setName("compact")
+      .setDescription("Trigger context compaction on the active session"),
+
+    new SlashCommandBuilder()
+      .setName("reset")
+      .setDescription("Reset the current session and start fresh"),
+  ] as SlashCommandBuilder[];
+}
+
+// Commands whose responses should be ephemeral (only visible to the invoker).
+export const EPHEMERAL_COMMAND_NAMES = ["help", "status", "features"] as const;
+const EPHEMERAL_COMMANDS = new Set<string>(EPHEMERAL_COMMAND_NAMES);
+
+// Commands that perform external I/O and may exceed Discord's 3-second
+// interaction response window. These get deferReply() before processing.
+const DEFERRED_COMMANDS = new Set(["plan", "scaffold", "room", "resume", "close"]);
+
+/** Minimal interface for the subset of ChatInputCommandInteraction used by extract_slash_args. */
+export interface SlashInteractionLike {
+  commandName: string;
+  options: {
+    getString(name: string): string | null;
+    getBoolean(name: string): boolean | null;
+  };
+}
+
+/**
+ * Extract slash command options into the positional args array that
+ * the shared handle_command dispatch expects. Each slash command
+ * maps its named options to the legacy positional format.
+ */
+export function extract_slash_args(interaction: SlashInteractionLike): string[] {
+  const name = interaction.commandName;
+
+  switch (name) {
+    case "status": {
+      const scope = interaction.options.getString("scope");
+      return scope ? [scope] : [];
+    }
+    case "plan": {
+      const title = interaction.options.getString("title") ?? "";
+      return [title];
+    }
+    case "approve":
+    case "advance": {
+      const feature = interaction.options.getString("feature");
+      return feature ? [feature] : [];
+    }
+    case "swap": {
+      const agent = interaction.options.getString("agent") ?? "";
+      return [agent];
+    }
+    case "scaffold": {
+      // /scaffold name:"my-entity" maps to args: ["entity", "my-entity"]
+      const scaffold_name = interaction.options.getString("name") ?? "";
+      if (scaffold_name === "server") return ["server"];
+      const blueprint = interaction.options.getString("blueprint");
+      const result = ["entity", scaffold_name];
+      if (blueprint) result.push("--blueprint", blueprint);
+      return result;
+    }
+    case "room": {
+      const room_name = interaction.options.getString("name") ?? "";
+      return [room_name];
+    }
+    case "close": {
+      const force = interaction.options.getBoolean("force");
+      return force ? ["--force"] : [];
+    }
+    case "resume": {
+      const resume_name = interaction.options.getString("name") ?? "";
+      return [resume_name];
+    }
+    default:
+      return [];
+  }
+}
+
+/** Create a CommandTarget from a Discord text message. */
+function target_from_message(message: Message, send_fallback: (channel_id: string, content: string) => Promise<void>): CommandTarget {
+  return {
+    channel_id: message.channelId,
+    author_name: message.author.displayName,
+    async reply(content: string) {
+      try {
+        await message.reply(content);
+      } catch {
+        await send_fallback(message.channelId, content);
+      }
+    },
+    async react(emoji: string) {
+      try { await message.react(emoji); } catch { /* ignore */ }
+    },
+  };
+}
+
+/** Create a CommandTarget from a slash command interaction. */
+function target_from_interaction(interaction: ChatInputCommandInteraction, ephemeral: boolean, deferred = false): CommandTarget {
+  let replied = false;
+  return {
+    channel_id: interaction.channelId,
+    author_name: interaction.user.displayName,
+    async reply(content: string) {
+      try {
+        if (deferred && !replied) {
+          // editReply inherits the ephemeral flag from the earlier deferReply()
+          // call — no need to pass ephemeral here.
+          await interaction.editReply({ content });
+        } else if (!replied) {
+          await interaction.reply({ content, ephemeral });
+        } else {
+          await interaction.followUp({ content, ephemeral });
+        }
+        replied = true;
+      } catch (err) {
+        console.error(`[discord:slash] Reply failed: ${String(err)}`);
+      }
+    },
+    async react(_emoji: string) {
+      // Slash commands don't support reactions — no-op
+    },
+  };
 }
 
 // ── Discord Bot ──
@@ -196,6 +429,10 @@ export class DiscordBot extends EventEmitter {
         const tag = this.client.user?.tag ?? "unknown";
         console.log(`[discord] Connected as ${tag}`);
         this.connected = true;
+
+        // Register guild-specific slash commands (instant, no propagation delay)
+        void this.register_slash_commands();
+
         this.emit("connected");
         resolve();
       });
@@ -203,6 +440,16 @@ export class DiscordBot extends EventEmitter {
 
     this.client.on("messageCreate", (message: Message) => {
       void this.handle_message(message);
+    });
+
+    this.client.on("interactionCreate", (interaction) => {
+      if (interaction.isAutocomplete()) {
+        void this.handle_autocomplete(interaction as AutocompleteInteraction);
+        return;
+      }
+      if (interaction.isChatInputCommand()) {
+        void this.handle_slash_command(interaction as ChatInputCommandInteraction);
+      }
     });
 
     await this.client.login(token);
@@ -213,6 +460,27 @@ export class DiscordBot extends EventEmitter {
       message: "Discord connected",
       data: { tag: this.client.user?.tag },
     });
+  }
+
+  /** Register slash commands on the guild for instant availability. */
+  private async register_slash_commands(): Promise<void> {
+    const guild = await this.get_guild();
+    if (!guild) {
+      console.log("[discord] No guild available — slash commands not registered");
+      return;
+    }
+
+    try {
+      const commands = build_slash_commands();
+      await guild.commands.set(commands);
+      console.log(`[discord] Registered ${String(commands.length)} slash commands on guild`);
+    } catch (err) {
+      console.error(`[discord] Failed to register slash commands: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { component: "discord", operation: "register_slash_commands" },
+        extra: { hint: "Most likely missing applications.commands OAuth2 scope" },
+      });
+    }
   }
 
   /** Disconnect from Discord. */
@@ -705,7 +973,7 @@ export class DiscordBot extends EventEmitter {
   /**
    * Scaffold Discord channels for a new entity.
    * Creates a category and standard channels (general, alerts).
-   * Work rooms are created on demand via !lf room.
+   * Work rooms are created on demand via /room (or !lf room).
    * Returns the channel mappings to store in entity config.
    */
   async scaffold_entity(
@@ -872,11 +1140,12 @@ export class DiscordBot extends EventEmitter {
         const { parse_command } = await import("./router.js");
         const cmd = parse_command(message.content);
         if (cmd) {
+          const target = target_from_message(message, (ch, c) => this.send(ch, c));
           try {
-            await this.handle_command(cmd.name, cmd.args, routed, message);
+            await this.handle_command(cmd.name, cmd.args, routed, target);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            await this.reply(message, `Error: ${msg}`);
+            await target.reply(`Error: ${msg}`);
           }
         }
       }
@@ -899,11 +1168,12 @@ export class DiscordBot extends EventEmitter {
       const { parse_command } = await import("./router.js");
       const cmd = parse_command(message.content);
       if (cmd) {
+        const target = target_from_message(message, (ch, c) => this.send(ch, c));
         try {
-          await this.handle_command(cmd.name, cmd.args, routed, message);
+          await this.handle_command(cmd.name, cmd.args, routed, target);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          await this.reply(message, `Error: ${msg}`);
+          await target.reply(`Error: ${msg}`);
         }
       }
       return;
@@ -915,7 +1185,8 @@ export class DiscordBot extends EventEmitter {
         // Clear session history so the next assignment starts fresh
         this._pool.clear_session_history(entry.entity_id, message.channelId);
         await this._pool.release(message.channelId);
-        await this.reply(message, "Session reset. Send a message to start fresh.");
+        const target = target_from_message(message, (ch, c) => this.send(ch, c));
+        await target.reply("Session reset. Send a message to start fresh.\n-# Tip: use `/reset` instead of `!reset`");
       }
       return;
     }
@@ -972,10 +1243,11 @@ export class DiscordBot extends EventEmitter {
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
           } catch { /* ignore */ }
-          await this.reply(
-            message,
-            "All bots are busy right now. Your message will be picked up when a slot opens.",
-          );
+          try {
+            await message.reply("All bots are busy right now. Your message will be picked up when a slot opens.");
+          } catch {
+            await this.send(message.channelId, "All bots are busy right now. Your message will be picked up when a slot opens.");
+          }
         }
       } else {
         // Bot is assigned and tmux is alive — touch for LRU tracking
@@ -987,38 +1259,35 @@ export class DiscordBot extends EventEmitter {
   private async execute_action(
     action: RouteAction,
     routed: RoutedMessage,
-    message: Message,
+    target: CommandTarget,
   ): Promise<void> {
     switch (action.type) {
       case "command":
-        await this.handle_command(action.name, action.args, routed, message);
+        await this.handle_command(action.name, action.args, routed, target);
         break;
 
       case "classify":
-        await this.reply(
-          message,
+        await target.reply(
           `Classified as **${action.archetype}** task. ` +
-            `Use \`!lf plan ${routed.entity_id} "${action.prompt}"\` to create a feature, ` +
+            `Use \`/plan ${action.prompt}\` to create a feature, ` +
             `or I can handle it directly (coming soon).`,
         );
         break;
 
       case "route_to_session":
-        await this.reply(
-          message,
+        await target.reply(
           `Routing to feature **${action.feature_id}** session (interactive routing coming soon).`,
         );
         break;
 
       case "approval_response":
-        await this.reply(
-          message,
-          `Received approval response. Use \`!lf approve <feature-id>\` to approve a specific feature.`,
+        await target.reply(
+          `Received approval response. Use \`/approve <feature-id>\` to approve a specific feature.`,
         );
         break;
 
       case "ask_clarification":
-        await this.reply(message, action.message);
+        await target.reply(action.message);
         break;
 
       case "ignore":
@@ -1030,79 +1299,82 @@ export class DiscordBot extends EventEmitter {
     name: string,
     args: string[],
     routed: RoutedMessage,
-    message: Message,
+    target: CommandTarget,
   ): Promise<void> {
     switch (name) {
       case "help":
-        await this.reply(
-          message,
+        await target.reply(
           "**LobsterFarm Commands:**\n" +
-            "• `!lf plan <entity> <title>` — create a feature in plan phase\n" +
-            "• `!lf approve <feature-id>` — approve current phase gate\n" +
-            "• `!lf advance <feature-id>` — advance to next phase\n" +
-            "• `!lf swap <agent>` — swap active agent in this channel (gary, bob, pearl, ray)\n" +
-            "• `!lf compact` — trigger context compaction on the active session\n" +
-            "• `!lf room <name> [context]` — create an on-demand work room with a pool bot\n" +
-            "• `!lf close` — archive and delete the current work room\n" +
-            "• `!lf resume <name>` — restore an archived work room session\n" +
-            "• `!lf status` — session/entity status for this channel\n" +
-            "• `!lf features [entity]` — list features\n" +
-            "• `!lf scaffold server` — create GLOBAL Discord channels\n" +
-            "• `!lf scaffold entity <id> <name>` — create entity Discord channels\n" +
-            "• `!lf help` — this message",
+            "• `/plan <title>` — create a feature in plan phase\n" +
+            "• `/approve [feature-id]` — approve current phase gate\n" +
+            "• `/advance [feature-id]` — advance to next phase\n" +
+            "• `/swap <agent>` — swap active agent in this channel\n" +
+            "• `/compact` — trigger context compaction on the active session\n" +
+            "• `/room <name>` — create an on-demand work room with a pool bot\n" +
+            "• `/close` — archive and delete the current work room\n" +
+            "• `/resume <name>` — restore an archived work room session\n" +
+            "• `/status` — session/entity status for this channel\n" +
+            "• `/features` — list features\n" +
+            "• `/scaffold <name>` — create Discord channels\n" +
+            "• `/reset` — reset the current session\n" +
+            "• `/help` — this message",
         );
         break;
 
       case "status":
-        await this.handle_status_command(routed, message);
+        await this.handle_status_command(routed, target);
         break;
 
       case "plan":
-        await this.handle_plan_command(args, routed, message);
+        await this.handle_plan_command(args, routed, target);
         break;
 
       case "approve":
-        await this.handle_approve_command(args, message);
+        await this.handle_approve_command(args, target);
         break;
 
       case "advance":
-        await this.handle_advance_command(args, message);
+        await this.handle_advance_command(args, target);
         break;
 
       case "features":
-        await this.handle_features_command(args, message);
+        await this.handle_features_command(args, target);
         break;
 
       case "scaffold":
-        await this.handle_scaffold_command(args, routed, message);
+        await this.handle_scaffold_command(args, routed, target);
         break;
 
       case "swap":
-        await this.handle_swap_command(args, message);
+        await this.handle_swap_command(args, target);
         break;
 
       case "compact":
-        await this.handle_compact_command(message);
+        await this.handle_compact_command(target);
         break;
 
       case "room":
-        await this.handle_room_command(args, routed, message);
+        await this.handle_room_command(args, routed, target);
         break;
 
       case "close":
-        await this.handle_close_command(args, routed, message);
+        await this.handle_close_command(args, routed, target);
         break;
 
       case "resume":
-        await this.handle_resume_command(args, routed, message);
+        await this.handle_resume_command(args, routed, target);
+        break;
+
+      case "reset":
+        await this.handle_reset_command(routed, target);
         break;
 
       default:
-        await this.reply(message, `Unknown command: \`${name}\`. Try \`!lf help\`.`);
+        await target.reply(`Unknown command: \`${name}\`. Try \`/help\`.`);
     }
   }
 
-  private async handle_status_command(routed: RoutedMessage, message: Message): Promise<void> {
+  private async handle_status_command(routed: RoutedMessage, target: CommandTarget): Promise<void> {
     const pool = this._pool;
     const features = this._features;
     const entity_id = routed.entity_id;
@@ -1113,18 +1385,18 @@ export class DiscordBot extends EventEmitter {
 
     // No entity context — global channel (e.g., #command-center)
     if (!is_entity_channel) {
-      await this.reply(message, "No active session in this channel." +
+      await target.reply("No active session in this channel." +
         (pool_summary ? `\n\n${pool_summary}` : ""));
       return;
     }
 
     // Entity-level channels without session-specific info (e.g., #alerts, #work-log)
     // Show entity summary without session details.
-    const assignment = pool?.get_assignment(message.channelId);
+    const assignment = pool?.get_assignment(target.channel_id);
     if (!assignment && routed.channel_type !== "general" && routed.channel_type !== "work_room") {
       const lines = this.format_entity_summary(entity_id, features);
       if (pool_summary) lines.push("", pool_summary);
-      await this.reply(message, lines.join("\n"));
+      await target.reply(lines.join("\n"));
       return;
     }
 
@@ -1134,7 +1406,7 @@ export class DiscordBot extends EventEmitter {
       const entity_lines = this.format_entity_summary(entity_id, features);
       lines.push("", ...entity_lines);
       if (pool_summary) lines.push("", pool_summary);
-      await this.reply(message, lines.join("\n"));
+      await target.reply(lines.join("\n"));
       return;
     }
 
@@ -1153,7 +1425,7 @@ export class DiscordBot extends EventEmitter {
 
     const lines = this.format_session_status(assignment, routed, features, context_usage, subscription_usage);
     if (pool_summary) lines.push("", pool_summary);
-    await this.reply(message, lines.join("\n"));
+    await target.reply(lines.join("\n"));
   }
 
   /** Format the full session status block for a channel with an assigned bot. */
@@ -1260,21 +1532,21 @@ export class DiscordBot extends EventEmitter {
   private async handle_plan_command(
     args: string[],
     routed: RoutedMessage,
-    message: Message,
+    target: CommandTarget,
   ): Promise<void> {
     const features = this._features;
     if (!features) {
-      await this.reply(message, "Feature manager not available.");
+      await target.reply("Feature manager not available.");
       return;
     }
 
-    // Parse: !lf plan <entity_id> <title>
+    // Parse: !lf plan <entity_id> <title> OR /plan title:"..."
     // If entity_id is omitted, use the channel's entity
     let entity_id: string;
     let title: string;
 
     if (args.length === 0) {
-      await this.reply(message, "Usage: `!lf plan <entity> <title>` or `!lf plan <title>` (in an entity channel)");
+      await target.reply("Usage: `/plan <title>` (in an entity channel)");
       return;
     }
 
@@ -1289,26 +1561,26 @@ export class DiscordBot extends EventEmitter {
     }
 
     if (!title) {
-      await this.reply(message, "Please provide a title for the feature.");
+      await target.reply("Please provide a title for the feature.");
       return;
     }
 
     // Resolve the GitHub repo for issue creation
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) {
-      await this.reply(message, `Entity "${entity_id}" not found.`);
+      await target.reply(`Entity "${entity_id}" not found.`);
       return;
     }
 
     const repo = entity_config.entity.repos[0];
     if (!repo) {
-      await this.reply(message, `Entity "${entity_id}" has no repos configured. Cannot create GitHub issue.`);
+      await target.reply(`Entity "${entity_id}" has no repos configured. Cannot create GitHub issue.`);
       return;
     }
 
     const nwo = nwo_from_url(repo.url);
     if (!nwo) {
-      await this.reply(message, `Could not parse GitHub owner/repo from URL: ${repo.url}`);
+      await target.reply(`Could not parse GitHub owner/repo from URL: ${repo.url}`);
       return;
     }
 
@@ -1326,13 +1598,13 @@ export class DiscordBot extends EventEmitter {
       // gh issue create outputs the issue URL, e.g. https://github.com/owner/repo/issues/42
       const url_match = stdout.trim().match(/\/issues\/(\d+)$/);
       if (!url_match) {
-        await this.reply(message, `GitHub issue created but could not parse issue number from: ${stdout.trim()}`);
+        await target.reply(`GitHub issue created but could not parse issue number from: ${stdout.trim()}`);
         return;
       }
       issue_number = Number(url_match[1]);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.reply(message, `Failed to create GitHub issue: ${msg}`);
+      await target.reply(`Failed to create GitHub issue: ${msg}`);
       return;
     }
 
@@ -1343,73 +1615,70 @@ export class DiscordBot extends EventEmitter {
         github_issue: issue_number,
       });
 
-      await this.reply(
-        message,
+      await target.reply(
         `Feature **${feature.id}** created: "${title}"\n` +
           `Phase: plan | Issue: #${String(issue_number)}\n` +
-          `Approve with \`!lf approve ${feature.id}\`, then advance with \`!lf advance ${feature.id}\``,
+          `Approve with \`/approve ${feature.id}\`, then advance with \`/advance ${feature.id}\``,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.reply(message, `Failed to create feature: ${msg}`);
+      await target.reply(`Failed to create feature: ${msg}`);
     }
   }
 
-  private async handle_approve_command(args: string[], message: Message): Promise<void> {
+  private async handle_approve_command(args: string[], target: CommandTarget): Promise<void> {
     const features = this._features;
     if (!features) {
-      await this.reply(message, "Feature manager not available.");
+      await target.reply("Feature manager not available.");
       return;
     }
 
     const feature_id = args[0];
     if (!feature_id) {
-      await this.reply(message, "Usage: `!lf approve <feature-id>`");
+      await target.reply("Usage: `/approve <feature-id>`");
       return;
     }
 
     try {
       const feature = features.approve_phase(feature_id);
-      await this.reply(
-        message,
+      await target.reply(
         `Approved phase **${feature.phase}** for ${feature_id}. ` +
-          `Use \`!lf advance ${feature_id}\` to proceed.`,
+          `Use \`/advance ${feature_id}\` to proceed.`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.reply(message, `Failed to approve: ${msg}`);
+      await target.reply(`Failed to approve: ${msg}`);
     }
   }
 
-  private async handle_advance_command(args: string[], message: Message): Promise<void> {
+  private async handle_advance_command(args: string[], target: CommandTarget): Promise<void> {
     const features = this._features;
     if (!features) {
-      await this.reply(message, "Feature manager not available.");
+      await target.reply("Feature manager not available.");
       return;
     }
 
     const feature_id = args[0];
     if (!feature_id) {
-      await this.reply(message, "Usage: `!lf advance <feature-id>`");
+      await target.reply("Usage: `/advance <feature-id>`");
       return;
     }
 
     try {
       const feature = await features.advance_feature(feature_id);
-      await this.reply(
-        message,
+      await target.reply(
         `Feature **${feature_id}** advanced to **${feature.phase}** phase.`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.reply(message, `Failed to advance: ${msg}`);
+      await target.reply(`Failed to advance: ${msg}`);
     }
   }
 
-  private async handle_features_command(args: string[], message: Message): Promise<void> {
+  private async handle_features_command(args: string[], target: CommandTarget): Promise<void> {
     const features = this._features;
     if (!features) {
-      await this.reply(message, "Feature manager not available.");
+      await target.reply("Feature manager not available.");
       return;
     }
 
@@ -1419,7 +1688,7 @@ export class DiscordBot extends EventEmitter {
       : features.list_features();
 
     if (all.length === 0) {
-      await this.reply(message, "No features found.");
+      await target.reply("No features found.");
       return;
     }
 
@@ -1431,37 +1700,41 @@ export class DiscordBot extends EventEmitter {
       return status;
     });
 
-    await this.reply(message, lines.join("\n"));
+    await target.reply(lines.join("\n"));
   }
 
   private async handle_scaffold_command(
     args: string[],
-    routed: RoutedMessage,
-    message: Message,
+    _routed: RoutedMessage,
+    target: CommandTarget,
   ): Promise<void> {
     const sub = args[0];
 
     if (sub === "entity") {
-      // Usage: !lf scaffold entity <id> <name> [--repo <url>]
+      // Usage: /scaffold name:<id> OR !lf scaffold entity <id> <name> [--repo <url>]
       const entity_id = args[1];
       if (!entity_id || !/^[a-z0-9-]+$/.test(entity_id)) {
-        await this.reply(message, "Usage: `!lf scaffold entity <id> <name>`\nID must be lowercase alphanumeric with hyphens.");
+        await target.reply("Usage: `/scaffold <id>` or `!lf scaffold entity <id> <name>`\nID must be lowercase alphanumeric with hyphens.");
         return;
       }
 
       // Check if entity already exists
       if (this.registry.get(entity_id)) {
-        await this.reply(message, `Entity **${entity_id}** already exists.`);
+        await target.reply(`Entity **${entity_id}** already exists.`);
         return;
       }
 
-      // Parse remaining args for name and optional --repo
+      // Parse remaining args for name, optional --repo, and optional --blueprint
       const remaining = args.slice(2);
       let repo_url = "";
+      let blueprint = "software";
       const name_parts: string[] = [];
       for (let i = 0; i < remaining.length; i++) {
         if (remaining[i] === "--repo" && remaining[i + 1]) {
           repo_url = remaining[i + 1]!;
+          i++;
+        } else if (remaining[i] === "--blueprint" && remaining[i + 1]) {
+          blueprint = remaining[i + 1]!;
           i++;
         } else {
           name_parts.push(remaining[i]!);
@@ -1469,7 +1742,7 @@ export class DiscordBot extends EventEmitter {
       }
       const entity_name = name_parts.join(" ") || entity_id;
 
-      await this.reply(message, `Setting up entity **${entity_id}** ("${entity_name}")...`);
+      await target.reply(`Setting up entity **${entity_id}** ("${entity_name}")...`);
 
       // 1. Create Discord channels
       const { category_id, channels } = await this.scaffold_entity(entity_id, entity_name);
@@ -1493,7 +1766,7 @@ export class DiscordBot extends EventEmitter {
           name: entity_name,
           description: "",
           status: "active",
-          blueprint: "software",
+          blueprint,
           repos: [{
             name: entity_id,
             url: repo_url || `git@github.com:org/${entity_id}.git`,
@@ -1544,24 +1817,22 @@ export class DiscordBot extends EventEmitter {
 
       // 6. Report
       const channel_lines = channels.map((c) => `  • #${c.purpose} → ${c.type}`);
-      await this.reply(
-        message,
+      await target.reply(
         `Entity **${entity_id}** fully scaffolded:\n` +
           `• Config: \`${config_path}\`\n` +
           `• Memory: \`${mem_path}\`\n` +
           `• Discord: ${String(channels.length)} channels\n` +
           channel_lines.join("\n") + "\n\n" +
-          `Ready to use. Try \`!lf plan ${entity_id} "Your first feature"\``,
+          `Ready to use. Try \`/plan "Your first feature"\``,
       );
     } else if (sub === "server") {
-      await this.reply(message, "Scaffolding global Discord structure...");
+      await target.reply("Scaffolding global Discord structure...");
       const result = await this.scaffold_server();
       const created = Object.entries(result).filter(([_, v]) => v).length;
-      await this.reply(message, `Global scaffold complete. ${String(created)} channels configured.`);
+      await target.reply(`Global scaffold complete. ${String(created)} channels configured.`);
     } else {
-      await this.reply(
-        message,
-        "Usage:\n• `!lf scaffold server` — create GLOBAL channels\n• `!lf scaffold entity <id> <name>` — create entity channels",
+      await target.reply(
+        "Usage:\n• `/scaffold server` — create GLOBAL channels\n• `/scaffold <id>` — create entity channels",
       );
     }
   }
@@ -1625,13 +1896,13 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  private async handle_swap_command(args: string[], message: Message): Promise<void> {
+  private async handle_swap_command(args: string[], target: CommandTarget): Promise<void> {
     if (!this._pool) {
-      await this.reply(message, "Bot pool not available.");
+      await target.reply("Bot pool not available.");
       return;
     }
 
-    // Usage: !lf swap <archetype>
+    // Usage: /swap agent:<archetype> OR !lf swap <archetype>
     const archetype_name = args[0]?.toLowerCase();
     const archetype_map: Record<string, ArchetypeRole> = {
       gary: "planner", planner: "planner",
@@ -1642,17 +1913,16 @@ export class DiscordBot extends EventEmitter {
 
     const archetype = archetype_map[archetype_name ?? ""];
     if (!archetype) {
-      await this.reply(
-        message,
-        "Usage: `!lf swap <agent>` — gary, bob, pearl, or ray",
+      await target.reply(
+        "Usage: `/swap <agent>` — planner, builder, designer, or operator",
       );
       return;
     }
 
-    const channel_id = message.channelId;
+    const channel_id = target.channel_id;
     const entry = this.channel_map.get(channel_id);
     if (!entry) {
-      await this.reply(message, "This channel isn't mapped to an entity.");
+      await target.reply("This channel isn't mapped to an entity.");
       return;
     }
 
@@ -1662,21 +1932,21 @@ export class DiscordBot extends EventEmitter {
 
     if (result) {
       const agent_display = this.config.agents[archetype === "reviewer" ? "planner" : archetype]?.name ?? archetype;
-      await this.reply(message, `Swapping to ${agent_display}...`);
+      await target.reply(`Swapping to ${agent_display}...`);
     } else {
-      await this.reply(message, "No pool bots available for swap.");
+      await target.reply("No pool bots available for swap.");
     }
   }
 
-  private async handle_compact_command(message: Message): Promise<void> {
+  private async handle_compact_command(target: CommandTarget): Promise<void> {
     if (!this._pool) {
-      await this.reply(message, "Bot pool not available.");
+      await target.reply("Bot pool not available.");
       return;
     }
 
-    const assignment = this._pool.get_assignment(message.channelId);
+    const assignment = this._pool.get_assignment(target.channel_id);
     if (!assignment) {
-      await this.reply(message, "No active session in this channel.");
+      await target.reply("No active session in this channel.");
       return;
     }
 
@@ -1685,38 +1955,38 @@ export class DiscordBot extends EventEmitter {
         stdio: "ignore",
         timeout: 5000,
       });
-      await message.react("\u2705");
+      await target.reply("✅ Compact triggered.");
     } catch {
-      await this.reply(message, "Failed to send compact — session may be unresponsive.");
+      await target.reply("Failed to send compact — session may be unresponsive.");
     }
   }
 
   // ── Dynamic room commands ──
 
   /**
-   * !lf room <name> [initial context]
+   * /room name:<name> OR !lf room <name> [initial context]
    * Creates an on-demand work room under the entity's category,
    * assigns a pool bot, and optionally bridges initial context.
    */
   private async handle_room_command(
     args: string[],
     routed: RoutedMessage,
-    message: Message,
+    target: CommandTarget,
   ): Promise<void> {
     if (!this._pool) {
-      await this.reply(message, "Bot pool not available.");
+      await target.reply("Bot pool not available.");
       return;
     }
 
     const entity_config = this.registry.get(routed.entity_id);
     if (!entity_config) {
-      await this.reply(message, "This channel isn't mapped to an entity.");
+      await target.reply("This channel isn't mapped to an entity.");
       return;
     }
 
     const category_id = entity_config.entity.channels.category_id;
     if (!category_id) {
-      await this.reply(message, "Entity has no Discord category configured.");
+      await target.reply("Entity has no Discord category configured.");
       return;
     }
 
@@ -1731,7 +2001,7 @@ export class DiscordBot extends EventEmitter {
 
     // Check for name collision with active channels
     if (this.find_channel_by_name(entity_config.entity.channels, name)) {
-      await this.reply(message, `A room named **${name}** already exists.`);
+      await target.reply(`A room named **${name}** already exists.`);
       return;
     }
 
@@ -1742,7 +2012,7 @@ export class DiscordBot extends EventEmitter {
       `On-demand work room for ${routed.entity_id}`,
     );
     if (!channel_id) {
-      await this.reply(message, "Failed to create Discord channel.");
+      await target.reply("Failed to create Discord channel.");
       return;
     }
 
@@ -1768,7 +2038,7 @@ export class DiscordBot extends EventEmitter {
     );
 
     // Post confirmation in both source channel and new room
-    await this.reply(message, `Room **#${name}** created. Session started.`);
+    await target.reply(`Room **#${name}** created. Session started.`);
     if (assignment) {
       await this.send(channel_id, "Room created. Session started.");
 
@@ -1777,14 +2047,14 @@ export class DiscordBot extends EventEmitter {
         await this.bridge_first_message(
           assignment.tmux_session,
           context,
-          message.author.displayName,
+          target.author_name,
         );
       }
     }
   }
 
   /**
-   * !lf close [--force]
+   * /close OR !lf close [--force]
    * Archives the current work room's session and deletes the channel.
    * Only works in work_room channels.
    * If there's an active feature lifecycle in this room, warns the user
@@ -1793,26 +2063,26 @@ export class DiscordBot extends EventEmitter {
   private async handle_close_command(
     args: string[],
     routed: RoutedMessage,
-    message: Message,
+    target: CommandTarget,
   ): Promise<void> {
     // Verify this is a work_room channel
     if (routed.channel_type !== "work_room") {
-      await this.reply(message, "Can't close this channel. `!lf close` only works in work rooms.");
+      await target.reply("Can't close this channel. `/close` only works in work rooms.");
       return;
     }
 
     const entity_config = this.registry.get(routed.entity_id);
     if (!entity_config) {
-      await this.reply(message, "Entity not found.");
+      await target.reply("Entity not found.");
       return;
     }
 
-    const channel_id = message.channelId;
+    const channel_id = target.channel_id;
     const channel_entry = entity_config.entity.channels.list.find(
       (c: ChannelMapping) => c.id === channel_id,
     );
     if (!channel_entry) {
-      await this.reply(message, "Channel not found in entity config.");
+      await target.reply("Channel not found in entity config.");
       return;
     }
 
@@ -1823,9 +2093,8 @@ export class DiscordBot extends EventEmitter {
       );
       if (active_features.length > 0 && !args.includes("--force")) {
         const title = active_features[0]!.title ?? active_features[0]!.id;
-        await this.reply(
-          message,
-          `This room has an active feature (**${title}**). Close anyway? Use \`!lf close --force\`.`,
+        await target.reply(
+          `This room has an active feature (**${title}**). Close anyway? Use \`/close\` with the \`force\` option, or \`!lf close --force\`.`,
         );
         return;
       }
@@ -1885,41 +2154,45 @@ export class DiscordBot extends EventEmitter {
     if (general_channel && is_discord_snowflake(general_channel.id)) {
       await this.send(
         general_channel.id,
-        `Session archived as \`${room_name}\`. Use \`!lf resume ${room_name}\` to restore.`,
+        `Session archived as \`${room_name}\`. Use \`/resume ${room_name}\` to restore.`,
       );
     }
+
+    // Acknowledge the interaction. For slash commands, the interaction token
+    // remains valid even after the channel is deleted.
+    await target.reply(`Session archived. Use \`/resume ${room_name}\` to restore.`);
   }
 
   /**
-   * !lf resume <name>
+   * /resume name:<name> OR !lf resume <name>
    * Restores an archived work room session. Creates a new channel,
    * assigns a pool bot with the archived session_id for resume.
    */
   private async handle_resume_command(
     args: string[],
     routed: RoutedMessage,
-    message: Message,
+    target: CommandTarget,
   ): Promise<void> {
     if (!this._pool) {
-      await this.reply(message, "Bot pool not available.");
+      await target.reply("Bot pool not available.");
       return;
     }
 
     const entity_config = this.registry.get(routed.entity_id);
     if (!entity_config) {
-      await this.reply(message, "Entity not found.");
+      await target.reply("Entity not found.");
       return;
     }
 
     const category_id = entity_config.entity.channels.category_id;
     if (!category_id) {
-      await this.reply(message, "Entity has no Discord category configured.");
+      await target.reply("Entity has no Discord category configured.");
       return;
     }
 
     const search_name = args[0];
     if (!search_name) {
-      await this.reply(message, "Usage: `!lf resume <name>`");
+      await target.reply("Usage: `/resume <name>`");
       return;
     }
 
@@ -1930,10 +2203,9 @@ export class DiscordBot extends EventEmitter {
     if (matches.length === 0) {
       const available = [...new Set(archives.map(a => a.name))];
       if (available.length === 0) {
-        await this.reply(message, `No archived sessions found for this entity.`);
+        await target.reply(`No archived sessions found for this entity.`);
       } else {
-        await this.reply(
-          message,
+        await target.reply(
           `No archived session found with name **${search_name}**.\nAvailable: ${available.map(n => `\`${n}\``).join(", ")}`,
         );
       }
@@ -1945,8 +2217,7 @@ export class DiscordBot extends EventEmitter {
       const lines = matches.map((a, i) =>
         `${String(i + 1)}. \`${a.name}\` — closed ${a.closed_at}`,
       );
-      await this.reply(
-        message,
+      await target.reply(
         `Multiple archived sessions named **${search_name}**:\n${lines.join("\n")}\n\nMost recent will be used. To specify, re-close to create distinct names.`,
       );
       // Use the most recent match
@@ -1957,7 +2228,7 @@ export class DiscordBot extends EventEmitter {
 
     // Check for name collision with active channels
     if (this.find_channel_by_name(entity_config.entity.channels, search_name)) {
-      await this.reply(message, `A room named **${search_name}** already exists.`);
+      await target.reply(`A room named **${search_name}** already exists.`);
       return;
     }
 
@@ -1968,7 +2239,7 @@ export class DiscordBot extends EventEmitter {
       `Resumed work room for ${routed.entity_id}`,
     );
     if (!channel_id) {
-      await this.reply(message, "Failed to create Discord channel.");
+      await target.reply("Failed to create Discord channel.");
       return;
     }
 
@@ -2000,9 +2271,9 @@ export class DiscordBot extends EventEmitter {
 
     if (assignment) {
       await this.send(channel_id, `Session \`${search_name}\` resumed.`);
-      await this.reply(message, `Session **${search_name}** resumed in <#${channel_id}>.`);
+      await target.reply(`Session **${search_name}** resumed in <#${channel_id}>.`);
     } else {
-      await this.reply(message, `Room created but no pool bots available. Send a message in <#${channel_id}> to auto-assign.`);
+      await target.reply(`Room created but no pool bots available. Send a message in <#${channel_id}> to auto-assign.`);
     }
   }
 
@@ -2025,13 +2296,96 @@ export class DiscordBot extends EventEmitter {
     );
   }
 
-  private async reply(message: Message, content: string): Promise<void> {
-    try {
-      await message.reply(content);
-    } catch {
-      // If reply fails, try sending to channel directly
-      await this.send(message.channelId, content);
+  // ── Slash command handling ──
+
+  /** Handle an incoming slash command interaction. */
+  private async handle_slash_command(interaction: ChatInputCommandInteraction): Promise<void> {
+    const command_name = interaction.commandName;
+    const ephemeral = EPHEMERAL_COMMANDS.has(command_name);
+    const deferred = DEFERRED_COMMANDS.has(command_name);
+
+    // Long-running commands must defer within 3 seconds to avoid
+    // Discord's "This application did not respond" error.
+    if (deferred) {
+      try {
+        await interaction.deferReply({ ephemeral });
+      } catch (err) {
+        console.error(`[discord:slash] deferReply failed for /${command_name}: ${String(err)}`);
+        return; // Can't respond — Discord already timed out or errored
+      }
     }
+
+    const target = target_from_interaction(interaction, ephemeral, deferred);
+
+    // Build entity context from channel map
+    const entry = this.channel_map.get(interaction.channelId);
+    const routed: RoutedMessage = {
+      entity_id: entry?.entity_id ?? "_global",
+      channel_type: entry?.channel_type ?? "general",
+      content: "",
+      author: interaction.user.tag,
+      channel_id: interaction.channelId,
+      assigned_feature: entry?.assigned_feature,
+    };
+
+    // Extract args from interaction options, mapping to the same
+    // positional format that the text command handlers expect
+    const args = extract_slash_args(interaction);
+
+    try {
+      await this.handle_command(command_name, args, routed, target);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await target.reply(`Error: ${msg}`);
+    }
+  }
+
+  /** Handle autocomplete interactions (e.g., /resume name suggestions). */
+  private async handle_autocomplete(interaction: AutocompleteInteraction): Promise<void> {
+    if (interaction.commandName !== "resume") return;
+
+    const focused = interaction.options.getFocused();
+    const entry = this.channel_map.get(interaction.channelId);
+    if (!entry) {
+      await interaction.respond([]);
+      return;
+    }
+
+    try {
+      const archives = await load_room_archives(entry.entity_id, this.config.paths);
+      // Deduplicate by name, keep most recent
+      const name_map = new Map<string, RoomArchive>();
+      for (const a of archives) {
+        name_map.set(a.name, a);
+      }
+
+      const choices = [...name_map.values()]
+        .filter(a => a.name.toLowerCase().includes(focused.toLowerCase()))
+        .slice(0, 25) // Discord limit
+        .map(a => ({ name: a.name, value: a.name }));
+
+      await interaction.respond(choices);
+    } catch {
+      await interaction.respond([]);
+    }
+  }
+
+  /** Handle /reset — release current bot, next message triggers fresh assignment. */
+  private async handle_reset_command(_routed: RoutedMessage, target: CommandTarget): Promise<void> {
+    if (!this._pool) {
+      await target.reply("Bot pool not available.");
+      return;
+    }
+
+    const entry = this.channel_map.get(target.channel_id);
+    if (!entry) {
+      await target.reply("This channel isn't mapped to an entity.");
+      return;
+    }
+
+    this._pool.clear_session_history(entry.entity_id, target.channel_id);
+    await this._pool.release(target.channel_id);
+    await target.reply("Session reset. Send a message to start fresh.");
   }
 }
 
