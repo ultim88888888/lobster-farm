@@ -300,11 +300,14 @@ export class PRReviewCron {
       last_checked: new Date(),
     });
 
-    // Fetch linked issue context if PR body references one (Closes #N, Fixes #N)
+    // Fetch linked issue context from PR body (Closes/Fixes/Resolves #N) and title (#N)
     let issue_context = "";
-    const linked_issue = this.extract_linked_issue(pr.body);
-    if (linked_issue) {
-      issue_context = await this.fetch_issue_context(repo_path, linked_issue);
+    const linked_issues = this.extract_linked_issues(pr.body, pr.title);
+    if (linked_issues.length > 0) {
+      const contexts = await Promise.all(
+        linked_issues.map((n) => this.fetch_issue_context(repo_path, n)),
+      );
+      issue_context = contexts.filter(Boolean).join("\n\n---\n\n");
     }
 
     const prompt_lines = [
@@ -556,11 +559,26 @@ export class PRReviewCron {
     }
   }
 
-  /** Extract "Closes #N" or "Fixes #N" references from PR body. */
-  private extract_linked_issue(body: string | null): number | null {
-    if (!body) return null;
-    const match = body.match(/(?:closes|fixes|resolves)\s+#(\d+)/i);
-    return match ? parseInt(match[1]!, 10) : null;
+  /** Extract linked issue numbers from PR body (Closes/Fixes/Resolves #N) and title (#N). */
+  private extract_linked_issues(body: string | null, title: string | null): number[] {
+    const issues = new Set<number>();
+
+    // Parse "Closes #N", "Fixes #N", "Resolves #N" from body (all occurrences)
+    if (body) {
+      for (const match of body.matchAll(/(?:closes|fixes|resolves)\s+#(\d+)/gi)) {
+        issues.add(parseInt(match[1]!, 10));
+      }
+    }
+
+    // Parse "(#N)" from PR title
+    if (title) {
+      const title_match = title.match(/#(\d+)/);
+      if (title_match) {
+        issues.add(parseInt(title_match[1]!, 10));
+      }
+    }
+
+    return [...issues];
   }
 
   /** Fetch issue title + body via gh CLI for reviewer context. */
@@ -568,10 +586,16 @@ export class PRReviewCron {
     try {
       const { stdout } = await exec("gh", [
         "issue", "view", String(issue_number),
-        "--json", "title,body",
+        "--json", "title,body,number",
         "--jq", `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
       ], { cwd: repo_path, timeout: 15_000 });
-      return stdout.trim();
+      const result = stdout.trim();
+
+      // Truncate very long issue bodies to avoid blowing up reviewer context
+      if (result.length > 2000) {
+        return result.slice(0, 2000) + "\n\n[...truncated]";
+      }
+      return result;
     } catch (err) {
       console.log(`[pr-cron] Could not fetch issue #${String(issue_number)}: ${String(err)}`);
       return "";
