@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
+import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
 import { PRReviewCron } from "../pr-cron.js";
 
 // ── Helpers ──
@@ -270,6 +270,111 @@ describe("PRReviewCron.should_skip_pr", () => {
     const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
     expect(log_messages.some(m =>
       typeof m === "string" && m.includes("PR #42") && m.includes("already reviewed"),
+    )).toBe(true);
+  });
+});
+
+// ── Repo path validation ──
+
+// Mock persistence to avoid filesystem writes during test
+vi.mock("../persistence.js", () => ({
+  load_pr_reviews: vi.fn().mockResolvedValue({}),
+  save_pr_reviews: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Mock sentry to avoid real Sentry calls
+vi.mock("../sentry.js", () => ({
+  cronCheckInStart: vi.fn().mockReturnValue("test-checkin-id"),
+  cronCheckInFinish: vi.fn(),
+  captureException: vi.fn(),
+  addBreadcrumb: vi.fn(),
+}));
+
+// Mock actions to avoid real execFile calls
+vi.mock("../actions.js", () => ({
+  detect_review_outcome: vi.fn().mockResolvedValue("approved"),
+}));
+
+function make_entity_with_repo(repo_path: string): EntityConfig {
+  return EntityConfigSchema.parse({
+    entity: {
+      id: "test-entity",
+      name: "Test Entity",
+      status: "active",
+      repos: [
+        { name: "test", url: "git@github.com:test/test.git", path: repo_path },
+      ],
+      accounts: {},
+      channels: { category_id: "cat-1", list: [] },
+      memory: { path: "/tmp/memory" },
+      secrets: { vault: "1password", vault_name: "test" },
+    },
+  });
+}
+
+describe("PRReviewCron — repo path validation", () => {
+  let log_spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    log_spy.mockRestore();
+  });
+
+  it("skips repos with non-existent paths without calling gh", async () => {
+    const mock_registry = {
+      get_active: () => [make_entity_with_repo("/tmp/does-not-exist-xyz-9999")],
+      get: vi.fn(),
+    };
+
+    const cron = new PRReviewCron(
+      mock_registry as never,
+      { spawn: vi.fn(), on: vi.fn(), removeListener: vi.fn() } as never,
+      make_config(),
+      null,
+      null,
+    );
+
+    // Start the cron — this triggers an immediate poll
+    await cron.start(999_999_999); // Very long interval so only the immediate poll fires
+    cron.stop();
+
+    // Give the immediate poll a tick to execute
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
+    expect(log_messages.some(m =>
+      typeof m === "string" && m.includes("Repo path does not exist") && m.includes("test-entity"),
+    )).toBe(true);
+
+    // Should NOT have "Could not list PRs" — we should skip before calling gh
+    expect(log_messages.some(m =>
+      typeof m === "string" && m.includes("Could not list PRs"),
+    )).toBe(false);
+  });
+
+  it("resolves gh binary to absolute path on start", async () => {
+    const mock_registry = {
+      get_active: () => [],
+      get: vi.fn(),
+    };
+
+    const cron = new PRReviewCron(
+      mock_registry as never,
+      { spawn: vi.fn(), on: vi.fn(), removeListener: vi.fn() } as never,
+      make_config(),
+      null,
+      null,
+    );
+
+    await cron.start(999_999_999);
+    cron.stop();
+
+    const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
+    expect(log_messages.some(m =>
+      typeof m === "string" && m.includes("Resolved gh binary:"),
     )).toBe(true);
   });
 });

@@ -33,6 +33,22 @@ function default_binary_checker(name: string): boolean {
 }
 
 /**
+ * Resolve a binary name to its absolute path via `which`.
+ * Returns the absolute path if found, or the bare name as fallback
+ * so callers still work (relying on PATH at exec time).
+ *
+ * Useful for launchd environments where PATH in the parent process
+ * may not propagate correctly to child processes in all cases.
+ */
+export function resolve_binary(name: string): string {
+  try {
+    return execFileSync("which", [name], { encoding: "utf-8" }).trim();
+  } catch {
+    return name;
+  }
+}
+
+/**
  * Set a tmux global environment variable. Returns true on success.
  * Extracted for testability.
  */

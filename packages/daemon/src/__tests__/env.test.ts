@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { check_required_binaries, propagate_tmux_env } from "../env.js";
+import { check_required_binaries, propagate_tmux_env, resolve_binary } from "../env.js";
 
 describe("check_required_binaries", () => {
   let original_exit: typeof process.exit;
@@ -168,5 +168,26 @@ describe("propagate_tmux_env", () => {
     expect(log_spy).toHaveBeenCalledWith("[env] tmux server not running, will inherit daemon env");
 
     log_spy.mockRestore();
+  });
+});
+
+describe("resolve_binary", () => {
+  it("returns an absolute path for a known binary", () => {
+    // `node` is guaranteed to be present since tests are running under it
+    const result = resolve_binary("node");
+    expect(result).toMatch(/^\//);
+    expect(result).toContain("node");
+  });
+
+  it("returns the bare name when the binary does not exist", () => {
+    const result = resolve_binary("definitely-not-a-real-binary-xyz");
+    expect(result).toBe("definitely-not-a-real-binary-xyz");
+  });
+
+  it("resolves gh to an absolute path", () => {
+    // gh is a required binary for this daemon, so it should exist in CI/dev
+    const result = resolve_binary("gh");
+    expect(result).toMatch(/^\//);
+    expect(result).toContain("gh");
   });
 });

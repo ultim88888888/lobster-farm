@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { LobsterFarmConfig, EntityConfig, ArchetypeRole } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
@@ -17,6 +18,7 @@ import {
   close_linked_issues,
   nwo_from_url,
 } from "./issue-utils.js";
+import { resolve_binary } from "./env.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -77,6 +79,7 @@ export class PRReviewCron {
   private processed: PRReviewState = {}; // persisted to disk — tracks completed reviews
   private running = false;
   private interval_ms: number = DEFAULT_INTERVAL_MS;
+  private gh_bin: string = "gh"; // resolved to absolute path in start()
 
   constructor(
     private registry: EntityRegistry,
@@ -90,6 +93,11 @@ export class PRReviewCron {
   /** Start the polling cron. Loads persisted review state before first poll. */
   async start(interval_ms: number = DEFAULT_INTERVAL_MS): Promise<void> {
     if (this.timer) return;
+
+    // Resolve gh to absolute path once — prevents ENOENT in launchd environments
+    // where child processes may not inherit PATH correctly
+    this.gh_bin = resolve_binary("gh");
+    console.log(`[pr-cron] Resolved gh binary: ${this.gh_bin}`);
 
     // Load persisted review state so we don't re-review after restart
     this.processed = await load_pr_reviews(this.config);
@@ -170,13 +178,22 @@ export class PRReviewCron {
     repo_path: string,
     entity_config: EntityConfig,
   ): Promise<void> {
+    // Verify repo path exists before shelling out — avoids confusing ENOENT
+    // errors for entities with stale or placeholder paths (e.g. alpha → /tmp/test-repo)
+    try {
+      await stat(repo_path);
+    } catch {
+      console.log(`[pr-cron] Repo path does not exist for ${entity_id}: ${repo_path} — skipping`);
+      return;
+    }
+
     let prs: OpenPR[];
     try {
-      const { stdout } = await exec("gh", [
+      const { stdout } = await exec(this.gh_bin, [
         "pr", "list",
         "--state", "open",
         "--json", "number,title,headRefName,updatedAt,url,body,author",
-      ], { cwd: repo_path, timeout: 30_000 });
+      ], { cwd: repo_path, env: process.env, timeout: 30_000 });
 
       prs = JSON.parse(stdout) as OpenPR[];
     } catch (err) {
@@ -298,10 +315,10 @@ export class PRReviewCron {
     pr_number: number,
   ): Promise<PRFeedbackData | null> {
     try {
-      const { stdout } = await exec("gh", [
+      const { stdout } = await exec(this.gh_bin, [
         "pr", "view", String(pr_number),
         "--json", "reviews,comments,commits",
-      ], { cwd: repo_path, timeout: 15_000 });
+      ], { cwd: repo_path, env: process.env, timeout: 15_000 });
 
       return JSON.parse(stdout) as PRFeedbackData;
     } catch {
@@ -604,11 +621,11 @@ export class PRReviewCron {
   /** Check if a PR has been merged. */
   private async check_pr_merged(repo_path: string, pr_number: number): Promise<boolean> {
     try {
-      const { stdout } = await exec("gh", [
+      const { stdout } = await exec(this.gh_bin, [
         "pr", "view", String(pr_number),
         "--json", "state",
         "--jq", ".state",
-      ], { cwd: repo_path, timeout: 15_000 });
+      ], { cwd: repo_path, env: process.env, timeout: 15_000 });
       return stdout.trim() === "MERGED";
     } catch {
       return false;
