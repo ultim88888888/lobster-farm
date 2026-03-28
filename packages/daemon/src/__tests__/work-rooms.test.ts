@@ -82,7 +82,7 @@ function make_mock_discord() {
     send_to_entity: vi.fn().mockResolvedValue(undefined),
     set_channel_topic: vi.fn().mockResolvedValue(undefined),
     create_channel: vi.fn().mockResolvedValue("dynamic-wr-4"),
-    delete_channel: vi.fn().mockResolvedValue(undefined),
+    delete_channel: vi.fn().mockResolvedValue(true),
     build_channel_map: vi.fn(),
     is_connected: vi.fn().mockReturnValue(true),
   };

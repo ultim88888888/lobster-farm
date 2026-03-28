@@ -518,7 +518,11 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   }
 
   // Delete Discord channel
-  await ctx.discord.delete_channel(params.channel_id);
+  const deleted = await ctx.discord.delete_channel(params.channel_id);
+  if (!deleted) {
+    json_response(res, 502, { error: "Failed to delete Discord channel" });
+    return;
+  }
 
   // Remove from entity config
   entity.entity.channels.list = entity.entity.channels.list.filter(c => c.id !== params.channel_id);
