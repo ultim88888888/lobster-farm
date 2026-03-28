@@ -27,7 +27,7 @@ import {
   expand_home,
   write_yaml,
 } from "@lobster-farm/shared";
-import { access, mkdir, writeFile, readFile, readdir, rename } from "node:fs/promises";
+import { access, mkdir, writeFile, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
@@ -1963,6 +1963,10 @@ export class DiscordBot extends EventEmitter {
       "work_room",
     );
 
+    // Consume the archive file now that the room is live again.
+    // Failure to delete is non-fatal — log and move on.
+    await delete_room_archive(routed.entity_id, archive, this.config.paths);
+
     if (assignment) {
       await this.send(channel_id, `Session \`${search_name}\` resumed.`);
       await this.reply(message, `Session **${search_name}** resumed in <#${channel_id}>.`);
@@ -2044,6 +2048,26 @@ export async function write_room_archive(
   await rename(tmp_path, filepath);
 
   console.log(`[discord] Archived room ${archive.name} to ${filepath}`);
+}
+
+/** Delete a specific archive file. Returns true if deleted, false on error. */
+export async function delete_room_archive(
+  entity_id: string,
+  archive: RoomArchive,
+  paths?: Record<string, string>,
+): Promise<boolean> {
+  const archives_dir = join(entity_dir(paths, entity_id), "archives");
+  const timestamp = archive.closed_at.replace(/[:.]/g, "-");
+  const filename = `${archive.name}-${timestamp}.json`;
+  const filepath = join(archives_dir, filename);
+  try {
+    await unlink(filepath);
+    console.log(`[discord] Deleted consumed archive: ${filepath}`);
+    return true;
+  } catch (err) {
+    console.warn(`[discord] Failed to delete archive ${filepath}: ${err}`);
+    return false;
+  }
 }
 
 /** Load all room archives for an entity, sorted by closed_at ascending. */

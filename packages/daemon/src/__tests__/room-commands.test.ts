@@ -6,6 +6,7 @@ import {
   sanitize_channel_name,
   write_room_archive,
   load_room_archives,
+  delete_room_archive,
   type RoomArchive,
 } from "../discord.js";
 
@@ -195,5 +196,55 @@ describe("Room archive I/O", () => {
     // Sorted by closed_at
     expect(auth_archives[0]!.session_id).toBe("sess-1");
     expect(auth_archives[1]!.session_id).toBe("sess-2");
+  });
+
+  // ── delete_room_archive ──
+
+  it("deletes the specified archive file", async () => {
+    const paths = { lobsterfarm_dir: temp_dir };
+    const archive = make_archive();
+
+    await write_room_archive("alpha", archive, paths);
+    expect(await load_room_archives("alpha", paths)).toHaveLength(1);
+
+    const result = await delete_room_archive("alpha", archive, paths);
+    expect(result).toBe(true);
+    expect(await load_room_archives("alpha", paths)).toHaveLength(0);
+  });
+
+  it("deletes only the targeted archive, preserving others", async () => {
+    const paths = { lobsterfarm_dir: temp_dir };
+
+    const older = make_archive({
+      name: "test-room",
+      closed_at: "2026-03-28T01:00:00Z",
+      session_id: "sess-old",
+    });
+    const newer = make_archive({
+      name: "test-room",
+      closed_at: "2026-03-28T04:00:00Z",
+      session_id: "sess-new",
+    });
+
+    await write_room_archive("alpha", older, paths);
+    await write_room_archive("alpha", newer, paths);
+    expect(await load_room_archives("alpha", paths)).toHaveLength(2);
+
+    // Delete only the newer one (simulating resume consuming most recent)
+    const result = await delete_room_archive("alpha", newer, paths);
+    expect(result).toBe(true);
+
+    const remaining = await load_room_archives("alpha", paths);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.session_id).toBe("sess-old");
+  });
+
+  it("returns false and does not throw when archive file is already gone", async () => {
+    const paths = { lobsterfarm_dir: temp_dir };
+    const archive = make_archive();
+
+    // Never written — file does not exist
+    const result = await delete_room_archive("alpha", archive, paths);
+    expect(result).toBe(false);
   });
 });
