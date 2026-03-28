@@ -11,6 +11,8 @@ import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
 import type { ArchetypeRole } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
+import type { GitHubAppAuth } from "./github-app.js";
+import { handle_github_webhook, type WebhookContext } from "./webhook-handler.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -21,6 +23,7 @@ interface ServerContext {
   commander: CommanderProcess | null;
   discord: DiscordBot | null;
   pool: BotPool | null;
+  github_app: GitHubAppAuth | null;
 }
 
 type RouteHandler = (
@@ -80,6 +83,7 @@ const handle_status: RouteHandler = (_req, res, ctx) => {
     },
     queue: queue_stats,
     commander: ctx.commander?.health_check() ?? { state: "not_configured" },
+    github_app: ctx.github_app ? "configured" : "not_configured",
   });
 };
 
@@ -110,10 +114,24 @@ const handle_entity_detail: RouteHandler = (req, res, ctx) => {
   json_response(res, 200, entity);
 };
 
-const handle_webhook_github: RouteHandler = async (req, res) => {
-  const body = await read_body(req);
-  console.log("GitHub webhook received:", body.slice(0, 200));
-  json_response(res, 200, { ok: true });
+const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.github_app) {
+    // Fallback when GitHub App is not configured — log and accept
+    const body = await read_body(req);
+    console.log("[webhook] GitHub webhook received but App not configured:", body.slice(0, 200));
+    json_response(res, 200, { ok: true, warning: "GitHub App not configured" });
+    return;
+  }
+
+  const webhook_ctx: WebhookContext = {
+    github_app: ctx.github_app,
+    session_manager: ctx.session_manager,
+    registry: ctx.registry,
+    feature_manager: ctx.features,
+    discord: ctx.discord,
+  };
+
+  await handle_github_webhook(req, res, webhook_ctx);
 };
 
 const handle_webhook_sentry: RouteHandler = async (req, res) => {
@@ -592,9 +610,10 @@ export function start_server(
   commander: CommanderProcess | null = null,
   discord: DiscordBot | null = null,
   pool: BotPool | null = null,
+  github_app: GitHubAppAuth | null = null,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander, discord, pool };
+  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander, discord, pool, github_app };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);

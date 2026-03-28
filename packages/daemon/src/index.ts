@@ -12,6 +12,7 @@ import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
+import { init_github_app_from_env } from "./github-app.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import type { Phase } from "@lobster-farm/shared";
 import { append_session_log } from "./persistence.js";
@@ -229,18 +230,28 @@ async function main(): Promise<void> {
     console.log("[commander] Add token to ~/.lobsterfarm/channels/pat/.env and restart.");
   }
 
-  // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null, pool);
+  // Initialize GitHub App auth (optional — graceful if not configured)
+  const github_app = init_github_app_from_env();
+  if (github_app) {
+    console.log("[github-app] Webhook-driven PR reviews enabled");
+  } else {
+    console.log("[github-app] Not configured — webhook endpoint will accept but not process events");
+  }
 
-  // Start PR review cron
+  // Start HTTP server
+  const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null, pool, github_app);
+
+  // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
+  const cron_interval_ms = github_app ? 30 * 60 * 1000 : 5 * 60 * 1000;
   const pr_cron = new PRReviewCron(
     registry,
     session_manager,
     config,
     discord_connected ? discord : null,
     feature_manager,
+    github_app,
   );
-  await pr_cron.start();
+  await pr_cron.start(cron_interval_ms);
 
   // Write PID file
   await write_pid(config);

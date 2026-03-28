@@ -6,6 +6,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import type { FeatureManager } from "./features.js";
+import type { GitHubAppAuth } from "./github-app.js";
 import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
@@ -74,6 +75,7 @@ export class PRReviewCron {
     private config: LobsterFarmConfig,
     private discord: DiscordBot | null = null,
     private feature_manager: FeatureManager | null = null,
+    private github_app: GitHubAppAuth | null = null,
   ) {}
 
   /** Start the polling cron. Loads persisted review state before first poll. */
@@ -312,6 +314,18 @@ export class PRReviewCron {
 
     console.log(`[pr-cron] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
 
+    // Inject GitHub App token if available — gives reviewer its own identity
+    let spawn_env: Record<string, string> | undefined;
+    if (this.github_app) {
+      try {
+        const gh_token = await this.github_app.get_token();
+        spawn_env = { GH_TOKEN: gh_token };
+      } catch (err) {
+        console.error(`[pr-cron] Failed to get GitHub App token: ${String(err)}`);
+        // Continue without app token — reviewer will use default gh auth
+      }
+    }
+
     try {
       const session = await this.session_manager.spawn({
         entity_id,
@@ -322,6 +336,7 @@ export class PRReviewCron {
         worktree_path: repo_path,
         prompt,
         interactive: false,
+        env: spawn_env,
       });
 
       console.log(`[pr-cron] Reviewer session ${session.session_id.slice(0, 8)} started for PR #${String(pr.number)}`);
@@ -465,6 +480,17 @@ export class PRReviewCron {
 
     console.log(`[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`);
 
+    // Inject GitHub App token if available
+    let fix_env: Record<string, string> | undefined;
+    if (this.github_app) {
+      try {
+        const gh_token = await this.github_app.get_token();
+        fix_env = { GH_TOKEN: gh_token };
+      } catch (err) {
+        console.error(`[pr-cron] Failed to get GitHub App token for fixer: ${String(err)}`);
+      }
+    }
+
     try {
       await this.session_manager.spawn({
         entity_id,
@@ -475,6 +501,7 @@ export class PRReviewCron {
         worktree_path: repo_path,
         prompt,
         interactive: false,
+        env: fix_env,
       });
     } catch (err) {
       console.error(`[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`);

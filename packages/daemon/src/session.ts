@@ -28,6 +28,8 @@ export interface SessionSpawnOptions {
   interactive: boolean;
   /** If set, resume this prior session instead of starting fresh. */
   resume_session_id?: string;
+  /** Extra environment variables to inject into the subprocess (e.g. GH_TOKEN). */
+  env?: Record<string, string>;
 }
 
 export interface ActiveSession {
@@ -249,7 +251,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     const proc = spawn(command, args, {
       cwd: options.worktree_path,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      env: { ...process.env, ...options.env },
     });
 
     // Write prompt to stdin and close it
