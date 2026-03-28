@@ -546,7 +546,7 @@ export class FeatureManager extends EventEmitter {
         // Notify alerts about the bounce
         await actions.notify_feature(
           feature,
-          `Review bounced ${feature.id} back to build -- changes requested on PR #${String(feature.prNumber)}`,
+          `PR #${String(feature.prNumber)}: ${feature.title} — changes requested, bouncing back to build`,
           entity,
           { also_alerts: true },
         );
