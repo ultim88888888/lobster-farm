@@ -252,7 +252,10 @@ export class BotPool extends EventEmitter {
       }
 
       if (bot.state === "assigned") {
-        // tmux is still running (survived restart, e.g. launchd) — restore metadata
+        // tmux is still running (survived restart, e.g. launchd) — restore metadata.
+        // BUT the Claude process inside has a stale MCP connection to the old daemon.
+        // We mark it as a resume candidate so resume_parked_bots() will kill the old
+        // tmux and spawn a fresh Claude process with --resume (fresh MCP connection).
         bot.channel_id = entry.channel_id;
         bot.entity_id = entry.entity_id;
         bot.archetype = entry.archetype;
@@ -260,6 +263,16 @@ export class BotPool extends EventEmitter {
         bot.session_id = entry.session_id;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
+
+        // Add to resume candidates — the live tmux session has a dead MCP socket.
+        // resume_parked_bots() will kill it and spawn fresh with --resume.
+        if (entry.state === "assigned" && entry.session_id) {
+          this.resume_candidates.push(entry);
+          console.log(
+            `[pool] pool-${String(bot.id)} has live tmux but stale MCP — ` +
+            `queued for fresh resume (session: ${entry.session_id.slice(0, 8)})`,
+          );
+        }
       } else {
         // tmux is dead — mark as parked with preserved session ID.
         // When someone messages the channel, existing parked-bot auto-resume
@@ -355,27 +368,51 @@ export class BotPool extends EventEmitter {
 
     let resumed = 0;
     for (const candidate of this.resume_candidates) {
+      // Match both parked bots (tmux died) and assigned bots (tmux survived but
+      // has stale MCP connection). Both need a fresh Claude process with --resume.
       const bot = this.bots.find(
-        b => b.id === candidate.id && b.state === "parked" && b.channel_id === candidate.channel_id,
+        b => b.id === candidate.id
+          && (b.state === "parked" || b.state === "assigned")
+          && b.channel_id === candidate.channel_id,
       );
       if (!bot) continue;
 
+      const had_live_tmux = bot.state === "assigned";
+
       try {
+        // Kill any surviving tmux session — the Claude process inside has a stale
+        // MCP connection to the old daemon and can't reply through Discord.
+        // This is safe even if the tmux session is already dead.
+        if (had_live_tmux) {
+          console.log(
+            `[pool] Killing stale tmux for pool-${String(bot.id)} ` +
+            `(MCP connection is dead after daemon restart)`,
+          );
+        }
+        this.kill_tmux(bot.tmux_session);
+
         // Write access.json so the Discord plugin listens on this channel
         await this.write_access_json(bot.state_dir, candidate.channel_id);
 
         // Set Discord nickname to match the archetype
         await this.set_bot_nickname(bot, candidate.archetype);
 
-        // Start tmux with --resume to restore the previous session
+        // Spawn a fresh Claude process with --resume — establishes a new MCP
+        // connection to this daemon while preserving conversation context
         const working_dir = entity_dir(this.config.paths, candidate.entity_id);
         await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!, true);
 
         // Update bot state to assigned
         bot.state = "assigned";
         bot.last_active = new Date();
+        bot.assigned_at = new Date(); // Reset uptime — new process
 
         resumed++;
+        console.log(
+          `[pool] Resumed pool-${String(bot.id)} with fresh MCP connection ` +
+          `(session: ${candidate.session_id!.slice(0, 8)}, ` +
+          `was: ${had_live_tmux ? "stale tmux" : "parked"})`,
+        );
 
         this.emit("bot:resumed", {
           bot_id: bot.id,
@@ -386,7 +423,8 @@ export class BotPool extends EventEmitter {
         console.error(
           `[pool] Failed to resume pool-${String(bot.id)}: ${String(err)}`,
         );
-        // Leave the bot parked — it can still be resumed on next message
+        // Leave the bot in its current state — parked bots can still be resumed
+        // on next message; assigned bots with dead tmux will be caught by health monitor
       }
     }
 

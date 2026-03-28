@@ -1100,6 +1100,133 @@ describe("BotPool persistence", () => {
       expect(events).toHaveLength(0);
     });
 
+    it("kills stale tmux and respawns when tmux survived daemon restart", async () => {
+      // This is the core fix for #112: when the daemon restarts and the old tmux
+      // session survives, the Claude process inside has a dead MCP connection.
+      // The resume path must kill the old tmux and spawn fresh with --resume.
+      const cfg = make_config();
+      await save_pool_state([
+        make_persisted_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "test-entity",
+          archetype: "builder",
+          session_id: "sess-stale",
+        }),
+      ], cfg);
+
+      const dir = join(temp_dir, "channels", "pool-1");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token-1", "utf-8");
+
+      const p = new TestBotPool(cfg);
+      // tmux IS alive — the old session survived the restart
+      vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(true);
+      const kill_spy = vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      const start_spy = vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
+        .mockResolvedValue(undefined);
+
+      const reg = make_registry([
+        make_entity_config("test-entity", ["ch-1"]),
+      ]);
+      await p.initialize(reg);
+
+      // Bot is "assigned" because tmux is alive, but should be queued for resume
+      const bots_before = p.get_bots();
+      expect(bots_before[0]!.state).toBe("assigned");
+      expect(p.get_resume_candidates()).toHaveLength(1);
+
+      const events: Array<{ bot_id: number; channel_id: string; entity_id: string }> = [];
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) => events.push(evt));
+
+      await p.resume_parked_bots();
+
+      // Old tmux was killed
+      expect(kill_spy).toHaveBeenCalledWith("pool-1");
+
+      // Fresh tmux was spawned with --resume session_id
+      const start_calls = (start_spy as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+      const resume_call = start_calls.find(c => c[4] === "sess-stale");
+      expect(resume_call).toBeDefined();
+      expect(resume_call![5]).toBe(true); // is_resume = true
+
+      // Bot is still assigned with correct metadata
+      const bots_after = p.get_bots();
+      const bot = bots_after.find(b => b.id === 1)!;
+      expect(bot.state).toBe("assigned");
+      expect(bot.channel_id).toBe("ch-1");
+      expect(bot.session_id).toBe("sess-stale");
+
+      // assigned_at was reset (new process)
+      expect(bot.assigned_at).not.toBeNull();
+      const now = Date.now();
+      expect(now - bot.assigned_at!.getTime()).toBeLessThan(5000);
+
+      // Event emitted
+      expect(events).toHaveLength(1);
+      expect(events[0]!.bot_id).toBe(1);
+
+      // Candidates cleared
+      expect(p.get_resume_candidates()).toHaveLength(0);
+    });
+
+    it("handles gracefully when tmux is already dead by resume time", async () => {
+      // Edge case: tmux was alive during initialize() but died before
+      // resume_parked_bots() runs. kill_tmux is a no-op, spawn still works.
+      const cfg = make_config();
+      await save_pool_state([
+        make_persisted_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "test-entity",
+          archetype: "planner",
+          session_id: "sess-died",
+        }),
+      ], cfg);
+
+      const dir = join(temp_dir, "channels", "pool-1");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token-1", "utf-8");
+
+      const p = new TestBotPool(cfg);
+      // tmux alive during init, so bot gets "assigned" state
+      const tmux_spy = vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(true);
+      vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
+        .mockResolvedValue(undefined);
+
+      const reg = make_registry([
+        make_entity_config("test-entity", ["ch-1"]),
+      ]);
+      await p.initialize(reg);
+
+      expect(p.get_resume_candidates()).toHaveLength(1);
+
+      // Simulate tmux dying between init and resume
+      tmux_spy.mockReturnValue(false);
+
+      // Should still succeed — kill_tmux is a no-op, start_tmux spawns fresh
+      await p.resume_parked_bots();
+
+      const bots = p.get_bots();
+      expect(bots[0]!.state).toBe("assigned");
+      expect(bots[0]!.session_id).toBe("sess-died");
+    });
+
     it("existing assign-on-message flow still works for non-resumed parked bots", async () => {
       const p = await setup_resume_pool(
         [
