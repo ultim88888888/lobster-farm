@@ -28,6 +28,9 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     effort: null,
     last_avatar_archetype: null,
     last_avatar_set_at: null,
+    cached_context: null,
+    cached_subscription: null,
+    cache_updated_at: null,
     ...overrides,
   };
 }
