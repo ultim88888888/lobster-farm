@@ -20,6 +20,7 @@ interface OpenPR {
   headRefName: string;
   updatedAt: string;
   url: string;
+  author: { login: string };
 }
 
 interface ActiveReview {
@@ -118,7 +119,7 @@ export class PRReviewCron {
       const { stdout } = await exec("gh", [
         "pr", "list",
         "--state", "open",
-        "--json", "number,title,headRefName,updatedAt,url",
+        "--json", "number,title,headRefName,updatedAt,url,author",
       ], { cwd: repo_path, timeout: 30_000 });
 
       prs = JSON.parse(stdout) as OpenPR[];
@@ -306,26 +307,42 @@ export class PRReviewCron {
       return;
     }
 
-    // External PR — no tracked feature
+    // Non-feature PR — determine if internal (our agents) or truly external
+    const entity_config = this.registry.get(entity_id);
+    const github_user = entity_config?.entity.accounts?.github?.user;
+    const is_internal = github_user != null && pr.author.login === github_user;
+
     if (review_state === "changes_requested") {
       await this.spawn_external_pr_fixer(entity_id, repo_path, pr);
-      await this.notify_alerts(
-        entity_id,
-        `External PR #${String(pr.number)}: ${pr.title} — needs changes, spawning builder to fix`,
-      );
+      if (is_internal) {
+        await this.notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — needs changes, spawning builder to fix`,
+        );
+      } else {
+        await this.notify_alerts(
+          entity_id,
+          `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — needs changes, spawning builder to fix`,
+        );
+      }
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
       const is_merged = await this.check_pr_merged(repo_path, pr.number);
-      if (is_merged) {
+      if (is_internal) {
         await this.notify_alerts(
           entity_id,
-          `External PR #${String(pr.number)}: ${pr.title} — approved and merged to main`,
+          `PR #${String(pr.number)}: ${pr.title} — ${is_merged ? "approved and merged to main" : "approved, awaiting merge"}`,
+        );
+      } else if (is_merged) {
+        await this.notify_alerts(
+          entity_id,
+          `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved and merged to main`,
         );
       } else {
-        // Not yet merged — escalate to human
+        // External, not yet merged — escalate to human
         await this.notify_alerts(
           entity_id,
-          `External PR #${String(pr.number)}: ${pr.title} — approved, awaiting human merge`,
+          `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved, awaiting human merge`,
         );
       }
     } else {
