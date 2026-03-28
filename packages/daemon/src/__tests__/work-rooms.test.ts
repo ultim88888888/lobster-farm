@@ -62,15 +62,21 @@ function make_feature(overrides: Partial<FeatureState> = {}): FeatureState {
   };
 }
 
-function make_static_work_rooms(): ChannelMapping[] {
-  return [
+/** Create channel list with N static work rooms (default 0 — dynamic-only).
+ * Also includes general and alerts. */
+function make_static_work_rooms(count = 0): ChannelMapping[] {
+  const channels: ChannelMapping[] = [
     { type: "general", id: "gen-1" },
-    { type: "work_room", id: "wr-1", purpose: "Work room 1" },
-    { type: "work_room", id: "wr-2", purpose: "Work room 2" },
-    { type: "work_room", id: "wr-3", purpose: "Work room 3" },
-    { type: "work_log", id: "wl-1" },
-    { type: "alerts", id: "al-1" },
   ];
+  for (let i = 1; i <= count; i++) {
+    channels.push({
+      type: "work_room",
+      id: `wr-${String(i)}`,
+      purpose: `Work room ${String(i)}`,
+    });
+  }
+  channels.push({ type: "alerts", id: "al-1" });
+  return channels;
 }
 
 // ── Mock Discord Bot ──
@@ -130,7 +136,7 @@ describe("Work Room Assignment", () => {
   describe("assign_work_room", () => {
     it("assigns a free static room when one is available", async () => {
       const feature = make_feature();
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
 
@@ -149,7 +155,7 @@ describe("Work Room Assignment", () => {
         discordWorkRoom: "wr-1",
         phase: "build",
       });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([existing_feature]));
 
@@ -164,7 +170,7 @@ describe("Work Room Assignment", () => {
         make_feature({ id: "alpha-10", discordWorkRoom: "wr-1", phase: "build" }),
         make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "review" }),
       ];
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager(features));
 
@@ -180,7 +186,7 @@ describe("Work Room Assignment", () => {
         make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "review" }),
         make_feature({ id: "alpha-12", discordWorkRoom: "wr-3", phase: "build" }),
       ];
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager(features));
 
@@ -201,7 +207,7 @@ describe("Work Room Assignment", () => {
         make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "build" }),
         make_feature({ id: "alpha-12", discordWorkRoom: "wr-3", phase: "build" }),
       ];
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager(features));
 
@@ -222,7 +228,7 @@ describe("Work Room Assignment", () => {
         discordWorkRoom: "wr-1",
         phase: "done",
       });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([done_feature]));
 
@@ -233,7 +239,7 @@ describe("Work Room Assignment", () => {
 
     it("sets channel topic with title on assignment", async () => {
       const feature = make_feature();
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
 
@@ -248,7 +254,7 @@ describe("Work Room Assignment", () => {
     it("truncates long title in channel topic on assignment", async () => {
       const long_title = "A".repeat(80);
       const feature = make_feature({ title: long_title });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
 
@@ -263,7 +269,7 @@ describe("Work Room Assignment", () => {
 
     it("rebuilds channel map after assignment", async () => {
       const feature = make_feature();
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
 
@@ -279,7 +285,7 @@ describe("Work Room Assignment", () => {
         make_feature({ id: "alpha-11", discordWorkRoom: "wr-2", phase: "build" }),
         make_feature({ id: "alpha-12", discordWorkRoom: "wr-3", phase: "build" }),
       ];
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager(features));
       actions.set_discord_bot(null);
@@ -291,7 +297,7 @@ describe("Work Room Assignment", () => {
 
     it("skips rooms with active pool bot assignments", async () => {
       const feature = make_feature({ id: "alpha-42" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
       // Pool has a bot assigned to wr-1 (e.g., manual planner session)
@@ -310,7 +316,7 @@ describe("Work Room Assignment", () => {
         discordWorkRoom: "wr-1",
         phase: "build",
       });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([existing_feature]));
       // Pool has a bot in wr-2 (manual session), feature occupies wr-1
@@ -324,7 +330,7 @@ describe("Work Room Assignment", () => {
 
     it("creates dynamic room when all static rooms are pool-assigned", async () => {
       const feature = make_feature({ id: "alpha-42" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
       // All three rooms have pool bots
@@ -347,7 +353,7 @@ describe("Work Room Assignment", () => {
 
     it("does not check non-work-room channels for pool assignments", async () => {
       const feature = make_feature({ id: "alpha-42" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
       // Pool has a bot in the general channel — should not affect work room assignment
@@ -365,7 +371,7 @@ describe("Work Room Assignment", () => {
 
     it("does not block rooms when pool is null", async () => {
       const feature = make_feature({ id: "alpha-42" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
       // @ts-expect-error — mock feature manager
       actions.set_feature_manager(make_mock_feature_manager([]));
       actions.set_pool(null);
@@ -376,10 +382,54 @@ describe("Work Room Assignment", () => {
     });
   });
 
+  describe("assign_work_room — 0 static rooms (dynamic-only)", () => {
+    it("creates a dynamic room when no static rooms exist", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms(0));
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      expect(room_id).toBe("dynamic-wr-4");
+      expect(discord.create_channel).toHaveBeenCalledWith(
+        "cat-123",
+        "work-room-1",
+        "Overflow for alpha-42",
+      );
+    });
+
+    it("tags dynamic room with dynamic: true when no static rooms exist", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms(0));
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+
+      await actions.assign_work_room(feature, entity);
+
+      const dynamic_entry = entity.entity.channels.list.find(c => c.id === "dynamic-wr-4");
+      expect(dynamic_entry).toBeDefined();
+      expect(dynamic_entry?.dynamic).toBe(true);
+      expect(dynamic_entry?.type).toBe("work_room");
+    });
+
+    it("returns null when no discord bot and no static rooms", async () => {
+      const feature = make_feature({ id: "alpha-42" });
+      const entity = make_entity_config(make_static_work_rooms(0));
+      // @ts-expect-error — mock feature manager
+      actions.set_feature_manager(make_mock_feature_manager([]));
+      actions.set_discord_bot(null);
+
+      const room_id = await actions.assign_work_room(feature, entity);
+
+      expect(room_id).toBeNull();
+    });
+  });
+
   describe("release_work_room", () => {
     it("resets static room topic to Available", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const channels = make_static_work_rooms();
+      const channels = make_static_work_rooms(3);
       channels[1]!.assigned_feature = "alpha-42";
       const entity = make_entity_config(channels);
 
@@ -390,7 +440,7 @@ describe("Work Room Assignment", () => {
 
     it("clears assigned_feature on static room", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const channels = make_static_work_rooms();
+      const channels = make_static_work_rooms(3);
       channels[1]!.assigned_feature = "alpha-42";
       const entity = make_entity_config(channels);
 
@@ -402,7 +452,7 @@ describe("Work Room Assignment", () => {
 
     it("sends farewell message in static room", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
 
@@ -414,7 +464,7 @@ describe("Work Room Assignment", () => {
 
     it("deletes dynamic room", async () => {
       const feature = make_feature({ discordWorkRoom: "dynamic-wr-4" });
-      const channels = make_static_work_rooms();
+      const channels = make_static_work_rooms(3);
       channels.push({
         type: "work_room",
         id: "dynamic-wr-4",
@@ -431,7 +481,7 @@ describe("Work Room Assignment", () => {
 
     it("removes dynamic room from entity config", async () => {
       const feature = make_feature({ discordWorkRoom: "dynamic-wr-4" });
-      const channels = make_static_work_rooms();
+      const channels = make_static_work_rooms(3);
       channels.push({
         type: "work_room",
         id: "dynamic-wr-4",
@@ -449,7 +499,7 @@ describe("Work Room Assignment", () => {
 
     it("sends farewell message before deleting dynamic room", async () => {
       const feature = make_feature({ discordWorkRoom: "dynamic-wr-4" });
-      const channels = make_static_work_rooms();
+      const channels = make_static_work_rooms(3);
       channels.push({
         type: "work_room",
         id: "dynamic-wr-4",
@@ -468,7 +518,7 @@ describe("Work Room Assignment", () => {
 
     it("rebuilds channel map after release", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
 
@@ -477,7 +527,7 @@ describe("Work Room Assignment", () => {
 
     it("is a no-op when feature has no work room", async () => {
       const feature = make_feature({ discordWorkRoom: null });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
 
@@ -488,7 +538,7 @@ describe("Work Room Assignment", () => {
 
     it("does not keep static room in list after release", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-2" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.release_work_room(feature, entity);
 
@@ -523,7 +573,7 @@ describe("Notification Routing", () => {
 
     it("does not send to Discord when no work room assigned (no work_log fallback)", async () => {
       const feature = make_feature({ discordWorkRoom: null, activeArchetype: null });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Build started", entity);
 
@@ -534,7 +584,7 @@ describe("Notification Routing", () => {
 
     it("also sends to alerts when also_alerts is true", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Awaiting approval", entity, { also_alerts: true });
 
@@ -548,7 +598,7 @@ describe("Notification Routing", () => {
 
     it("also sends to general when also_general is true", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Shipped!", entity, { also_general: true });
 
@@ -562,7 +612,7 @@ describe("Notification Routing", () => {
 
     it("sends to both alerts and general when both options are true", async () => {
       const feature = make_feature({ discordWorkRoom: "wr-1" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Urgent!", entity, {
         also_alerts: true,
@@ -586,7 +636,7 @@ describe("Notification Routing", () => {
 
     it("still sends to alerts when no work room but also_alerts is true", async () => {
       const feature = make_feature({ discordWorkRoom: null, activeArchetype: "builder" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Blocked!", entity, { also_alerts: true });
 
@@ -600,7 +650,7 @@ describe("Notification Routing", () => {
 
     it("still sends to general when no work room but also_general is true", async () => {
       const feature = make_feature({ discordWorkRoom: null, activeArchetype: "builder" });
-      const entity = make_entity_config(make_static_work_rooms());
+      const entity = make_entity_config(make_static_work_rooms(3));
 
       await actions.notify_feature(feature, "Shipped!", entity, { also_general: true });
 
@@ -679,7 +729,7 @@ describe("Startup Topic Reset", () => {
     // @ts-expect-error — mock feature manager
     actions.set_feature_manager(make_mock_feature_manager([]));
 
-    const entity = make_entity_config(make_static_work_rooms());
+    const entity = make_entity_config(make_static_work_rooms(3));
     const registry = {
       get_active: vi.fn().mockReturnValue([entity]),
     };
@@ -703,7 +753,7 @@ describe("Startup Topic Reset", () => {
     // @ts-expect-error — mock feature manager
     actions.set_feature_manager(make_mock_feature_manager([active_feature]));
 
-    const entity = make_entity_config(make_static_work_rooms());
+    const entity = make_entity_config(make_static_work_rooms(3));
     const registry = {
       get_active: vi.fn().mockReturnValue([entity]),
     };
@@ -728,7 +778,7 @@ describe("Startup Topic Reset", () => {
     // @ts-expect-error — mock feature manager
     actions.set_feature_manager(make_mock_feature_manager([review_feature]));
 
-    const entity = make_entity_config(make_static_work_rooms());
+    const entity = make_entity_config(make_static_work_rooms(3));
     const registry = {
       get_active: vi.fn().mockReturnValue([entity]),
     };
@@ -752,7 +802,7 @@ describe("Startup Topic Reset", () => {
     // @ts-expect-error — mock feature manager
     actions.set_feature_manager(make_mock_feature_manager([done_feature]));
 
-    const entity = make_entity_config(make_static_work_rooms());
+    const entity = make_entity_config(make_static_work_rooms(3));
     const registry = {
       get_active: vi.fn().mockReturnValue([entity]),
     };
@@ -799,7 +849,7 @@ describe("Startup Topic Reset", () => {
     // @ts-expect-error — mock feature manager
     actions.set_feature_manager(make_mock_feature_manager([]));
 
-    const entity = make_entity_config(make_static_work_rooms());
+    const entity = make_entity_config(make_static_work_rooms(3));
     const registry = {
       get_active: vi.fn().mockReturnValue([entity]),
     };
@@ -807,10 +857,25 @@ describe("Startup Topic Reset", () => {
     // @ts-expect-error — mock registry
     await actions.reset_idle_work_room_topics(registry);
 
-    // Should not be called for gen-1, wl-1, or al-1
+    // Should not be called for gen-1 or al-1
     expect(discord.set_channel_topic).not.toHaveBeenCalledWith("gen-1", expect.anything());
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wl-1", expect.anything());
     expect(discord.set_channel_topic).not.toHaveBeenCalledWith("al-1", expect.anything());
+  });
+
+  it("is a no-op with 0 static work rooms", async () => {
+    // @ts-expect-error — mock feature manager
+    actions.set_feature_manager(make_mock_feature_manager([]));
+
+    const entity = make_entity_config(make_static_work_rooms(0));
+    const registry = {
+      get_active: vi.fn().mockReturnValue([entity]),
+    };
+
+    // @ts-expect-error — mock registry
+    await actions.reset_idle_work_room_topics(registry);
+
+    // No work rooms → no topics to reset
+    expect(discord.set_channel_topic).not.toHaveBeenCalled();
   });
 });
 
