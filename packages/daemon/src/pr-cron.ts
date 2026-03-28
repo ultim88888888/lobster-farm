@@ -22,6 +22,7 @@ interface OpenPR {
   headRefName: string;
   updatedAt: string;
   url: string;
+  body: string;
   author: { login: string };
 }
 
@@ -148,7 +149,7 @@ export class PRReviewCron {
       const { stdout } = await exec("gh", [
         "pr", "list",
         "--state", "open",
-        "--json", "number,title,headRefName,updatedAt,url,author",
+        "--json", "number,title,headRefName,updatedAt,url,body,author",
       ], { cwd: repo_path, timeout: 30_000 });
 
       prs = JSON.parse(stdout) as OpenPR[];
@@ -299,7 +300,17 @@ export class PRReviewCron {
       last_checked: new Date(),
     });
 
-    const prompt = [
+    // Fetch linked issue context from PR body (Closes/Fixes/Resolves #N) and title (#N)
+    let issue_context = "";
+    const linked_issues = this.extract_linked_issues(pr.body, pr.title);
+    if (linked_issues.length > 0) {
+      const contexts = await Promise.all(
+        linked_issues.map((n) => this.fetch_issue_context(repo_path, n)),
+      );
+      issue_context = contexts.filter(Boolean).join("\n\n---\n\n");
+    }
+
+    const prompt_lines = [
       `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}.`,
       `Repository: ${repo_path}`,
       ``,
@@ -317,7 +328,13 @@ export class PRReviewCron {
       `- If you approved, merge the PR:`,
       `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
       `- If you requested changes, do NOT merge.`,
-    ].join("\n");
+    ];
+
+    if (issue_context) {
+      prompt_lines.push(``, `## Linked Issue Context`, ``, issue_context);
+    }
+
+    const prompt = prompt_lines.join("\n");
 
     console.log(`[pr-cron] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
 
@@ -539,6 +556,49 @@ export class PRReviewCron {
       return stdout.trim() === "MERGED";
     } catch {
       return false;
+    }
+  }
+
+  /** Extract linked issue numbers from PR body (Closes/Fixes/Resolves #N) and title (#N). */
+  private extract_linked_issues(body: string | null, title: string | null): number[] {
+    const issues = new Set<number>();
+
+    // Parse "Closes #N", "Fixes #N", "Resolves #N" from body (all occurrences)
+    if (body) {
+      for (const match of body.matchAll(/(?:closes|fixes|resolves)\s+#(\d+)/gi)) {
+        issues.add(parseInt(match[1]!, 10));
+      }
+    }
+
+    // Parse "(#N)" from PR title
+    if (title) {
+      const title_match = title.match(/#(\d+)/);
+      if (title_match) {
+        issues.add(parseInt(title_match[1]!, 10));
+      }
+    }
+
+    return [...issues];
+  }
+
+  /** Fetch issue title + body via gh CLI for reviewer context. */
+  private async fetch_issue_context(repo_path: string, issue_number: number): Promise<string> {
+    try {
+      const { stdout } = await exec("gh", [
+        "issue", "view", String(issue_number),
+        "--json", "title,body,number",
+        "--jq", `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
+      ], { cwd: repo_path, timeout: 15_000 });
+      const result = stdout.trim();
+
+      // Truncate very long issue bodies to avoid blowing up reviewer context
+      if (result.length > 2000) {
+        return result.slice(0, 2000) + "\n\n[...truncated]";
+      }
+      return result;
+    } catch (err) {
+      console.log(`[pr-cron] Could not fetch issue #${String(issue_number)}: ${String(err)}`);
+      return "";
     }
   }
 }
