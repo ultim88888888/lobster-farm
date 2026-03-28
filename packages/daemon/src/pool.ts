@@ -5,11 +5,12 @@ import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
-import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
+import { lobsterfarm_dir, entity_dir, DEFAULT_ARCHETYPES } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { save_pool_state, load_pool_state } from "./persistence.js";
 import type { PersistedPoolBot, PersistedBotAvatarState } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
+import { resolve_model_id, resolve_effort } from "./models.js";
 import { sq } from "./shell.js";
 import * as sentry from "./sentry.js";
 
@@ -28,6 +29,10 @@ export interface PoolBot {
   /** When this bot was assigned to its current channel. Used for uptime calculation. */
   assigned_at: Date | null;
   state_dir: string;
+  /** Claude CLI model ID used for this session (e.g., "claude-opus-4-6"). */
+  model: string | null;
+  /** Claude CLI effort level used for this session (e.g., "high"). */
+  effort: string | null;
   /** The archetype whose avatar was last set on this bot's Discord profile.
    * Used to skip redundant avatar updates when the archetype hasn't changed. */
   last_avatar_archetype: ArchetypeRole | null;
@@ -235,6 +240,8 @@ export class BotPool extends EventEmitter {
         last_active: is_running ? new Date() : null,
         assigned_at: is_running ? new Date() : null,
         state_dir,
+        model: null,
+        effort: null,
         last_avatar_archetype: null,
         last_avatar_set_at: null,
       });
@@ -293,6 +300,11 @@ export class BotPool extends EventEmitter {
         continue;
       }
 
+      // Restore model/effort — fall back to archetype defaults for older pool-state.json
+      // files that don't have these fields yet.
+      const restored_model = entry.model ?? (entry.archetype ? resolve_model_id(DEFAULT_ARCHETYPES[entry.archetype]) : null);
+      const restored_effort = entry.effort ?? (entry.archetype ? resolve_effort(DEFAULT_ARCHETYPES[entry.archetype].think) : null);
+
       if (bot.state === "assigned") {
         // tmux is still running (survived restart, e.g. launchd) — restore metadata.
         // BUT the Claude process inside has a stale MCP connection to the old daemon.
@@ -303,6 +315,8 @@ export class BotPool extends EventEmitter {
         bot.archetype = entry.archetype;
         bot.channel_type = entry.channel_type;
         bot.session_id = entry.session_id;
+        bot.model = restored_model;
+        bot.effort = restored_effort;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
         bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
@@ -326,6 +340,8 @@ export class BotPool extends EventEmitter {
         bot.archetype = entry.archetype;
         bot.channel_type = entry.channel_type;
         bot.session_id = entry.session_id;
+        bot.model = restored_model;
+        bot.effort = restored_effort;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
         bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
@@ -361,6 +377,8 @@ export class BotPool extends EventEmitter {
         bot.archetype = null;
         bot.channel_type = null;
         bot.session_id = null;
+        bot.model = null;
+        bot.effort = null;
         bot.last_active = null;
         // Clear the stale access.json so the bot doesn't listen on the old channel
         await this.write_access_json(bot.state_dir, null);
@@ -648,12 +666,15 @@ export class BotPool extends EventEmitter {
       await this.start_tmux(bot, archetype, entity_id, resolved_dir, session_id, !!resume_session_id);
 
       // Update bot state
+      const assigned_defaults = DEFAULT_ARCHETYPES[archetype];
       bot.state = "assigned";
       bot.channel_id = channel_id;
       bot.entity_id = entity_id;
       bot.archetype = archetype;
       bot.channel_type = channel_type ?? null;
       bot.session_id = session_id;
+      bot.model = resolve_model_id(assigned_defaults);
+      bot.effort = resolve_effort(assigned_defaults.think);
       bot.last_active = new Date();
       bot.assigned_at = new Date();
 
@@ -713,6 +734,8 @@ export class BotPool extends EventEmitter {
       bot.archetype = null;
       bot.channel_type = null;
       bot.session_id = null;
+      bot.model = null;
+      bot.effort = null;
       bot.last_active = null;
       bot.assigned_at = null;
 
@@ -957,6 +980,8 @@ export class BotPool extends EventEmitter {
       bot.archetype = null;
       bot.channel_type = null;
       bot.session_id = null;
+      bot.model = null;
+      bot.effort = null;
       bot.last_active = null;
       bot.assigned_at = null;
       changed = true;
@@ -1002,6 +1027,8 @@ export class BotPool extends EventEmitter {
         archetype: b.archetype!,
         channel_type: b.channel_type,
         session_id: b.session_id,
+        model: b.model,
+        effort: b.effort,
         last_active: b.last_active?.toISOString() ?? null,
         assigned_at: b.assigned_at?.toISOString() ?? null,
         last_avatar_archetype: b.last_avatar_archetype,
@@ -1110,15 +1137,24 @@ export class BotPool extends EventEmitter {
     const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
     const agent_name = resolve_agent_name(archetype, this.config);
 
+    // Resolve model and effort from archetype defaults
+    const archetype_defaults = DEFAULT_ARCHETYPES[archetype];
+    const model_id = resolve_model_id(archetype_defaults);
+    const effort = resolve_effort(archetype_defaults.think);
+
     const claude_args = [
       sq(claude_bin),
       "--channels", "plugin:discord@claude-plugins-official",
       "--agent", sq(agent_name),
-      "--model", "claude-opus-4-6",
+      "--model", model_id,
       "--permission-mode", "bypassPermissions",
       "--add-dir", sq(working_dir),
       "--add-dir", sq(homedir()),
     ];
+
+    if (effort) {
+      claude_args.push("--effort", effort);
+    }
 
     if (is_resume) {
       claude_args.push("--resume", sq(session_id));

@@ -96,6 +96,10 @@ export interface PersistedPoolBot {
   archetype: ArchetypeRole;
   channel_type: ChannelType | null;
   session_id: string | null;
+  /** Claude CLI model ID (e.g., "claude-opus-4-6"). Added in #101. */
+  model?: string | null;
+  /** Claude CLI effort level (e.g., "high"). Added in #101. */
+  effort?: string | null;
   last_active: string | null;  // ISO timestamp
   assigned_at?: string | null;  // ISO timestamp — when the bot was assigned to its current channel
   /** The archetype whose avatar is currently set on this bot's Discord profile.
