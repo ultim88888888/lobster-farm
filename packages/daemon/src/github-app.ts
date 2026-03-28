@@ -48,6 +48,44 @@ function base64url(input: Buffer | string): string {
     .replace(/=+$/, "");
 }
 
+/**
+ * Normalize a PEM private key from env var injection.
+ *
+ * 1Password / `op run` can deliver the key with:
+ * - Literal `\n` instead of real newlines
+ * - Everything on one line (spaces where newlines were)
+ * - Correct multi-line format (pass-through)
+ */
+function normalize_pem(raw: string): string {
+  // Already has real newlines and looks like a PEM — pass through
+  if (raw.includes("\n") && raw.startsWith("-----BEGIN")) {
+    return raw;
+  }
+
+  // Replace literal \n sequences with real newlines
+  let normalized = raw.replace(/\\n/g, "\n");
+
+  // If still no newlines, try reconstructing from space-separated or continuous base64
+  if (!normalized.includes("\n") && normalized.includes("-----BEGIN")) {
+    // Extract the header, base64 body, and footer
+    const match = normalized.match(
+      /^(-----BEGIN [A-Z ]+-----)(.+)(-----END [A-Z ]+-----)$/,
+    );
+    if (match) {
+      const [, header, body, footer] = match;
+      // Split base64 body into 64-char lines
+      const clean_body = body!.replace(/\s+/g, "");
+      const lines: string[] = [];
+      for (let i = 0; i < clean_body.length; i += 64) {
+        lines.push(clean_body.slice(i, i + 64));
+      }
+      normalized = `${header}\n${lines.join("\n")}\n${footer}\n`;
+    }
+  }
+
+  return normalized;
+}
+
 // ── Class ──
 
 export class GitHubAppAuth {
@@ -180,10 +218,13 @@ export function init_github_app_from_env(): GitHubAppAuth | null {
   const installation_id = process.env["GITHUB_APP_INSTALLATION_ID"];
   const webhook_secret = process.env["GITHUB_APP_WEBHOOK_SECRET"];
 
-  if (!app_id || !private_key || !installation_id || !webhook_secret) {
+  // Normalize PEM key — env var injection can mangle newlines
+  const normalized_key = private_key ? normalize_pem(private_key) : undefined;
+
+  if (!app_id || !normalized_key || !installation_id || !webhook_secret) {
     const missing = [
       !app_id && "GITHUB_APP_ID",
-      !private_key && "GITHUB_APP_PRIVATE_KEY",
+      !normalized_key && "GITHUB_APP_PRIVATE_KEY",
       !installation_id && "GITHUB_APP_INSTALLATION_ID",
       !webhook_secret && "GITHUB_APP_WEBHOOK_SECRET",
     ].filter(Boolean);
@@ -196,5 +237,5 @@ export function init_github_app_from_env(): GitHubAppAuth | null {
   console.log(
     `[github-app] Initialized (app_id=${app_id}, installation_id=${installation_id})`,
   );
-  return new GitHubAppAuth({ app_id, private_key, installation_id, webhook_secret });
+  return new GitHubAppAuth({ app_id, private_key: normalized_key, installation_id, webhook_secret });
 }
