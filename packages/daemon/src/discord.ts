@@ -14,6 +14,7 @@ import {
 import type {
   LobsterFarmConfig,
   ChannelType,
+  ChannelMapping,
   ArchetypeRole,
 } from "@lobster-farm/shared";
 import {
@@ -26,7 +27,7 @@ import {
   expand_home,
   write_yaml,
 } from "@lobster-farm/shared";
-import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+import { mkdir, writeFile, readFile, readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
@@ -602,7 +603,8 @@ export class DiscordBot extends EventEmitter {
 
   /**
    * Scaffold Discord channels for a new entity.
-   * Creates a category and standard channels (general, work-rooms, work-log, alerts).
+   * Creates a category and standard channels (general, alerts).
+   * Work rooms are created on demand via !lf room.
    * Returns the channel mappings to store in entity config.
    */
   async scaffold_entity(
@@ -632,13 +634,9 @@ export class DiscordBot extends EventEmitter {
       }
       category_id = category.id;
 
-      // Standard entity channels
+      // Standard entity channels — work rooms are created on demand via !lf room
       const entity_channels = [
         { name: "general", type: "general", purpose: "Entity-level discussion" },
-        { name: "work-room-1", type: "work_room", purpose: "Feature workspace 1" },
-        { name: "work-room-2", type: "work_room", purpose: "Feature workspace 2" },
-        { name: "work-room-3", type: "work_room", purpose: "Feature workspace 3" },
-        { name: "work-log", type: "work_log", purpose: "Agent activity feed" },
         { name: "alerts", type: "alerts", purpose: "Approvals, blockers, questions" },
       ];
 
@@ -658,16 +656,6 @@ export class DiscordBot extends EventEmitter {
         }
 
         channels.push({ type: ch.type, id: channel.id, purpose: ch.purpose });
-
-        // Set channel topic for work rooms
-        if (ch.type === "work_room") {
-          try {
-            const text_channel = channel as TextChannel;
-            await text_channel.setTopic("🟢 Available");
-          } catch (topic_err) {
-            console.log(`[discord] Could not set topic for #${ch.name}: ${String(topic_err)}`);
-          }
-        }
       }
 
       // Rebuild channel map to include new channels
@@ -943,6 +931,9 @@ export class DiscordBot extends EventEmitter {
             "• `!lf advance <feature-id>` — advance to next phase\n" +
             "• `!lf swap <agent>` — swap active agent in this channel (gary, bob, pearl, ray)\n" +
             "• `!lf compact` — trigger context compaction on the active session\n" +
+            "• `!lf room <name> [context]` — create an on-demand work room with a pool bot\n" +
+            "• `!lf close` — archive and delete the current work room\n" +
+            "• `!lf resume <name>` — restore an archived work room session\n" +
             "• `!lf status` — session/entity status for this channel\n" +
             "• `!lf features [entity]` — list features\n" +
             "• `!lf scaffold server` — create GLOBAL Discord channels\n" +
@@ -981,6 +972,18 @@ export class DiscordBot extends EventEmitter {
 
       case "compact":
         await this.handle_compact_command(message);
+        break;
+
+      case "room":
+        await this.handle_room_command(args, routed, message);
+        break;
+
+      case "close":
+        await this.handle_close_command(routed, message);
+        break;
+
+      case "resume":
+        await this.handle_resume_command(args, routed, message);
         break;
 
       default:
@@ -1545,6 +1548,318 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
+  // ── Dynamic room commands ──
+
+  /**
+   * !lf room <name> [initial context]
+   * Creates an on-demand work room under the entity's category,
+   * assigns a pool bot, and optionally bridges initial context.
+   */
+  private async handle_room_command(
+    args: string[],
+    routed: RoutedMessage,
+    message: Message,
+  ): Promise<void> {
+    if (!this._pool) {
+      await this.reply(message, "Bot pool not available.");
+      return;
+    }
+
+    const entity_config = this.registry.get(routed.entity_id);
+    if (!entity_config) {
+      await this.reply(message, "This channel isn't mapped to an entity.");
+      return;
+    }
+
+    const category_id = entity_config.entity.channels.category_id;
+    if (!category_id) {
+      await this.reply(message, "Entity has no Discord category configured.");
+      return;
+    }
+
+    // Parse name and optional context
+    const raw_name = args[0];
+    if (!raw_name) {
+      // Generate a default name with timestamp
+      args.unshift(`room-${String(Date.now())}`);
+    }
+    const name = sanitize_channel_name(args[0]!);
+    const context = args.slice(1).join(" ");
+
+    // Check for name collision with active channels
+    if (this.find_channel_by_name(entity_config.entity.channels, name)) {
+      await this.reply(message, `A room named **${name}** already exists.`);
+      return;
+    }
+
+    // Create Discord channel
+    const channel_id = await this.create_channel(
+      category_id,
+      name,
+      `On-demand work room for ${routed.entity_id}`,
+    );
+    if (!channel_id) {
+      await this.reply(message, "Failed to create Discord channel.");
+      return;
+    }
+
+    // Add to entity config
+    entity_config.entity.channels.list.push({
+      type: "work_room",
+      id: channel_id,
+      purpose: name,
+      dynamic: true,
+    });
+
+    // Persist and rebuild
+    await this.persist_entity_config(entity_config);
+    this.build_channel_map();
+
+    // Assign a pool bot (planner by default)
+    const assignment = await this._pool.assign(
+      channel_id,
+      routed.entity_id,
+      "planner",
+      undefined,
+      "work_room",
+    );
+
+    // Post confirmation in both source channel and new room
+    await this.reply(message, `Room **#${name}** created. Session started.`);
+    if (assignment) {
+      await this.send(channel_id, "Room created. Session started.");
+
+      // Bridge initial context if provided
+      if (context) {
+        await this.bridge_first_message(
+          assignment.tmux_session,
+          context,
+          message.author.displayName,
+        );
+      }
+    }
+  }
+
+  /**
+   * !lf close
+   * Archives the current work room's session and deletes the channel.
+   * Only works in work_room channels.
+   */
+  private async handle_close_command(
+    routed: RoutedMessage,
+    message: Message,
+  ): Promise<void> {
+    // Verify this is a work_room channel
+    if (routed.channel_type !== "work_room") {
+      await this.reply(message, "Can't close this channel. `!lf close` only works in work rooms.");
+      return;
+    }
+
+    const entity_config = this.registry.get(routed.entity_id);
+    if (!entity_config) {
+      await this.reply(message, "Entity not found.");
+      return;
+    }
+
+    const channel_id = message.channelId;
+    const channel_entry = entity_config.entity.channels.list.find(
+      (c: ChannelMapping) => c.id === channel_id,
+    );
+    if (!channel_entry) {
+      await this.reply(message, "Channel not found in entity config.");
+      return;
+    }
+
+    // Determine the room name from the purpose field or the channel name
+    const room_name = channel_entry.purpose ?? `room-${channel_id}`;
+
+    // Archive the session
+    const archive_entry: RoomArchive = {
+      name: room_name,
+      channel_id,
+      session_id: null,
+      entity_id: routed.entity_id,
+      archetype: "planner",
+      created_at: new Date().toISOString(),
+      closed_at: new Date().toISOString(),
+    };
+
+    // Get session info from pool bot if assigned
+    if (this._pool) {
+      const assignment = this._pool.get_assignment(channel_id);
+      if (assignment) {
+        archive_entry.session_id = assignment.session_id ?? null;
+        archive_entry.archetype = assignment.archetype ?? "planner";
+      }
+    }
+
+    // Write archive atomically
+    await write_room_archive(routed.entity_id, archive_entry, this.config.paths);
+
+    // Release the pool bot
+    if (this._pool) {
+      await this._pool.release(channel_id);
+    }
+
+    // Send farewell before deleting (can't send after deletion)
+    // The channel is about to be deleted, so we notify the source-adjacent channel instead.
+    // Find the entity's general channel for the farewell message.
+    const general_channel = entity_config.entity.channels.list.find(
+      (c: ChannelMapping) => c.type === "general",
+    );
+
+    // Delete Discord channel
+    await this.delete_channel(channel_id);
+
+    // Remove from entity config
+    entity_config.entity.channels.list = entity_config.entity.channels.list.filter(
+      (c: ChannelMapping) => c.id !== channel_id,
+    );
+
+    // Persist and rebuild
+    await this.persist_entity_config(entity_config);
+    this.build_channel_map();
+
+    // Send farewell to general
+    if (general_channel) {
+      await this.send(
+        general_channel.id,
+        `Session archived as \`${room_name}\`. Use \`!lf resume ${room_name}\` to restore.`,
+      );
+    }
+  }
+
+  /**
+   * !lf resume <name>
+   * Restores an archived work room session. Creates a new channel,
+   * assigns a pool bot with the archived session_id for resume.
+   */
+  private async handle_resume_command(
+    args: string[],
+    routed: RoutedMessage,
+    message: Message,
+  ): Promise<void> {
+    if (!this._pool) {
+      await this.reply(message, "Bot pool not available.");
+      return;
+    }
+
+    const entity_config = this.registry.get(routed.entity_id);
+    if (!entity_config) {
+      await this.reply(message, "Entity not found.");
+      return;
+    }
+
+    const category_id = entity_config.entity.channels.category_id;
+    if (!category_id) {
+      await this.reply(message, "Entity has no Discord category configured.");
+      return;
+    }
+
+    const search_name = args[0];
+    if (!search_name) {
+      await this.reply(message, "Usage: `!lf resume <name>`");
+      return;
+    }
+
+    // Look up archives
+    const archives = await load_room_archives(routed.entity_id, this.config.paths);
+    const matches = archives.filter(a => a.name === search_name);
+
+    if (matches.length === 0) {
+      const available = [...new Set(archives.map(a => a.name))];
+      if (available.length === 0) {
+        await this.reply(message, `No archived sessions found for this entity.`);
+      } else {
+        await this.reply(
+          message,
+          `No archived session found with name **${search_name}**.\nAvailable: ${available.map(n => `\`${n}\``).join(", ")}`,
+        );
+      }
+      return;
+    }
+
+    if (matches.length > 1) {
+      // Multiple matches — list them with timestamps for disambiguation
+      const lines = matches.map((a, i) =>
+        `${String(i + 1)}. \`${a.name}\` — closed ${a.closed_at}`,
+      );
+      await this.reply(
+        message,
+        `Multiple archived sessions named **${search_name}**:\n${lines.join("\n")}\n\nMost recent will be used. To specify, re-close to create distinct names.`,
+      );
+      // Use the most recent match
+    }
+
+    // Use the most recent match (last in sorted order)
+    const archive = matches[matches.length - 1]!;
+
+    // Check for name collision with active channels
+    if (this.find_channel_by_name(entity_config.entity.channels, search_name)) {
+      await this.reply(message, `A room named **${search_name}** already exists.`);
+      return;
+    }
+
+    // Create new Discord channel
+    const channel_id = await this.create_channel(
+      category_id,
+      search_name,
+      `Resumed work room for ${routed.entity_id}`,
+    );
+    if (!channel_id) {
+      await this.reply(message, "Failed to create Discord channel.");
+      return;
+    }
+
+    // Add to entity config
+    entity_config.entity.channels.list.push({
+      type: "work_room",
+      id: channel_id,
+      purpose: search_name,
+      dynamic: true,
+    });
+
+    // Persist and rebuild
+    await this.persist_entity_config(entity_config);
+    this.build_channel_map();
+
+    // Assign pool bot with resumed session_id
+    const resume_session_id = archive.session_id ?? undefined;
+    const assignment = await this._pool.assign(
+      channel_id,
+      routed.entity_id,
+      archive.archetype as ArchetypeRole ?? "planner",
+      resume_session_id,
+      "work_room",
+    );
+
+    if (assignment) {
+      await this.send(channel_id, `Session \`${search_name}\` resumed.`);
+      await this.reply(message, `Session **${search_name}** resumed in <#${channel_id}>.`);
+    } else {
+      await this.reply(message, `Room created but no pool bots available. Send a message in <#${channel_id}> to auto-assign.`);
+    }
+  }
+
+  // ── Helpers ──
+
+  /** Persist an entity's config back to YAML. */
+  private async persist_entity_config(entity_config: { entity: { id: string } } & Record<string, unknown>): Promise<void> {
+    const config_path = entity_config_path(undefined, entity_config.entity.id);
+    await write_yaml(config_path, entity_config);
+    console.log(`[discord] Persisted entity config for ${entity_config.entity.id}`);
+  }
+
+  /** Find a channel in an entity's channel list by its purpose/name field. */
+  private find_channel_by_name(
+    channels: { list: ChannelMapping[] },
+    name: string,
+  ): ChannelMapping | undefined {
+    return channels.list.find(
+      (c: ChannelMapping) => c.type === "work_room" && c.purpose === name,
+    );
+  }
+
   private async reply(message: Message, content: string): Promise<void> {
     try {
       await message.reply(content);
@@ -1553,6 +1868,81 @@ export class DiscordBot extends EventEmitter {
       await this.send(message.channelId, content);
     }
   }
+}
+
+// ── Channel name sanitization ──
+
+/** Sanitize a string for use as a Discord channel name.
+ * Lowercase, hyphens only, no spaces, max 100 chars. */
+export function sanitize_channel_name(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")  // Replace non-alphanumeric with hyphens
+    .replace(/-+/g, "-")           // Collapse multiple hyphens
+    .replace(/^-|-$/g, "")         // Trim leading/trailing hyphens
+    .slice(0, 100);                // Discord channel name limit
+}
+
+// ── Room archive types and I/O ──
+
+export interface RoomArchive {
+  name: string;
+  channel_id: string;
+  session_id: string | null;
+  entity_id: string;
+  archetype: string;
+  created_at: string;
+  closed_at: string;
+}
+
+/** Write a room archive entry atomically. */
+export async function write_room_archive(
+  entity_id: string,
+  archive: RoomArchive,
+  paths?: Record<string, string>,
+): Promise<void> {
+  const archives_dir = join(entity_dir(paths, entity_id), "archives");
+  await mkdir(archives_dir, { recursive: true });
+
+  const timestamp = archive.closed_at.replace(/[:.]/g, "-");
+  const filename = `${archive.name}-${timestamp}.json`;
+  const filepath = join(archives_dir, filename);
+  const tmp_path = `${filepath}.tmp`;
+
+  await writeFile(tmp_path, JSON.stringify(archive, null, 2), "utf-8");
+  await rename(tmp_path, filepath);
+
+  console.log(`[discord] Archived room ${archive.name} to ${filepath}`);
+}
+
+/** Load all room archives for an entity, sorted by closed_at ascending. */
+export async function load_room_archives(
+  entity_id: string,
+  paths?: Record<string, string>,
+): Promise<RoomArchive[]> {
+  const archives_dir = join(entity_dir(paths, entity_id), "archives");
+  let entries: string[];
+  try {
+    entries = await readdir(archives_dir);
+  } catch {
+    return []; // No archives directory
+  }
+
+  const archives: RoomArchive[] = [];
+  for (const filename of entries) {
+    if (!filename.endsWith(".json")) continue;
+    try {
+      const raw = await readFile(join(archives_dir, filename), "utf-8");
+      const data = JSON.parse(raw) as RoomArchive;
+      archives.push(data);
+    } catch {
+      console.log(`[discord] Skipping invalid archive file: ${filename}`);
+    }
+  }
+
+  // Sort by closed_at ascending (oldest first)
+  archives.sort((a, b) => a.closed_at.localeCompare(b.closed_at));
+  return archives;
 }
 
 // ── Token resolution ──

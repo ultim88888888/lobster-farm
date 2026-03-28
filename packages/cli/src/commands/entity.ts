@@ -176,12 +176,9 @@ entity_command
     const channels: DiscordChannel[] = [];
 
     if (setup_discord_flag) {
+      // Work rooms are created on demand via !lf room
       const channel_types = [
         { type: "general", purpose: "Entity-level discussion" },
-        { type: "work_room", purpose: "Feature workspace 1" },
-        { type: "work_room", purpose: "Feature workspace 2" },
-        { type: "work_room", purpose: "Feature workspace 3" },
-        { type: "work_log", purpose: "Agent activity feed" },
         { type: "alerts", purpose: "Approvals, blockers, questions" },
       ];
 
