@@ -1,47 +1,122 @@
 import { Command } from "commander";
-import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+
+/**
+ * Resolve the monorepo root directory.
+ *
+ * Strategy: walk up from this file's location until we find a directory
+ * that contains `pnpm-workspace.yaml` (the monorepo marker). This works
+ * whether the CLI is running from source or from `dist/`.
+ */
+function resolve_repo_root(): string {
+  const this_file = fileURLToPath(import.meta.url);
+  let dir = dirname(this_file);
+
+  for (let i = 0; i < 10; i++) {
+    if (existsSync(join(dir, "pnpm-workspace.yaml"))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+
+  // Fallback: ask git (works if git is available and we're inside the repo)
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: dirname(this_file),
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    throw new Error(
+      "Could not resolve LobsterFarm repo root. " +
+      "Is the CLI running from within the repository?",
+    );
+  }
+}
+
+/** Run a git command in the repo directory, returning stdout. */
+function git(repo_dir: string, args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: repo_dir,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
 
 export const update_command = new Command("update")
-  .description("Pull latest code, rebuild, and relink")
+  .description("Pull latest code and rebuild")
   .action(() => {
-    const src_dir = join(homedir(), ".lobsterfarm", "src");
-
-    console.log("Updating LobsterFarm...\n");
-
-    const steps = [
-      { name: "Pulling latest", cmd: "git", args: ["pull"], cwd: src_dir },
-      { name: "Installing deps", cmd: "pnpm", args: ["install"], cwd: src_dir },
-      { name: "Building", cmd: "pnpm", args: ["build"], cwd: src_dir },
-      { name: "Relinking CLI", cmd: "npm", args: ["link"], cwd: join(src_dir, "packages", "cli") },
-    ];
-
-    for (const step of steps) {
-      console.log(`→ ${step.name}...`);
-      const result = spawnSync(step.cmd, step.args, {
-        cwd: step.cwd,
-        stdio: "inherit",
-      });
-
-      if (result.status !== 0) {
-        // Try with sudo for the link step
-        if (step.name === "Relinking CLI") {
-          console.log("  Retrying with sudo...");
-          const retry = spawnSync("sudo", [step.cmd, ...step.args], {
-            cwd: step.cwd,
-            stdio: "inherit",
-          });
-          if (retry.status !== 0) {
-            console.error(`  Failed: ${step.name}`);
-            process.exit(1);
-          }
-        } else {
-          console.error(`  Failed: ${step.name}`);
-          process.exit(1);
-        }
-      }
+    let repo_dir: string;
+    try {
+      repo_dir = resolve_repo_root();
+    } catch (err) {
+      console.error(
+        err instanceof Error ? err.message : "Failed to resolve repo root.",
+      );
+      process.exit(1);
     }
 
-    console.log("\nUpdated. Restart the daemon with: lf stop && lf start");
+    console.log("Checking for updates...");
+
+    // Fetch latest from origin
+    try {
+      execFileSync("git", ["fetch", "origin"], {
+        cwd: repo_dir,
+        stdio: "inherit",
+      });
+    } catch {
+      console.error("Failed to fetch from origin. Check your network connection.");
+      process.exit(1);
+    }
+
+    // Check if the local main branch is behind origin/main
+    const status = git(repo_dir, ["status", "-uno"]);
+    if (status.includes("Your branch is up to date")) {
+      console.log("Already up to date.");
+      return;
+    }
+
+    // Pull from origin/main
+    console.log("Pulling latest from origin/main...");
+    try {
+      execFileSync("git", ["pull", "origin", "main"], {
+        cwd: repo_dir,
+        stdio: "inherit",
+      });
+    } catch {
+      console.error(
+        "Pull failed. You may have local changes that conflict.\n" +
+        "Resolve conflicts manually, then re-run: lf update",
+      );
+      process.exit(1);
+    }
+
+    // Rebuild
+    console.log("Rebuilding...");
+    try {
+      execFileSync("pnpm", ["install"], {
+        cwd: repo_dir,
+        stdio: "inherit",
+      });
+      execFileSync("pnpm", ["build"], {
+        cwd: repo_dir,
+        stdio: "inherit",
+      });
+    } catch {
+      console.error(
+        "Build failed. Check the output above for errors.\n" +
+        "You can retry the build manually: cd " + repo_dir + " && pnpm install && pnpm build",
+      );
+      process.exit(1);
+    }
+
+    // Report success with the new commit hash
+    const hash = git(repo_dir, ["rev-parse", "--short", "HEAD"]);
+    console.log(`\nLobsterFarm updated to commit ${hash}`);
+    console.log("Restart the daemon to apply: lf restart");
   });

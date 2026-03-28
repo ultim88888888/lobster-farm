@@ -311,7 +311,7 @@ export class PRReviewCron {
       await this.spawn_external_pr_fixer(entity_id, repo_path, pr);
       await this.notify_alerts(
         entity_id,
-        `External PR #${String(pr.number)} needs changes — spawning builder to fix`,
+        `External PR #${String(pr.number)}: ${pr.title} — needs changes, spawning builder to fix`,
       );
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
@@ -319,13 +319,13 @@ export class PRReviewCron {
       if (is_merged) {
         await this.notify_alerts(
           entity_id,
-          `External PR #${String(pr.number)} approved and merged`,
+          `External PR #${String(pr.number)}: ${pr.title} — approved and merged to main`,
         );
       } else {
         // Not yet merged — escalate to human
         await this.notify_alerts(
           entity_id,
-          `External PR #${String(pr.number)} approved — awaiting human merge approval`,
+          `External PR #${String(pr.number)}: ${pr.title} — approved, awaiting human merge`,
         );
       }
     } else {
