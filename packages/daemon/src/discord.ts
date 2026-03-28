@@ -38,8 +38,6 @@ import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
 import type { TaskQueue } from "./queue.js";
 import type { BotPool, PoolBot } from "./pool.js";
-import { query_context_usage, query_subscription_usage } from "./tmux-query.js";
-import type { ContextUsage, SubscriptionUsage } from "./tmux-query.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -74,6 +72,23 @@ export function format_duration(start: Date): string {
   const minutes = total_minutes % 60;
   if (hours > 0) return `${String(hours)}h ${String(minutes)}m`;
   return `${String(minutes)}m`;
+}
+
+/**
+ * Format a staleness label for cached usage data.
+ * Returns empty string if cache is fresh (under 60s) or missing,
+ * e.g., " *(30s ago)*" or " *(2m ago)*".
+ */
+export function format_cache_staleness(cache_updated_at: Date | null): string {
+  if (!cache_updated_at) return "";
+  const age_ms = Date.now() - cache_updated_at.getTime();
+  if (age_ms < 0) return "";
+  // Under 60s: considered fresh, no indicator needed
+  if (age_ms < 60_000) return "";
+  const age_seconds = Math.floor(age_ms / 1000);
+  if (age_seconds < 120) return ` *(${String(age_seconds)}s ago)*`;
+  const age_minutes = Math.floor(age_seconds / 60);
+  return ` *(${String(age_minutes)}m ago)*`;
 }
 
 // ── Channel index entry ──
@@ -1411,30 +1426,21 @@ export class DiscordBot extends EventEmitter {
     }
 
     // Full session status — bot is assigned to this channel.
-    // Query context/usage from the live tmux session (best-effort, non-blocking).
-    // Queries run sequentially — both target the same tmux pane, so parallel injection
-    // would interleave commands and corrupt output.
-    let context_usage: ContextUsage | null = null;
-    let subscription_usage: SubscriptionUsage | null = null;
-    try {
-      context_usage = await query_context_usage(assignment.tmux_session);
-      subscription_usage = await query_subscription_usage(assignment.tmux_session);
-    } catch {
-      // Non-fatal: tmux queries are best-effort
-    }
-
-    const lines = this.format_session_status(assignment, routed, features, context_usage, subscription_usage);
+    // Read cached context/usage from the health monitor instead of querying tmux
+    // synchronously. The health monitor updates the cache every 30s when the session
+    // is idle. Querying here would always fail because the session is busy processing
+    // this very /status command (catch-22 with the idle guard).
+    const lines = this.format_session_status(assignment, routed, features);
     if (pool_summary) lines.push("", pool_summary);
     await target.reply(lines.join("\n"));
   }
 
-  /** Format the full session status block for a channel with an assigned bot. */
+  /** Format the full session status block for a channel with an assigned bot.
+   * Reads context/usage from the bot's cache (populated by the health monitor). */
   private format_session_status(
     bot: PoolBot,
     routed: RoutedMessage,
     features: FeatureManager | null,
-    context_usage?: ContextUsage | null,
-    subscription_usage?: SubscriptionUsage | null,
   ): string[] {
     const identity = bot.archetype
       ? this.resolve_agent_identity(bot.archetype)
@@ -1469,12 +1475,13 @@ export class DiscordBot extends EventEmitter {
       lines.push(`Effort: ${bot.effort}`);
     }
 
-    // Context and subscription usage from live tmux query
-    if (context_usage) {
-      lines.push(`Context: ${context_usage.summary}`);
+    // Context and subscription usage from health monitor cache
+    const staleness_label = format_cache_staleness(bot.cache_updated_at);
+    if (bot.cached_context) {
+      lines.push(`Context: ${bot.cached_context.summary}${staleness_label}`);
     }
-    if (subscription_usage) {
-      lines.push(`Subscription: ${subscription_usage.summary}`);
+    if (bot.cached_subscription) {
+      lines.push(`Subscription: ${bot.cached_subscription.summary}${staleness_label}`);
     }
 
     // Active features for this entity
