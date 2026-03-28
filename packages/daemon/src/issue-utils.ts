@@ -32,6 +32,13 @@ export function nwo_from_url(url: string): string | undefined {
  *
  * Body patterns: "Closes #N", "Fixes #N", "Resolves #N" (case-insensitive, all occurrences).
  * Title pattern: "#N" (first match only — PR titles like "feat: add foo (#42)").
+ *
+ * Note: the title regex `/#(\d+)/` is intentionally broad. It will match PR numbers
+ * in squash-merge default titles (e.g., "feat: add thing (#126)"). If the PR body has
+ * no explicit "Closes/Fixes/Resolves #N", the title extraction could try to close the
+ * PR's own number. This is low-risk because: (a) closing a PR via the issues API is a
+ * no-op if it's already merged, and (b) most PRs in this codebase have explicit body
+ * keywords. If this becomes a real problem, scope the title regex to closing keywords.
  */
 export function extract_linked_issues(body: string | null, title: string | null): number[] {
   const issues = new Set<number>();
@@ -116,8 +123,13 @@ export interface CloseIssueResult {
  * Close linked issues after a PR merge.
  *
  * For each issue:
- * 1. Adds a comment attributing the closure to the PR
+ * 1. Checks if the issue is already closed (skip if so — prevents duplicate
+ *    comments when both the webhook and cron paths fire for the same merge)
  * 2. Closes the issue with state_reason: "completed"
+ * 3. Adds an attribution comment only after a successful close
+ *
+ * The close-then-comment order ensures we never leave a misleading "Closed by"
+ * comment on an issue that failed to close.
  *
  * Uses the GitHub REST API with the installation token so the closure
  * is attributed to the GitHub App (lf-review[bot]), not a human account.
@@ -134,31 +146,27 @@ export async function close_linked_issues(
   if (issue_numbers.length === 0) return [];
 
   const results: CloseIssueResult[] = [];
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${gh_token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
 
   for (const issue_number of issue_numbers) {
     try {
-      // 1. Add a comment attributing the closure to the PR
-      const comment_res = await fetch(
-        `https://api.github.com/repos/${repo_full_name}/issues/${String(issue_number)}/comments`,
-        {
-          method: "POST",
-          headers: {
-            Accept: "application/vnd.github+json",
-            Authorization: `Bearer ${gh_token}`,
-            "X-GitHub-Api-Version": "2022-11-28",
-          },
-          body: JSON.stringify({
-            body: `Closed by #${String(pr_number)}.`,
-          }),
-        },
+      // 1. Check if the issue is already closed — prevents duplicate "Closed by"
+      //    comments when both the webhook path and cron path fire for the same PR.
+      const state_res = await fetch(
+        `https://api.github.com/repos/${repo_full_name}/issues/${String(issue_number)}`,
+        { headers },
       );
-
-      if (!comment_res.ok) {
-        const body = await comment_res.text();
-        console.warn(
-          `[issue-utils] Failed to comment on issue #${String(issue_number)}: ${String(comment_res.status)} ${body}`,
-        );
-        // Continue to close even if commenting fails
+      if (state_res.ok) {
+        const data = await state_res.json() as { state?: string };
+        if (data.state === "closed") {
+          console.log(`[issue-utils] Issue #${String(issue_number)} already closed — skipping`);
+          results.push({ issue_number, success: true });
+          continue;
+        }
       }
 
       // 2. Close the issue
@@ -166,11 +174,7 @@ export async function close_linked_issues(
         `https://api.github.com/repos/${repo_full_name}/issues/${String(issue_number)}`,
         {
           method: "PATCH",
-          headers: {
-            Accept: "application/vnd.github+json",
-            Authorization: `Bearer ${gh_token}`,
-            "X-GitHub-Api-Version": "2022-11-28",
-          },
+          headers,
           body: JSON.stringify({
             state: "closed",
             state_reason: "completed",
@@ -184,6 +188,26 @@ export async function close_linked_issues(
         console.warn(`[issue-utils] Failed to close issue #${String(issue_number)}: ${msg}`);
         results.push({ issue_number, success: false, error: msg });
         continue;
+      }
+
+      // 3. Add attribution comment only after successful close
+      const comment_res = await fetch(
+        `https://api.github.com/repos/${repo_full_name}/issues/${String(issue_number)}/comments`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            body: `Closed by #${String(pr_number)}.`,
+          }),
+        },
+      );
+
+      if (!comment_res.ok) {
+        const body = await comment_res.text();
+        console.warn(
+          `[issue-utils] Failed to comment on issue #${String(issue_number)}: ${String(comment_res.status)} ${body}`,
+        );
+        // Comment failure is non-critical — the issue is already closed
       }
 
       console.log(`[issue-utils] Closed issue #${String(issue_number)} (via PR #${String(pr_number)})`);

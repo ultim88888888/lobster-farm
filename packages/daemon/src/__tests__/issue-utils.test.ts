@@ -101,6 +101,17 @@ describe("close_linked_issues", () => {
   let warn_spy: ReturnType<typeof vi.spyOn>;
   let log_spy: ReturnType<typeof vi.spyOn>;
 
+  /** Helper: mock an open-issue GET state response. */
+  const open_state = () =>
+    new Response(JSON.stringify({ state: "open" }), { status: 200 });
+
+  /** Helper: mock a closed-issue GET state response. */
+  const closed_state = () =>
+    new Response(JSON.stringify({ state: "closed" }), { status: 200 });
+
+  /** Helper: mock a generic 200 OK response. */
+  const ok = () => new Response("{}", { status: 200 });
+
   beforeEach(() => {
     fetch_spy = vi.spyOn(globalThis, "fetch");
     warn_spy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -119,25 +130,30 @@ describe("close_linked_issues", () => {
     expect(fetch_spy).not.toHaveBeenCalled();
   });
 
-  it("comments and closes each issue", async () => {
-    fetch_spy.mockResolvedValue(new Response("{}", { status: 200 }));
+  it("checks state, closes, and comments for each issue", async () => {
+    fetch_spy
+      // Issue 10: GET state → open, PATCH close → ok, POST comment → ok
+      .mockResolvedValueOnce(open_state())
+      .mockResolvedValueOnce(ok())
+      .mockResolvedValueOnce(ok())
+      // Issue 20: GET state → open, PATCH close → ok, POST comment → ok
+      .mockResolvedValueOnce(open_state())
+      .mockResolvedValueOnce(ok())
+      .mockResolvedValueOnce(ok());
 
     const results = await close_linked_issues("owner/repo", 42, [10, 20], "ghs_token");
 
-    // 2 issues x 2 API calls each (comment + close)
-    expect(fetch_spy).toHaveBeenCalledTimes(4);
+    // 2 issues x 3 API calls each (GET state + PATCH close + POST comment)
+    expect(fetch_spy).toHaveBeenCalledTimes(6);
 
-    // First issue: comment
+    // First issue: GET state
     expect(fetch_spy).toHaveBeenNthCalledWith(
       1,
-      "https://api.github.com/repos/owner/repo/issues/10/comments",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({ body: "Closed by #42." }),
-      }),
+      "https://api.github.com/repos/owner/repo/issues/10",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer ghs_token" }) }),
     );
 
-    // First issue: close
+    // First issue: PATCH close
     expect(fetch_spy).toHaveBeenNthCalledWith(
       2,
       "https://api.github.com/repos/owner/repo/issues/10",
@@ -147,6 +163,48 @@ describe("close_linked_issues", () => {
       }),
     );
 
+    // First issue: POST comment (after successful close)
+    expect(fetch_spy).toHaveBeenNthCalledWith(
+      3,
+      "https://api.github.com/repos/owner/repo/issues/10/comments",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ body: "Closed by #42." }),
+      }),
+    );
+
+    expect(results).toEqual([
+      { issue_number: 10, success: true },
+      { issue_number: 20, success: true },
+    ]);
+  });
+
+  it("skips already-closed issues without commenting or closing", async () => {
+    fetch_spy.mockResolvedValueOnce(closed_state());
+
+    const results = await close_linked_issues("owner/repo", 42, [10], "token");
+
+    // Only 1 API call: the GET state check
+    expect(fetch_spy).toHaveBeenCalledTimes(1);
+    expect(results).toEqual([{ issue_number: 10, success: true }]);
+    expect(log_spy).toHaveBeenCalledWith(
+      expect.stringContaining("Issue #10 already closed"),
+    );
+  });
+
+  it("skips closed issues and processes open ones in a mixed batch", async () => {
+    fetch_spy
+      // Issue 10: already closed
+      .mockResolvedValueOnce(closed_state())
+      // Issue 20: open → close → comment
+      .mockResolvedValueOnce(open_state())
+      .mockResolvedValueOnce(ok())
+      .mockResolvedValueOnce(ok());
+
+    const results = await close_linked_issues("owner/repo", 42, [10, 20], "token");
+
+    // 1 call for issue 10 (GET only), 3 calls for issue 20 (GET + close + comment)
+    expect(fetch_spy).toHaveBeenCalledTimes(4);
     expect(results).toEqual([
       { issue_number: 10, success: true },
       { issue_number: 20, success: true },
@@ -154,20 +212,37 @@ describe("close_linked_issues", () => {
   });
 
   it("uses the installation token in Authorization header", async () => {
-    fetch_spy.mockResolvedValue(new Response("{}", { status: 200 }));
+    fetch_spy
+      .mockResolvedValueOnce(open_state())
+      .mockResolvedValueOnce(ok())
+      .mockResolvedValueOnce(ok());
 
     await close_linked_issues("owner/repo", 42, [10], "ghs_test_token");
 
     for (const call of fetch_spy.mock.calls) {
-      const headers = (call[1] as RequestInit).headers as Record<string, string>;
+      const init = call[1] as RequestInit | undefined;
+      const headers = (init?.headers ?? {}) as Record<string, string>;
       expect(headers["Authorization"]).toBe("Bearer ghs_test_token");
     }
   });
 
-  it("continues to close even if commenting fails", async () => {
+  it("still closes even if state check fails (non-OK response)", async () => {
     fetch_spy
-      .mockResolvedValueOnce(new Response("Not found", { status: 404 })) // comment fails
-      .mockResolvedValueOnce(new Response("{}", { status: 200 })); // close succeeds
+      .mockResolvedValueOnce(new Response("Server error", { status: 500 })) // GET state fails
+      .mockResolvedValueOnce(ok()) // close succeeds
+      .mockResolvedValueOnce(ok()); // comment succeeds
+
+    const results = await close_linked_issues("owner/repo", 42, [10], "token");
+
+    expect(fetch_spy).toHaveBeenCalledTimes(3);
+    expect(results).toEqual([{ issue_number: 10, success: true }]);
+  });
+
+  it("succeeds even if comment fails after close", async () => {
+    fetch_spy
+      .mockResolvedValueOnce(open_state())
+      .mockResolvedValueOnce(ok()) // close succeeds
+      .mockResolvedValueOnce(new Response("Not found", { status: 404 })); // comment fails
 
     const results = await close_linked_issues("owner/repo", 42, [10], "token");
 
@@ -177,13 +252,15 @@ describe("close_linked_issues", () => {
     );
   });
 
-  it("reports failure when close API returns error", async () => {
+  it("does not comment when close fails", async () => {
     fetch_spy
-      .mockResolvedValueOnce(new Response("{}", { status: 200 })) // comment succeeds
+      .mockResolvedValueOnce(open_state()) // GET state → open
       .mockResolvedValueOnce(new Response("Forbidden", { status: 403 })); // close fails
 
     const results = await close_linked_issues("owner/repo", 42, [10], "token");
 
+    // Only 2 calls: GET state + PATCH close. No comment POST.
+    expect(fetch_spy).toHaveBeenCalledTimes(2);
     expect(results).toEqual([
       { issue_number: 10, success: false, error: "403 Forbidden" },
     ]);
