@@ -8,7 +8,7 @@ import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { save_pool_state, load_pool_state } from "./persistence.js";
-import type { PersistedPoolBot } from "./persistence.js";
+import type { PersistedPoolBot, PersistedBotAvatarState } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
 import { sq } from "./shell.js";
 import * as sentry from "./sentry.js";
@@ -28,6 +28,12 @@ export interface PoolBot {
   /** When this bot was assigned to its current channel. Used for uptime calculation. */
   assigned_at: Date | null;
   state_dir: string;
+  /** The archetype whose avatar was last set on this bot's Discord profile.
+   * Used to skip redundant avatar updates when the archetype hasn't changed. */
+  last_avatar_archetype: ArchetypeRole | null;
+  /** When the avatar was last set via the Discord API. Used for rate limit safety
+   * (~2 changes per hour per bot, we enforce a 30-minute cooldown). */
+  last_avatar_set_at: Date | null;
 }
 
 export interface PoolAssignment {
@@ -103,6 +109,16 @@ function bot_user_id_from_token(token: string): string | null {
  * so the pool doesn't need direct access to bot tokens or the Discord API. */
 export type NicknameHandler = (user_id: string, display_name: string) => Promise<void>;
 
+/** Callback for setting a bot's Discord profile avatar using its own token.
+ * Provided by the Discord module — the pool never touches raw tokens.
+ * @param state_dir - The bot's channel directory (contains .env with token)
+ * @param agent_name - Lowercase agent name used to find the avatar file */
+export type AvatarHandler = (state_dir: string, agent_name: string) => Promise<void>;
+
+/** Rate limit cooldown for avatar changes (30 minutes). Discord allows ~2 per
+ * hour per bot — this gives comfortable margin. */
+export const AVATAR_COOLDOWN_MS = 30 * 60 * 1000;
+
 // ── Pool Manager ──
 
 export class BotPool extends EventEmitter {
@@ -116,6 +132,7 @@ export class BotPool extends EventEmitter {
   private releasing_channels = new Set<string>();
   private bot_user_ids = new Map<number, string>();
   private nickname_handler: NicknameHandler | null = null;
+  private avatar_handler: AvatarHandler | null = null;
   /** Bots that were actively assigned before shutdown and should be proactively resumed.
    * Populated during initialize(), consumed by resume_parked_bots(). */
   private resume_candidates: PersistedPoolBot[] = [];
@@ -133,6 +150,13 @@ export class BotPool extends EventEmitter {
    * set nicknames through the daemon bot without touching pool bot tokens. */
   set_nickname_handler(handler: NicknameHandler): void {
     this.nickname_handler = handler;
+  }
+
+  /** Register a callback for setting bot profile avatars.
+   * Called by the Discord module — the handler reads the bot's token from its
+   * .env file and makes a raw REST call. The pool never sees the token. */
+  set_avatar_handler(handler: AvatarHandler): void {
+    this.avatar_handler = handler;
   }
 
   /** Enter drain mode — no new assignments accepted. */
@@ -211,6 +235,8 @@ export class BotPool extends EventEmitter {
         last_active: is_running ? new Date() : null,
         assigned_at: is_running ? new Date() : null,
         state_dir,
+        last_avatar_archetype: null,
+        last_avatar_set_at: null,
       });
     }
 
@@ -239,6 +265,21 @@ export class BotPool extends EventEmitter {
       console.log(`[pool] Restored ${String(this.session_history.size)} session history entries`);
     }
 
+    // Restore avatar state for all bots (including those that will stay free).
+    // Avatar state is per-bot, not per-assignment — a bot's Discord profile
+    // avatar persists even when the bot is released from the pool.
+    const avatar_entries = saved_state.avatar_state ?? {};
+    for (const [id_str, avatar_info] of Object.entries(avatar_entries)) {
+      const bot = this.bots.find(b => b.id === parseInt(id_str, 10));
+      if (!bot) continue;
+      bot.last_avatar_archetype = avatar_info.archetype;
+      bot.last_avatar_set_at = new Date(avatar_info.set_at);
+    }
+    const avatar_count = Object.keys(avatar_entries).length;
+    if (avatar_count > 0) {
+      console.log(`[pool] Restored avatar state for ${String(avatar_count)} bot(s)`);
+    }
+
     for (const entry of saved_state.bots) {
       const bot = this.bots.find(b => b.id === entry.id);
       if (!bot) continue; // Bot directory removed since last run
@@ -264,6 +305,7 @@ export class BotPool extends EventEmitter {
         bot.session_id = entry.session_id;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
+        bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
 
         // Add to resume candidates — the live tmux session has a dead MCP socket.
         // resume_parked_bots() will kill it and spawn fresh with --resume.
@@ -286,6 +328,7 @@ export class BotPool extends EventEmitter {
         bot.session_id = entry.session_id;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
+        bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
 
         // If this bot was actively assigned (not already parked) before shutdown
         // and has a session_id, it's a candidate for proactive resume.
@@ -395,8 +438,9 @@ export class BotPool extends EventEmitter {
         // Write access.json so the Discord plugin listens on this channel
         await this.write_access_json(bot.state_dir, candidate.channel_id);
 
-        // Set Discord nickname to match the archetype
+        // Set Discord nickname and profile avatar to match the archetype
         await this.set_bot_nickname(bot, candidate.archetype);
+        await this.set_bot_avatar(bot, candidate.archetype);
 
         // Spawn a fresh Claude process with --resume — establishes a new MCP
         // connection to this daemon while preserving conversation context
@@ -592,8 +636,9 @@ export class BotPool extends EventEmitter {
       // Update access.json with the channel ID
       await this.write_access_json(bot.state_dir, channel_id);
 
-      // Set Discord nickname to match the archetype
+      // Set Discord nickname and profile avatar to match the archetype
       await this.set_bot_nickname(bot, archetype);
+      await this.set_bot_avatar(bot, archetype);
 
       // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
       // For fresh sessions, generate a UUID so pool-state.json always has a session_id
@@ -959,6 +1004,7 @@ export class BotPool extends EventEmitter {
         session_id: b.session_id,
         last_active: b.last_active?.toISOString() ?? null,
         assigned_at: b.assigned_at?.toISOString() ?? null,
+        last_avatar_archetype: b.last_avatar_archetype,
       }));
 
     // Convert session_history Map to a plain object for serialization
@@ -967,8 +1013,20 @@ export class BotPool extends EventEmitter {
       history_obj[key] = value;
     }
 
+    // Build avatar state for ALL bots (including free ones) — the bot's
+    // Discord profile avatar persists independently of pool assignment
+    const avatar_obj: Record<string, PersistedBotAvatarState> = {};
+    for (const b of this.bots) {
+      if (b.last_avatar_archetype && b.last_avatar_set_at) {
+        avatar_obj[String(b.id)] = {
+          archetype: b.last_avatar_archetype,
+          set_at: b.last_avatar_set_at.toISOString(),
+        };
+      }
+    }
+
     try {
-      await save_pool_state(to_save, this.config, history_obj);
+      await save_pool_state(to_save, this.config, history_obj, avatar_obj);
     } catch (err) {
       // Non-fatal: log and continue. Next mutation will retry the write.
       console.error(`[pool] Failed to persist state: ${String(err)}`);
@@ -1155,6 +1213,56 @@ export class BotPool extends EventEmitter {
       console.log(`[pool] Set pool-${String(bot.id)} nickname to "${display_name}"`);
     } catch (err) {
       console.log(`[pool] Nickname set failed for pool-${String(bot.id)}: ${String(err)}`);
+    }
+  }
+
+  /** Set a pool bot's Discord profile avatar to match its archetype.
+   * Skips if the archetype hasn't changed since the last set, or if the bot
+   * is within the rate limit cooldown window. Avatar failures are non-fatal —
+   * the bot continues with its previous avatar. */
+  private async set_bot_avatar(
+    bot: PoolBot,
+    archetype: ArchetypeRole,
+  ): Promise<void> {
+    if (!this.avatar_handler) {
+      console.log(`[pool] No avatar handler registered — skipping avatar set for pool-${String(bot.id)}`);
+      return;
+    }
+
+    // Skip if archetype hasn't changed since last avatar set
+    if (bot.last_avatar_archetype === archetype) {
+      console.log(
+        `[pool] pool-${String(bot.id)} already has ${archetype} avatar — skipping`,
+      );
+      return;
+    }
+
+    // Rate limit: skip if within cooldown window
+    if (bot.last_avatar_set_at) {
+      const elapsed = Date.now() - bot.last_avatar_set_at.getTime();
+      if (elapsed < AVATAR_COOLDOWN_MS) {
+        const remaining_min = Math.ceil((AVATAR_COOLDOWN_MS - elapsed) / 60_000);
+        console.log(
+          `[pool] pool-${String(bot.id)} avatar rate-limited — ${String(remaining_min)}min remaining. ` +
+          `Keeping ${bot.last_avatar_archetype ?? "default"} avatar`,
+        );
+        return;
+      }
+    }
+
+    const agent_name = resolve_agent_name(archetype, this.config);
+
+    try {
+      await this.avatar_handler(bot.state_dir, agent_name);
+      bot.last_avatar_archetype = archetype;
+      bot.last_avatar_set_at = new Date();
+      console.log(`[pool] Set pool-${String(bot.id)} avatar to ${agent_name}`);
+    } catch (err) {
+      // Non-fatal: bot continues with its previous avatar
+      console.log(`[pool] Avatar set failed for pool-${String(bot.id)}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pool", bot_id: String(bot.id), action: "set_avatar" },
+      });
     }
   }
 

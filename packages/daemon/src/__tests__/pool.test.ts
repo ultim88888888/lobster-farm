@@ -54,6 +54,8 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     last_active: null,
     assigned_at: null,
     state_dir: `/tmp/test-pool-${String(overrides.id)}`,
+    last_avatar_archetype: null,
+    last_avatar_set_at: null,
     ...overrides,
   };
 }
@@ -78,6 +80,8 @@ describe("BotPool", () => {
     vi.spyOn(pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> }, "write_access_json" as never)
       .mockResolvedValue(undefined);
     vi.spyOn(pool as unknown as { set_bot_nickname: (d: string, a: string) => Promise<void> }, "set_bot_nickname" as never)
+      .mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as { set_bot_avatar: (b: PoolBot, a: string) => Promise<void> }, "set_bot_avatar" as never)
       .mockResolvedValue(undefined);
     vi.spyOn(pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> }, "start_tmux" as never)
       .mockResolvedValue(undefined);

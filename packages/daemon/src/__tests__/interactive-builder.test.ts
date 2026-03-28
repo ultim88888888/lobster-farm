@@ -95,6 +95,8 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     last_active: null,
     assigned_at: null,
     state_dir: `/tmp/test-pool-${String(overrides.id)}`,
+    last_avatar_archetype: null,
+    last_avatar_set_at: null,
     ...overrides,
   };
 }
@@ -129,6 +131,8 @@ describe("Interactive builder sessions", () => {
     vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
       .mockResolvedValue(undefined);
     vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+      .mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
       .mockResolvedValue(undefined);
     vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
       .mockResolvedValue(undefined);

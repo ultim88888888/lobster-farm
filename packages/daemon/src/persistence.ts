@@ -98,6 +98,17 @@ export interface PersistedPoolBot {
   session_id: string | null;
   last_active: string | null;  // ISO timestamp
   assigned_at?: string | null;  // ISO timestamp — when the bot was assigned to its current channel
+  /** The archetype whose avatar is currently set on this bot's Discord profile.
+   * Persisted so we don't redundantly set avatars on restart. */
+  last_avatar_archetype?: ArchetypeRole | null;
+}
+
+/** Per-bot avatar state, persisted for ALL bots (including free ones).
+ * A bot's Discord profile avatar persists even when the bot is released from
+ * the pool — we need to track it across assignment cycles. */
+export interface PersistedBotAvatarState {
+  archetype: ArchetypeRole;
+  set_at: string;  // ISO timestamp
 }
 
 /** Persisted pool state: bots + session history for cross-eviction resume. */
@@ -106,19 +117,25 @@ export interface PersistedPoolState {
   /** Maps "{entity_id}:{channel_id}" → session_id. Preserved across evictions
    * so a channel can resume its old session when a bot is reassigned to it. */
   session_history: Record<string, string>;
+  /** Per-bot avatar state, keyed by bot ID string. Persisted for ALL bots
+   * (including free ones) because the Discord profile avatar persists
+   * independently of pool assignment. */
+  avatar_state?: Record<string, PersistedBotAvatarState>;
 }
 
-/** Save pool state (bots + session history) to disk. */
+/** Save pool state (bots + session history + avatar state) to disk. */
 export async function save_pool_state(
   bots: PersistedPoolBot[],
   config: LobsterFarmConfig,
   session_history?: Record<string, string>,
+  avatar_state?: Record<string, PersistedBotAvatarState>,
 ): Promise<void> {
   const path = pool_state_path(config);
   await mkdir(dirname(path), { recursive: true });
   const state: PersistedPoolState = {
     bots,
     session_history: session_history ?? {},
+    avatar_state: avatar_state ?? {},
   };
   await writeFile(path, JSON.stringify(state, null, 2), "utf-8");
 }
@@ -139,31 +156,35 @@ export async function load_pool_state(
     // Old format: plain array of bots
     if (Array.isArray(data)) {
       console.log(`[pool] Loaded pool-state.json (old array format, ${String(data.length)} entries)`);
-      return { bots: data as PersistedPoolBot[], session_history: {} };
+      return { bots: data as PersistedPoolBot[], session_history: {}, avatar_state: {} };
     }
 
-    // New format: { bots, session_history }
+    // New format: { bots, session_history, avatar_state? }
     if (typeof data === "object" && data !== null && "bots" in data) {
       const obj = data as Record<string, unknown>;
       const bots = Array.isArray(obj["bots"]) ? (obj["bots"] as PersistedPoolBot[]) : [];
       const history = (typeof obj["session_history"] === "object" && obj["session_history"] !== null && !Array.isArray(obj["session_history"]))
         ? (obj["session_history"] as Record<string, string>)
         : {};
+      const avatars = (typeof obj["avatar_state"] === "object" && obj["avatar_state"] !== null && !Array.isArray(obj["avatar_state"]))
+        ? (obj["avatar_state"] as Record<string, PersistedBotAvatarState>)
+        : {};
       console.log(
         `[pool] Loaded pool-state.json (${String(bots.length)} bots, ` +
-        `${String(Object.keys(history).length)} history entries)`,
+        `${String(Object.keys(history).length)} history entries, ` +
+        `${String(Object.keys(avatars).length)} avatar entries)`,
       );
-      return { bots, session_history: history };
+      return { bots, session_history: history, avatar_state: avatars };
     }
 
     console.log("[pool] pool-state.json has unexpected format — starting fresh");
-    return { bots: [], session_history: {} };
+    return { bots: [], session_history: {}, avatar_state: {} };
   } catch (err) {
     const msg = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT'
       ? "file not found"
       : String(err);
     console.log(`[pool] Could not load pool-state.json: ${msg} — starting fresh`);
-    return { bots: [], session_history: {} };
+    return { bots: [], session_history: {}, avatar_state: {} };
   }
 }
 

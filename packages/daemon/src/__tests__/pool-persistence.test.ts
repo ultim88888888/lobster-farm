@@ -82,6 +82,8 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     last_active: null,
     assigned_at: null,
     state_dir: `/tmp/test-pool-${String(overrides.id)}`,
+    last_avatar_archetype: null,
+    last_avatar_set_at: null,
     ...overrides,
   };
 }
@@ -167,7 +169,7 @@ describe("save_pool_state / load_pool_state", () => {
   it("returns empty state when file does not exist", async () => {
     const config = make_config();
     const result = await load_pool_state(config);
-    expect(result).toEqual({ bots: [], session_history: {} });
+    expect(result).toEqual({ bots: [], session_history: {}, avatar_state: {} });
   });
 
   it("returns empty state for malformed JSON", async () => {
@@ -177,7 +179,7 @@ describe("save_pool_state / load_pool_state", () => {
     await writeFile(join(state_path, "pool-state.json"), "not valid json{{{", "utf-8");
 
     const result = await load_pool_state(config);
-    expect(result).toEqual({ bots: [], session_history: {} });
+    expect(result).toEqual({ bots: [], session_history: {}, avatar_state: {} });
   });
 
   it("backward compat: loads old-format plain array as bots-only", async () => {
@@ -222,6 +224,8 @@ describe("BotPool persistence", () => {
     vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
       .mockResolvedValue(undefined);
     vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+      .mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
       .mockResolvedValue(undefined);
     vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
       .mockResolvedValue(undefined);
@@ -312,6 +316,8 @@ describe("BotPool persistence", () => {
       vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
         .mockResolvedValue(undefined);
@@ -581,6 +587,8 @@ describe("BotPool persistence", () => {
         .mockResolvedValue(undefined);
       vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
         .mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
+        .mockResolvedValue(undefined);
       vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
@@ -610,6 +618,8 @@ describe("BotPool persistence", () => {
       vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "write_access_json" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "start_tmux" as never)
         .mockResolvedValue(undefined);
@@ -853,6 +863,8 @@ describe("BotPool persistence", () => {
       vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_avatar" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
         .mockResolvedValue(undefined);
@@ -1205,6 +1217,8 @@ describe("BotPool persistence", () => {
       vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
+        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_avatar" as never)
         .mockResolvedValue(undefined);
       vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
         .mockResolvedValue(undefined);
