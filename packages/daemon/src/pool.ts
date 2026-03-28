@@ -24,6 +24,8 @@ export interface PoolBot {
   session_id: string | null;
   tmux_session: string;
   last_active: Date | null;
+  /** When this bot was assigned to its current channel. Used for uptime calculation. */
+  assigned_at: Date | null;
   state_dir: string;
 }
 
@@ -206,6 +208,7 @@ export class BotPool extends EventEmitter {
         session_id: null,
         tmux_session,
         last_active: is_running ? new Date() : null,
+        assigned_at: is_running ? new Date() : null,
         state_dir,
       });
     }
@@ -244,6 +247,7 @@ export class BotPool extends EventEmitter {
         bot.channel_type = entry.channel_type;
         bot.session_id = entry.session_id;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
+        bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
       } else {
         // tmux is dead — mark as parked with preserved session ID.
         // When someone messages the channel, existing parked-bot auto-resume
@@ -255,6 +259,7 @@ export class BotPool extends EventEmitter {
         bot.channel_type = entry.channel_type;
         bot.session_id = entry.session_id;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
+        bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
 
         // If this bot was actively assigned (not already parked) before shutdown
         // and has a session_id, it's a candidate for proactive resume.
@@ -550,6 +555,7 @@ export class BotPool extends EventEmitter {
       bot.channel_type = channel_type ?? null;
       bot.session_id = session_id;
       bot.last_active = new Date();
+      bot.assigned_at = new Date();
 
       // Consume session history entry now that it's been used
       const assign_key = `${entity_id}:${channel_id}`;
@@ -602,6 +608,7 @@ export class BotPool extends EventEmitter {
       bot.channel_type = null;
       bot.session_id = null;
       bot.last_active = null;
+      bot.assigned_at = null;
 
       // Clear access.json
       await this.write_access_json(bot.state_dir, null);
@@ -836,6 +843,7 @@ export class BotPool extends EventEmitter {
       bot.channel_type = null;
       bot.session_id = null;
       bot.last_active = null;
+      bot.assigned_at = null;
       changed = true;
 
       this.emit("bot:session_ended", event_data);
@@ -876,6 +884,7 @@ export class BotPool extends EventEmitter {
         channel_type: b.channel_type,
         session_id: b.session_id,
         last_active: b.last_active?.toISOString() ?? null,
+        assigned_at: b.assigned_at?.toISOString() ?? null,
       }));
 
     // Convert session_history Map to a plain object for serialization

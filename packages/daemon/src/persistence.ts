@@ -97,6 +97,7 @@ export interface PersistedPoolBot {
   channel_type: ChannelType | null;
   session_id: string | null;
   last_active: string | null;  // ISO timestamp
+  assigned_at?: string | null;  // ISO timestamp — when the bot was assigned to its current channel
 }
 
 /** Persisted pool state: bots + session history for cross-eviction resume. */

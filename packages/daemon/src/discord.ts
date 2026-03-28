@@ -33,7 +33,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
 import type { TaskQueue } from "./queue.js";
-import type { BotPool } from "./pool.js";
+import type { BotPool, PoolBot } from "./pool.js";
 
 const exec = promisify(execFile);
 
@@ -50,6 +50,19 @@ function nwo_from_url(url: string): string | undefined {
   return undefined;
 }
 
+
+// ── Formatting helpers ──
+
+/** Format the duration between a start time and now as a human-readable string (e.g., "2h 14m"). */
+export function format_duration(start: Date): string {
+  const ms = Date.now() - start.getTime();
+  if (ms < 0) return "0m";
+  const total_minutes = Math.floor(ms / 60_000);
+  const hours = Math.floor(total_minutes / 60);
+  const minutes = total_minutes % 60;
+  if (hours > 0) return `${String(hours)}h ${String(minutes)}m`;
+  return `${String(minutes)}m`;
+}
 
 // ── Channel index entry ──
 
@@ -915,7 +928,7 @@ export class DiscordBot extends EventEmitter {
             "• `!lf advance <feature-id>` — advance to next phase\n" +
             "• `!lf swap <agent>` — swap active agent in this channel (gary, bob, pearl, ray)\n" +
             "• `!lf compact` — trigger context compaction on the active session\n" +
-            "• `!lf status` — daemon status\n" +
+            "• `!lf status` — session/entity status for this channel\n" +
             "• `!lf features [entity]` — list features\n" +
             "• `!lf scaffold server` — create GLOBAL Discord channels\n" +
             "• `!lf scaffold entity <id> <name>` — create entity Discord channels\n" +
@@ -924,7 +937,7 @@ export class DiscordBot extends EventEmitter {
         break;
 
       case "status":
-        await this.handle_status_command(message);
+        await this.handle_status_command(routed, message);
         break;
 
       case "plan":
@@ -960,36 +973,130 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  private async handle_status_command(message: Message): Promise<void> {
+  private async handle_status_command(routed: RoutedMessage, message: Message): Promise<void> {
+    const pool = this._pool;
     const features = this._features;
-    const queue = this._queue;
+    const entity_id = routed.entity_id;
+    const is_entity_channel = entity_id !== "_global";
 
-    const lines = ["**LobsterFarm Status**"];
-    lines.push(`Entities: ${String(this.registry.count())} (${String(this.registry.get_active().length)} active)`);
+    // Build pool summary (used in all contexts)
+    const pool_summary = pool ? this.format_pool_summary(pool) : null;
 
-    if (queue) {
-      const stats = queue.get_stats();
-      lines.push(`Queue: ${String(stats.active)} active, ${String(stats.pending)} pending`);
+    // No entity context — global channel (e.g., #command-center)
+    if (!is_entity_channel) {
+      await this.reply(message, "No active session in this channel." +
+        (pool_summary ? `\n\n${pool_summary}` : ""));
+      return;
     }
+
+    // Entity-level channels without session-specific info (e.g., #alerts, #work-log)
+    // Show entity summary without session details.
+    const assignment = pool?.get_assignment(message.channelId);
+    if (!assignment && routed.channel_type !== "general" && routed.channel_type !== "work_room") {
+      const lines = this.format_entity_summary(entity_id, features);
+      if (pool_summary) lines.push("", pool_summary);
+      await this.reply(message, lines.join("\n"));
+      return;
+    }
+
+    // Entity channel with no bot assigned
+    if (!assignment) {
+      const lines = ["No active session in this channel."];
+      const entity_lines = this.format_entity_summary(entity_id, features);
+      lines.push("", ...entity_lines);
+      if (pool_summary) lines.push("", pool_summary);
+      await this.reply(message, lines.join("\n"));
+      return;
+    }
+
+    // Full session status — bot is assigned to this channel
+    const lines = this.format_session_status(assignment, routed, features);
+    if (pool_summary) lines.push("", pool_summary);
+    await this.reply(message, lines.join("\n"));
+  }
+
+  /** Format the full session status block for a channel with an assigned bot. */
+  private format_session_status(
+    bot: PoolBot,
+    routed: RoutedMessage,
+    features: FeatureManager | null,
+  ): string[] {
+    const identity = bot.archetype
+      ? this.resolve_agent_identity(bot.archetype)
+      : null;
+    const agent_label = identity
+      ? `${identity.name} (${bot.archetype})`
+      : "unknown";
+
+    const lines = [
+      "**Session Status**",
+      `Agent: ${agent_label}`,
+      `Entity: ${bot.entity_id ?? routed.entity_id}`,
+      `Channel: <#${routed.channel_id}>`,
+    ];
+
+    if (bot.session_id) {
+      lines.push(`Session: \`${bot.session_id.slice(0, 8)}\``);
+    }
+
+    // Uptime from assigned_at, falling back to last_active
+    const start_time = bot.assigned_at ?? bot.last_active;
+    if (start_time) {
+      lines.push(`Uptime: ${format_duration(start_time)}`);
+    }
+
+    lines.push(`Bot: pool-${String(bot.id)} (lf-${String(bot.id)})`);
+
+    // Active features for this entity
+    if (features && bot.entity_id) {
+      const entity_features = features.get_features_by_entity(bot.entity_id)
+        .filter(f => f.phase !== "done");
+      if (entity_features.length > 0) {
+        lines.push("");
+        lines.push("**Active features:**");
+        for (const f of entity_features) {
+          let entry = `- #${String(f.githubIssue)} ${f.title} -- ${f.phase} phase`;
+          if (f.discordWorkRoom) {
+            entry += ` (<#${f.discordWorkRoom}>)`;
+          }
+          if (f.blocked) entry += " **(BLOCKED)**";
+          lines.push(entry);
+        }
+      }
+    }
+
+    return lines;
+  }
+
+  /** Format an entity-level summary (features, no session info). */
+  private format_entity_summary(
+    entity_id: string,
+    features: FeatureManager | null,
+  ): string[] {
+    const lines = [`**${entity_id}**`];
 
     if (features) {
-      const all = features.list_features();
-      const by_phase = new Map<string, number>();
-      for (const f of all) {
-        by_phase.set(f.phase, (by_phase.get(f.phase) ?? 0) + 1);
-      }
-      if (all.length > 0) {
-        const phase_summary = [...by_phase.entries()]
-          .map(([p, c]) => `${p}: ${String(c)}`)
-          .join(", ");
-        lines.push(`Features: ${String(all.length)} total (${phase_summary})`);
+      const entity_features = features.get_features_by_entity(entity_id)
+        .filter(f => f.phase !== "done");
+      if (entity_features.length > 0) {
+        lines.push("Active features:");
+        for (const f of entity_features) {
+          let entry = `- #${String(f.githubIssue)} ${f.title} -- ${f.phase} phase`;
+          if (f.blocked) entry += " **(BLOCKED)**";
+          lines.push(entry);
+        }
       } else {
-        lines.push("Features: none");
+        lines.push("No active features.");
       }
     }
 
-    lines.push(`Discord: connected`);
-    await this.reply(message, lines.join("\n"));
+    return lines;
+  }
+
+  /** Format pool capacity summary. */
+  private format_pool_summary(pool: BotPool): string {
+    const status = pool.get_status();
+    return `Pool: ${String(status.assigned)}/${String(status.total)} assigned, ${String(status.free)} free`;
   }
 
   private async handle_plan_command(

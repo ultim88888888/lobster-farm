@@ -52,6 +52,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     session_id: null,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
+    assigned_at: null,
     state_dir: `/tmp/test-pool-${String(overrides.id)}`,
     ...overrides,
   };
