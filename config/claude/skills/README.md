@@ -6,7 +6,7 @@ Skills fall into three categories:
 
 - **DNA** -- Deep domain knowledge. How we write code, design interfaces, plan features, manage databases. Loaded by the primary archetype for that domain.
 - **Guidelines** -- Operational requirements. Secret handling, code review standards, README maintenance, Discord management. Loaded across archetypes as needed.
-- **SOPs** -- Step-by-step procedures. Feature lifecycle flow, PR review-merge workflow, entity scaffolding process. Loaded when executing a specific process.
+- **SOPs** -- Step-by-step procedures. PR review-merge workflow, entity scaffolding process. Loaded when executing a specific process.
 
 ## Directories
 
@@ -18,6 +18,5 @@ Skills fall into three categories:
 - `secrets-guideline/` -- 1Password-based secret management. The "never handle raw secrets" rule.
 - `readme-guideline/` -- Directory documentation standards. When and how to write READMEs.
 - `discord-guideline/` -- Discord server management. Channel scaffolding, bot architecture, webhook patterns.
-- `feature-lifecycle/` -- SOP for how features move from idea to shipped code.
 - `pr-review-merge/` -- SOP for the PR review, feedback, and merge workflow.
 - `entity-scaffold/` -- SOP for standing up a new entity from a blueprint.
