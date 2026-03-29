@@ -33,7 +33,6 @@ import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { RoutedMessage } from "./router.js";
-import type { TaskQueue } from "./queue.js";
 import type { BotPool, PoolBot } from "./pool.js";
 import { fetch_subscription_usage } from "./usage-api.js";
 import { read_session_context } from "./session-context.js";
@@ -1035,13 +1034,7 @@ export class DiscordBot extends EventEmitter {
     );
   }
 
-  /** Set reference to queue for command handling. */
-  private _queue: TaskQueue | null = null;
   private _pool: BotPool | null = null;
-
-  set_managers(queue: TaskQueue): void {
-    this._queue = queue;
-  }
 
   set_pool(pool: BotPool): void {
     this._pool = pool;
@@ -1703,20 +1696,6 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // Guard: warn if there's an active feature lifecycle in this room
-    if (this._features) {
-      const active_features = this._features.get_features_by_entity(routed.entity_id).filter(
-        f => f.discordWorkRoom === channel_id && !["done", "cancelled"].includes(f.phase),
-      );
-      if (active_features.length > 0 && !args.includes("--force")) {
-        const title = active_features[0]!.title ?? active_features[0]!.id;
-        await target.reply(
-          `This room has an active feature (**${title}**). Close anyway? Use \`/close\` with the \`force\` option.`,
-        );
-        return;
-      }
-    }
-
     // Determine the room name from the purpose field or the channel name
     const room_name = channel_entry.purpose ?? `room-${channel_id}`;
 
@@ -1942,7 +1921,6 @@ export class DiscordBot extends EventEmitter {
       content: "",
       author: interaction.user.tag,
       channel_id: interaction.channelId,
-      assigned_feature: entry?.assigned_feature,
     };
 
     // Extract args from interaction options, mapping to the same

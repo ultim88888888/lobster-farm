@@ -150,7 +150,6 @@ async function main(): Promise<void> {
   const bot_token = await resolve_bot_token(config);
   if (bot_token) {
     try {
-      discord.set_managers(queue);
       discord.set_pool(pool);
       set_discord_bot(discord);
       await discord.connect(bot_token);
