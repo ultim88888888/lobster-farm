@@ -1,4 +1,4 @@
-import type { ArchetypeRole, ModelName, Phase, ThinkLevel } from "./schemas/enums.js";
+import type { ArchetypeRole, ModelName, ThinkLevel } from "./schemas/enums.js";
 
 export interface ArchetypeDefaults {
   default_name: string;
@@ -53,18 +53,7 @@ export const DEFAULT_ARCHETYPES: Record<ArchetypeRole, ArchetypeDefaults> = {
   },
 } as const;
 
-/** Valid phase transitions. Keys are current phase, values are allowed next phases. */
-export const PHASE_TRANSITIONS: Record<Phase, Phase[]> = {
-  plan: ["design", "build"],
-  design: ["build"],
-  build: ["review"],
-  review: ["ship", "build"],
-  ship: ["done", "build"],
-  done: [],
-} as const;
-
 export const DEFAULT_SOPS = [
-  "feature-lifecycle",
   "pr-review-merge",
   "sentry-triage",
   "repo-scaffolding",

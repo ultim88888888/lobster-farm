@@ -6,9 +6,8 @@ import { expand_home } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
-import type { FeatureManager } from "./features.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
+import { fetch_review_comments, build_review_fix_prompt } from "./review-utils.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
@@ -86,7 +85,6 @@ export class PRReviewCron {
     private session_manager: ClaudeSessionManager,
     private config: LobsterFarmConfig,
     private discord: DiscordBot | null = null,
-    private feature_manager: FeatureManager | null = null,
     private github_app: GitHubAppAuth | null = null,
   ) {}
 
@@ -486,15 +484,8 @@ export class PRReviewCron {
     review_outcome?: "approved" | "changes_requested" | "pending",
   ): Promise<void> {
     const review_state = review_outcome ?? await detect_review_outcome(pr.number, repo_path);
-    const linked_feature = this.feature_manager?.find_by_pr(pr.number) ?? null;
 
-    if (linked_feature) {
-      // Internal PR caught by cron — feature manager handles its own transitions
-      console.log(`[pr-cron] PR #${String(pr.number)} linked to feature ${linked_feature.id} — deferring to feature manager`);
-      return;
-    }
-
-    // Non-feature PR — determine if internal (our agents) or truly external
+    // Determine if internal (our agents) or truly external
     const entity_config = this.registry.get(entity_id);
     const github_user = entity_config?.entity.accounts?.github?.user;
     const is_internal = github_user != null && pr.author.login === github_user;

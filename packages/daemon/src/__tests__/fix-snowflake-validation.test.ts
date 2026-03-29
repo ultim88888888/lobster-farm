@@ -1,8 +1,9 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, EntityConfig, FeatureState, ChannelMapping } from "@lobster-farm/shared";
+import type { LobsterFarmConfig, EntityConfig, ChannelMapping } from "@lobster-farm/shared";
 import { is_discord_snowflake, DiscordBot } from "../discord.js";
 import { EntityRegistry } from "../registry.js";
+import type { FeatureData } from "../actions.js";
 import * as actions from "../actions.js";
 
 // ── Test helpers ──
@@ -243,31 +244,17 @@ function make_actions_entity(
   });
 }
 
-function make_feature(overrides: Partial<FeatureState> = {}): FeatureState {
+function make_feature(overrides: Partial<FeatureData> = {}): FeatureData {
   return {
     id: "alpha-42",
     entity: "alpha",
     githubIssue: 42,
     title: "Test Feature",
-    phase: "build",
-    priority: "medium",
     branch: "feature/42-test-feature",
     worktreePath: "/tmp/worktree",
     discordWorkRoom: null,
     activeArchetype: "builder",
-    activeDna: ["coding-dna"],
-    sessionId: null,
-    lastSessionId: null,
-    lastBuilderSessionId: null,
-    dependsOn: [],
-    blocked: false,
-    blockedReason: null,
-    approved: false,
-    labels: [],
     prNumber: null,
-    agentDone: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
     ...overrides,
   };
 }
@@ -285,14 +272,6 @@ function make_mock_discord() {
   };
 }
 
-function make_mock_feature_manager(features: FeatureState[] = []) {
-  return {
-    get_features_by_entity: vi.fn().mockReturnValue(features),
-    get_feature: vi.fn((id: string) => features.find(f => f.id === id)),
-    list_features: vi.fn().mockReturnValue(features),
-  };
-}
-
 describe("reset_idle_work_room_topics — snowflake guard", () => {
   let discord: ReturnType<typeof make_mock_discord>;
 
@@ -300,8 +279,7 @@ describe("reset_idle_work_room_topics — snowflake guard", () => {
     discord = make_mock_discord();
     // @ts-expect-error — mock
     actions.set_discord_bot(discord);
-    // @ts-expect-error — mock
-    actions.set_feature_manager(make_mock_feature_manager([]));
+    actions.set_pool(null);
   });
 
   it("skips work rooms with placeholder IDs", async () => {
@@ -346,8 +324,6 @@ describe("assign_work_room — snowflake guard", () => {
     discord = make_mock_discord();
     // @ts-expect-error — mock
     actions.set_discord_bot(discord);
-    // @ts-expect-error — mock
-    actions.set_feature_manager(make_mock_feature_manager([]));
     actions.set_pool(null);
   });
 
@@ -404,38 +380,6 @@ describe("update_work_room_topic — snowflake guard", () => {
     await actions.update_work_room_topic(feature, "some topic");
 
     expect(discord.set_channel_topic).toHaveBeenCalledWith(VALID_WR, "some topic");
-  });
-});
-
-describe("notify_feature — snowflake guard", () => {
-  let discord: ReturnType<typeof make_mock_discord>;
-
-  beforeEach(() => {
-    discord = make_mock_discord();
-    // @ts-expect-error — mock
-    actions.set_discord_bot(discord);
-  });
-
-  it("skips Discord send when work room ID is a placeholder", async () => {
-    const feature = make_feature({
-      discordWorkRoom: "wr-1",
-      activeArchetype: "builder",
-    });
-
-    await actions.notify_feature(feature, "Build started");
-
-    expect(discord.send_as_agent).not.toHaveBeenCalled();
-  });
-
-  it("sends to Discord when work room ID is a valid snowflake", async () => {
-    const feature = make_feature({
-      discordWorkRoom: VALID_WR,
-      activeArchetype: "builder",
-    });
-
-    await actions.notify_feature(feature, "Build started");
-
-    expect(discord.send_as_agent).toHaveBeenCalledWith(VALID_WR, "Build started", "builder");
   });
 });
 

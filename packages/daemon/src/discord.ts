@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
-import { execFile, execFileSync } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 import {
   Client,
   ChannelType as DiscordChannelType,
@@ -27,14 +26,12 @@ import {
   entity_files_dir,
   entity_config_path,
   entity_memory_path,
-  expand_home,
   write_yaml,
 } from "@lobster-farm/shared";
 import { access, mkdir, writeFile, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
-import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import type { RoutedMessage } from "./router.js";
 import type { TaskQueue } from "./queue.js";
 import type { BotPool, PoolBot } from "./pool.js";
@@ -42,26 +39,10 @@ import { fetch_subscription_usage } from "./usage-api.js";
 import { read_session_context } from "./session-context.js";
 import * as sentry from "./sentry.js";
 
-const exec = promisify(execFile);
-
 /** Discord snowflake IDs are numeric strings, 17-20 digits. */
 export function is_discord_snowflake(id: string): boolean {
   return /^\d{17,20}$/.test(id);
 }
-
-/**
- * Extract GitHub owner/repo (nwo) from a repo URL.
- * Handles both SSH (git@github.com:owner/repo.git) and
- * HTTPS (https://github.com/owner/repo.git) formats.
- * Returns undefined if the URL doesn't match either pattern.
- */
-function nwo_from_url(url: string): string | undefined {
-  // SSH: git@github.com:owner/repo.git
-  const ssh_match = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
-  if (ssh_match) return ssh_match[1];
-  return undefined;
-}
-
 
 // ── Formatting helpers ──
 
@@ -94,7 +75,6 @@ export function format_relative_time(iso: string): string {
 interface ChannelEntry {
   entity_id: string;
   channel_type: ChannelType;
-  assigned_feature?: string | null;
 }
 
 // ── Command target abstraction ──
@@ -128,35 +108,6 @@ export function build_slash_commands(): SlashCommandBuilder[] {
           { name: "entity", value: "entity" },
           { name: "all", value: "all" },
         ),
-      ) as SlashCommandBuilder,
-
-    new SlashCommandBuilder()
-      .setName("features")
-      .setDescription("List active features"),
-
-    new SlashCommandBuilder()
-      .setName("plan")
-      .setDescription("Create a new feature in the plan phase")
-      .addStringOption(opt =>
-        opt.setName("title").setDescription("Feature title").setRequired(true),
-      ) as SlashCommandBuilder,
-
-    // NOTE: Spec defines `feature` as optional for /approve and /advance, but we
-    // mark it required because there's no "infer from active channel" mechanism yet.
-    // Requiring the ID is safer than silently failing. Tracked as a deliberate
-    // deviation — revisit when per-channel feature inference is implemented.
-    new SlashCommandBuilder()
-      .setName("approve")
-      .setDescription("Approve the current phase gate for a feature")
-      .addStringOption(opt =>
-        opt.setName("feature").setDescription("Feature ID").setRequired(true),
-      ) as SlashCommandBuilder,
-
-    new SlashCommandBuilder()
-      .setName("advance")
-      .setDescription("Advance a feature to the next phase")
-      .addStringOption(opt =>
-        opt.setName("feature").setDescription("Feature ID").setRequired(true),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
@@ -217,12 +168,12 @@ export function build_slash_commands(): SlashCommandBuilder[] {
 }
 
 // Commands whose responses should be ephemeral (only visible to the invoker).
-export const EPHEMERAL_COMMAND_NAMES = ["help", "status", "features", "archives"] as const;
+export const EPHEMERAL_COMMAND_NAMES = ["help", "status", "archives"] as const;
 const EPHEMERAL_COMMANDS = new Set<string>(EPHEMERAL_COMMAND_NAMES);
 
 // Commands that perform external I/O and may exceed Discord's 3-second
 // interaction response window. These get deferReply() before processing.
-const DEFERRED_COMMANDS = new Set(["plan", "scaffold", "room", "resume", "close"]);
+const DEFERRED_COMMANDS = new Set(["scaffold", "room", "resume", "close"]);
 
 /** Minimal interface for the subset of ChatInputCommandInteraction used by extract_slash_args. */
 export interface SlashInteractionLike {
@@ -245,15 +196,6 @@ export function extract_slash_args(interaction: SlashInteractionLike): string[] 
     case "status": {
       const scope = interaction.options.getString("scope");
       return scope ? [scope] : [];
-    }
-    case "plan": {
-      const title = interaction.options.getString("title") ?? "";
-      return [title];
-    }
-    case "approve":
-    case "advance": {
-      const feature = interaction.options.getString("feature");
-      return feature ? [feature] : [];
     }
     case "swap": {
       const agent = interaction.options.getString("agent") ?? "";
@@ -1077,7 +1019,6 @@ export class DiscordBot extends EventEmitter {
         this.channel_map.set(channel.id, {
           entity_id,
           channel_type: channel.type,
-          assigned_feature: channel.assigned_feature,
         });
 
         // For send_to_entity, store the first channel of each type
@@ -1094,13 +1035,11 @@ export class DiscordBot extends EventEmitter {
     );
   }
 
-  /** Set references to feature manager and queue for command handling. */
-  private _features: FeatureManager | null = null;
+  /** Set reference to queue for command handling. */
   private _queue: TaskQueue | null = null;
   private _pool: BotPool | null = null;
 
-  set_managers(features: FeatureManager, queue: TaskQueue): void {
-    this._features = features;
+  set_managers(queue: TaskQueue): void {
     this._queue = queue;
   }
 
@@ -1181,18 +1120,8 @@ export class DiscordBot extends EventEmitter {
       }
 
       if (!assignment) {
-        // Determine archetype: check if channel has a feature with an active phase
-        let archetype: ArchetypeRole = "planner"; // default
-        if (this._features && entry.assigned_feature) {
-          const feature = this._features.get_feature(entry.assigned_feature);
-          if (feature) {
-            const phase_archetypes: Record<string, ArchetypeRole> = {
-              plan: "planner", design: "designer", build: "builder",
-              review: "reviewer", ship: "planner", done: "planner",
-            };
-            archetype = phase_archetypes[feature.phase] ?? "planner";
-          }
-        }
+        // Default to planner archetype for new auto-assigned sessions
+        const archetype: ArchetypeRole = "planner";
 
         // Show the user we're working on it
         try { await message.react("⏳"); } catch { /* ignore */ }
@@ -1238,9 +1167,6 @@ export class DiscordBot extends EventEmitter {
       case "help":
         await target.reply(
           "**LobsterFarm Commands:**\n" +
-            "• `/plan <title>` — create a feature in plan phase\n" +
-            "• `/approve [feature-id]` — approve current phase gate\n" +
-            "• `/advance [feature-id]` — advance to next phase\n" +
             "• `/swap <agent>` — swap active agent in this channel\n" +
             "• `/compact` — trigger context compaction on the active session\n" +
             "• `/room <name>` — create an on-demand work room with a pool bot\n" +
@@ -1248,7 +1174,6 @@ export class DiscordBot extends EventEmitter {
             "• `/resume <name>` — restore an archived work room session\n" +
             "• `/archives` — list archived work room sessions\n" +
             "• `/status` — session/entity status for this channel\n" +
-            "• `/features` — list features\n" +
             "• `/scaffold <name>` — create Discord channels\n" +
             "• `/reset` — reset the current session\n" +
             "• `/help` — this message",
@@ -1257,22 +1182,6 @@ export class DiscordBot extends EventEmitter {
 
       case "status":
         await this.handle_status_command(routed, target);
-        break;
-
-      case "plan":
-        await this.handle_plan_command(args, routed, target);
-        break;
-
-      case "approve":
-        await this.handle_approve_command(args, target);
-        break;
-
-      case "advance":
-        await this.handle_advance_command(args, target);
-        break;
-
-      case "features":
-        await this.handle_features_command(args, target);
         break;
 
       case "scaffold":
@@ -1314,7 +1223,6 @@ export class DiscordBot extends EventEmitter {
 
   private async handle_status_command(routed: RoutedMessage, target: CommandTarget): Promise<void> {
     const pool = this._pool;
-    const features = this._features;
     const entity_id = routed.entity_id;
     const is_entity_channel = entity_id !== "_global";
 
@@ -1329,10 +1237,9 @@ export class DiscordBot extends EventEmitter {
     }
 
     // Entity-level channels without session-specific info (e.g., #alerts, #work-log)
-    // Show entity summary without session details.
     const assignment = pool?.get_assignment(target.channel_id);
     if (!assignment && routed.channel_type !== "general" && routed.channel_type !== "work_room") {
-      const lines = this.format_entity_summary(entity_id, features);
+      const lines = [`**${entity_id}**`];
       if (pool_summary) lines.push("", pool_summary);
       await target.reply(lines.join("\n"));
       return;
@@ -1341,19 +1248,14 @@ export class DiscordBot extends EventEmitter {
     // Entity channel with no bot assigned
     if (!assignment) {
       const lines = ["No active session in this channel."];
-      const entity_lines = this.format_entity_summary(entity_id, features);
-      lines.push("", ...entity_lines);
+      lines.push("", `**${entity_id}**`);
       if (pool_summary) lines.push("", pool_summary);
       await target.reply(lines.join("\n"));
       return;
     }
 
     // Full session status — bot is assigned to this channel.
-    // Fetch context and subscription usage on demand from direct data sources:
-    // - Context: parsed from the session's JSONL transcript file
-    // - Subscription: fetched from Anthropic's OAuth API
-    // Both are best-effort — failures are silently swallowed, we show what we can.
-    const lines = await this.format_session_status(assignment, routed, features);
+    const lines = await this.format_session_status(assignment, routed);
     if (pool_summary) lines.push("", pool_summary);
     await target.reply(lines.join("\n"));
   }
@@ -1362,8 +1264,7 @@ export class DiscordBot extends EventEmitter {
    * Fetches context and subscription usage on demand from live data sources. */
   private async format_session_status(
     bot: PoolBot,
-    routed: RoutedMessage,
-    features: FeatureManager | null,
+    _routed: RoutedMessage,
   ): Promise<string[]> {
     const identity = bot.archetype
       ? this.resolve_agent_identity(bot.archetype)
@@ -1410,49 +1311,6 @@ export class DiscordBot extends EventEmitter {
       lines.push(`Usage: ${subscription_usage.summary}`);
     }
 
-    // Active features for this entity
-    if (features && bot.entity_id) {
-      const entity_features = features.get_features_by_entity(bot.entity_id)
-        .filter(f => f.phase !== "done");
-      if (entity_features.length > 0) {
-        lines.push("");
-        lines.push("**Active features:**");
-        for (const f of entity_features) {
-          let entry = `- #${String(f.githubIssue)} ${f.title} -- ${f.phase} phase`;
-          if (f.discordWorkRoom) {
-            entry += ` (<#${f.discordWorkRoom}>)`;
-          }
-          if (f.blocked) entry += " **(BLOCKED)**";
-          lines.push(entry);
-        }
-      }
-    }
-
-    return lines;
-  }
-
-  /** Format an entity-level summary (features, no session info). */
-  private format_entity_summary(
-    entity_id: string,
-    features: FeatureManager | null,
-  ): string[] {
-    const lines = [`**${entity_id}**`];
-
-    if (features) {
-      const entity_features = features.get_features_by_entity(entity_id)
-        .filter(f => f.phase !== "done");
-      if (entity_features.length > 0) {
-        lines.push("Active features:");
-        for (const f of entity_features) {
-          let entry = `- #${String(f.githubIssue)} ${f.title} -- ${f.phase} phase`;
-          if (f.blocked) entry += " **(BLOCKED)**";
-          lines.push(entry);
-        }
-      } else {
-        lines.push("No active features.");
-      }
-    }
-
     return lines;
   }
 
@@ -1460,179 +1318,6 @@ export class DiscordBot extends EventEmitter {
   private format_pool_summary(pool: BotPool): string {
     const status = pool.get_status();
     return `Pool: ${String(status.assigned)}/${String(status.total)} assigned, ${String(status.free)} free`;
-  }
-
-  private async handle_plan_command(
-    args: string[],
-    routed: RoutedMessage,
-    target: CommandTarget,
-  ): Promise<void> {
-    const features = this._features;
-    if (!features) {
-      await target.reply("Feature manager not available.");
-      return;
-    }
-
-    // /plan title:"..." — if entity_id is omitted, use the channel's entity
-    let entity_id: string;
-    let title: string;
-
-    if (args.length === 0) {
-      await target.reply("Usage: `/plan <title>` (in an entity channel)");
-      return;
-    }
-
-    // Check if first arg is a known entity
-    const first_arg = args[0]!;
-    if (this.registry.get(first_arg)) {
-      entity_id = first_arg;
-      title = args.slice(1).join(" ");
-    } else {
-      entity_id = routed.entity_id;
-      title = args.join(" ");
-    }
-
-    if (!title) {
-      await target.reply("Please provide a title for the feature.");
-      return;
-    }
-
-    // Resolve the GitHub repo for issue creation
-    const entity_config = this.registry.get(entity_id);
-    if (!entity_config) {
-      await target.reply(`Entity "${entity_id}" not found.`);
-      return;
-    }
-
-    const repo = entity_config.entity.repos[0];
-    if (!repo) {
-      await target.reply(`Entity "${entity_id}" has no repos configured. Cannot create GitHub issue.`);
-      return;
-    }
-
-    const nwo = nwo_from_url(repo.url);
-    if (!nwo) {
-      await target.reply(`Could not parse GitHub owner/repo from URL: ${repo.url}`);
-      return;
-    }
-
-    // Create a real GitHub issue
-    let issue_number: number;
-    try {
-      const repo_path = expand_home(repo.path);
-      const { stdout } = await exec("gh", [
-        "issue", "create",
-        "--repo", nwo,
-        "--title", title,
-        "--body", "",
-      ], { cwd: repo_path, timeout: 30_000 });
-
-      // gh issue create outputs the issue URL, e.g. https://github.com/owner/repo/issues/42
-      const url_match = stdout.trim().match(/\/issues\/(\d+)$/);
-      if (!url_match) {
-        await target.reply(`GitHub issue created but could not parse issue number from: ${stdout.trim()}`);
-        return;
-      }
-      issue_number = Number(url_match[1]);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await target.reply(`Failed to create GitHub issue: ${msg}`);
-      return;
-    }
-
-    try {
-      const feature = await features.create_feature({
-        entity_id,
-        title,
-        github_issue: issue_number,
-      });
-
-      await target.reply(
-        `Feature **${feature.id}** created: "${title}"\n` +
-          `Phase: plan | Issue: #${String(issue_number)}\n` +
-          `Approve with \`/approve ${feature.id}\`, then advance with \`/advance ${feature.id}\``,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await target.reply(`Failed to create feature: ${msg}`);
-    }
-  }
-
-  private async handle_approve_command(args: string[], target: CommandTarget): Promise<void> {
-    const features = this._features;
-    if (!features) {
-      await target.reply("Feature manager not available.");
-      return;
-    }
-
-    const feature_id = args[0];
-    if (!feature_id) {
-      await target.reply("Usage: `/approve <feature-id>`");
-      return;
-    }
-
-    try {
-      const feature = features.approve_phase(feature_id);
-      await target.reply(
-        `Approved phase **${feature.phase}** for ${feature_id}. ` +
-          `Use \`/advance ${feature_id}\` to proceed.`,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await target.reply(`Failed to approve: ${msg}`);
-    }
-  }
-
-  private async handle_advance_command(args: string[], target: CommandTarget): Promise<void> {
-    const features = this._features;
-    if (!features) {
-      await target.reply("Feature manager not available.");
-      return;
-    }
-
-    const feature_id = args[0];
-    if (!feature_id) {
-      await target.reply("Usage: `/advance <feature-id>`");
-      return;
-    }
-
-    try {
-      const feature = await features.advance_feature(feature_id);
-      await target.reply(
-        `Feature **${feature_id}** advanced to **${feature.phase}** phase.`,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await target.reply(`Failed to advance: ${msg}`);
-    }
-  }
-
-  private async handle_features_command(args: string[], target: CommandTarget): Promise<void> {
-    const features = this._features;
-    if (!features) {
-      await target.reply("Feature manager not available.");
-      return;
-    }
-
-    const entity_filter = args[0];
-    const all = entity_filter
-      ? features.get_features_by_entity(entity_filter)
-      : features.list_features();
-
-    if (all.length === 0) {
-      await target.reply("No features found.");
-      return;
-    }
-
-    const lines = all.map((f) => {
-      let status = `**${f.id}** — ${f.title} [${f.phase}]`;
-      if (f.blocked) status += " (BLOCKED)";
-      if (f.approved) status += " (approved)";
-      if (f.sessionId) status += " (active session)";
-      return status;
-    });
-
-    await target.reply(lines.join("\n"));
   }
 
   private async handle_scaffold_command(
@@ -1755,7 +1440,7 @@ export class DiscordBot extends EventEmitter {
           `• Memory: \`${mem_path}\`\n` +
           `• Discord: ${String(channels.length)} channels\n` +
           channel_lines.join("\n") + "\n\n" +
-          `Ready to use. Try \`/plan "Your first feature"\``,
+          `Ready to use. Try \`/room "your-first-room"\``,
       );
     } else if (sub === "server") {
       await target.reply("Scaffolding global Discord structure...");

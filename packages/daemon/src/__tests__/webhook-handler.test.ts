@@ -6,8 +6,6 @@ import { handle_github_webhook, type WebhookContext } from "../webhook-handler.j
 import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
 import type { ClaudeSessionManager } from "../session.js";
-import type { FeatureManager } from "../features.js";
-
 // ── Test helpers ──
 
 const WEBHOOK_SECRET = "test-secret-for-webhook-tests";
@@ -125,18 +123,11 @@ function make_session_manager(): ClaudeSessionManager {
   return manager as unknown as ClaudeSessionManager;
 }
 
-function make_feature_manager(): FeatureManager {
-  return {
-    find_by_pr: vi.fn().mockReturnValue(null),
-  } as unknown as FeatureManager;
-}
-
 function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
   return {
     github_app: make_github_app(),
     session_manager: make_session_manager(),
     registry: make_registry(),
-    feature_manager: make_feature_manager(),
     discord: null,
     ...overrides,
   };

@@ -8,13 +8,11 @@ export interface RoutedMessage {
   content: string;
   author: string;
   channel_id: string;
-  assigned_feature?: string | null;
 }
 
 export type RouteAction =
   | { type: "command"; name: string; args: string[] }
   | { type: "classify"; archetype: ArchetypeRole; prompt: string }
-  | { type: "route_to_session"; feature_id: string; content: string }
   | { type: "approval_response"; content: string }
   | { type: "ask_clarification"; message: string }
   | { type: "ignore" };
@@ -115,7 +113,7 @@ function classify_intent(content: string): Classification | null {
  * Takes a message with entity/channel context and returns the action to take.
  */
 export function route_message(msg: RoutedMessage): RouteAction {
-  const { content, channel_type, assigned_feature } = msg;
+  const { content, channel_type } = msg;
 
   // Rule 1: Command prefix
   const command = parse_command(content);
@@ -128,16 +126,7 @@ export function route_message(msg: RoutedMessage): RouteAction {
     return { type: "approval_response", content };
   }
 
-  // Rule 3: Work room with assigned feature
-  if (channel_type === "work_room" && assigned_feature) {
-    return {
-      type: "route_to_session",
-      feature_id: assigned_feature,
-      content,
-    };
-  }
-
-  // Rule 4: General channel — classify intent
+  // Rule 3: General channel — classify intent
   if (channel_type === "general") {
     const classification = classify_intent(content);
     if (classification && classification.confidence >= 0.3) {
@@ -152,9 +141,8 @@ export function route_message(msg: RoutedMessage): RouteAction {
       type: "ask_clarification",
       message:
         "I'm not sure what you'd like me to do. Try:\n" +
-        "• `/plan <title>` — start planning a feature\n" +
-        "• `/features` — list active features\n" +
         "• `/status` — check daemon status\n" +
+        "• `/room <name>` — create a work room\n" +
         "• Or describe what you need (e.g., \"build the login page\")",
     };
   }

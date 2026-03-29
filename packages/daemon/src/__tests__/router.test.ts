@@ -124,25 +124,11 @@ describe("route_message", () => {
   });
 
   describe("work room routing", () => {
-    it("routes to assigned feature session", () => {
-      const result = route_message(make_msg({
-        channel_type: "work_room",
-        content: "Use a grid layout for the cards",
-        assigned_feature: "alpha-42",
-      }));
-      expect(result.type).toBe("route_to_session");
-      if (result.type === "route_to_session") {
-        expect(result.feature_id).toBe("alpha-42");
-      }
-    });
-
-    it("does not route unassigned work room messages", () => {
+    it("ignores non-command work room messages", () => {
       const result = route_message(make_msg({
         channel_type: "work_room",
         content: "hello",
-        assigned_feature: null,
       }));
-      // No assigned feature, falls through to ignore
       expect(result.type).toBe("ignore");
     });
   });

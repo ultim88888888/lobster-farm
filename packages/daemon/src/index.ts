@@ -4,9 +4,8 @@ import { EntityRegistry } from "./registry.js";
 import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
 import { TaskQueue } from "./queue.js";
-import { FeatureManager } from "./features.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
-import { set_discord_bot, set_feature_manager, set_pool, reset_idle_work_room_topics } from "./actions.js";
+import { set_discord_bot, set_pool, reset_idle_work_room_topics } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
@@ -14,7 +13,6 @@ import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
-import type { Phase } from "@lobster-farm/shared";
 import { append_session_log } from "./persistence.js";
 import * as sentry from "./sentry.js";
 
@@ -39,38 +37,27 @@ async function main(): Promise<void> {
       `(${String(registry.get_active().length)} active)`,
   );
 
-  // Initialize session manager + task queue + feature manager
+  // Initialize session manager + task queue
   const session_manager = new ClaudeSessionManager(config);
   const queue = new TaskQueue(session_manager, config);
-  const feature_manager = new FeatureManager(registry, queue, config);
-  await feature_manager.load_persisted();
-  set_feature_manager(feature_manager);
 
-  // Wire up session events to feature manager + session history logging.
-  // Track session metadata at start so completion/failure handlers have full context
-  // even after the feature manager cleans up its session-to-feature mapping.
+  // Wire up session events for session history logging.
   interface QueueSessionMeta {
     start_ms: number;
     entity_id: string;
     feature_id: string;
     archetype: ActiveSession["archetype"];
-    phase: Phase | null;
     started_at: string;
     resume: boolean;
   }
   const queue_session_meta = new Map<string, QueueSessionMeta>();
 
   session_manager.on("session:started", (session: ActiveSession) => {
-    feature_manager.on_session_started(session);
-
-    // Capture metadata for completion/failure logging
-    const feature = feature_manager.get_feature(session.feature_id);
     const meta: QueueSessionMeta = {
       start_ms: Date.now(),
       entity_id: session.entity_id,
       feature_id: session.feature_id,
       archetype: session.archetype,
-      phase: feature?.phase ?? null,
       started_at: session.started_at.toISOString(),
       resume: session.resume,
     };
@@ -82,7 +69,7 @@ async function main(): Promise<void> {
       entity_id: session.entity_id,
       feature_id: session.feature_id,
       archetype: session.archetype,
-      phase: meta.phase,
+      phase: null,
       source: "queue",
       started_at: meta.started_at,
       ended_at: null,
@@ -94,11 +81,8 @@ async function main(): Promise<void> {
   });
 
   session_manager.on("session:completed", (result: SessionResult) => {
-    // Look up metadata before feature manager cleans up
     const meta = queue_session_meta.get(result.session_id);
     queue_session_meta.delete(result.session_id);
-
-    void feature_manager.on_session_completed(result);
 
     // Log session completion
     if (meta) {
@@ -108,7 +92,7 @@ async function main(): Promise<void> {
         entity_id: meta.entity_id,
         feature_id: meta.feature_id,
         archetype: meta.archetype,
-        phase: meta.phase,
+        phase: null,
         source: "queue",
         started_at: meta.started_at,
         ended_at: now,
@@ -120,12 +104,9 @@ async function main(): Promise<void> {
     }
   });
 
-  session_manager.on("session:failed", (session_id: string, error: string) => {
-    // Look up metadata before feature manager cleans up
+  session_manager.on("session:failed", (session_id: string, _error: string) => {
     const meta = queue_session_meta.get(session_id);
     queue_session_meta.delete(session_id);
-
-    feature_manager.on_session_failed(session_id, error);
 
     // Log session failure
     if (meta) {
@@ -135,7 +116,7 @@ async function main(): Promise<void> {
         entity_id: meta.entity_id,
         feature_id: meta.feature_id,
         archetype: meta.archetype,
-        phase: meta.phase,
+        phase: null,
         source: "queue",
         started_at: meta.started_at,
         ended_at: now,
@@ -156,9 +137,6 @@ async function main(): Promise<void> {
   const pool = new BotPool(config);
   await pool.initialize(registry);
 
-  // Wire pool to feature manager for interactive builder sessions
-  feature_manager.set_pool(pool);
-
   // Wire pool to actions module so assign_work_room() checks pool state
   set_pool(pool);
 
@@ -172,7 +150,7 @@ async function main(): Promise<void> {
   const bot_token = await resolve_bot_token(config);
   if (bot_token) {
     try {
-      discord.set_managers(feature_manager, queue);
+      discord.set_managers(queue);
       discord.set_pool(pool);
       set_discord_bot(discord);
       await discord.connect(bot_token);
@@ -249,7 +227,7 @@ async function main(): Promise<void> {
   }
 
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null, pool, github_app);
+  const server = start_server(registry, config, session_manager, queue, commander, discord_connected ? discord : null, pool, github_app);
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
   const cron_interval_ms = github_app ? 30 * 60 * 1000 : 5 * 60 * 1000;
@@ -258,7 +236,6 @@ async function main(): Promise<void> {
     session_manager,
     config,
     discord_connected ? discord : null,
-    feature_manager,
     github_app,
   );
   await pr_cron.start(cron_interval_ms);
@@ -327,12 +304,7 @@ async function main(): Promise<void> {
     // Kill all pool bot tmux sessions. Assigned bots are persisted to
     // pool-state.json on every mutation, so on restart they'll be restored
     // as parked and resumed with --resume {session_id} — no context lost.
-    // Previous approach (preserving tmux) caused state desync between
-    // surviving tmux sessions and the daemon's pool metadata.
     await pool.shutdown();
-
-    // Drain the feature persist queue so pending state writes complete before exit
-    await feature_manager.drain_persist();
 
     // Stop Commander
     await commander.stop();

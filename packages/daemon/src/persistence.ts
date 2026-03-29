@@ -1,19 +1,14 @@
 import { readFile, writeFile, mkdir, appendFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { FeatureState, LobsterFarmConfig, ArchetypeRole, ChannelType, Phase } from "@lobster-farm/shared";
+import type { LobsterFarmConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 
 const STATE_DIR = "state";
-const FEATURES_FILE = "features.json";
 const PR_REVIEWS_FILE = "pr-reviews.json";
 const POOL_STATE_FILE = "pool-state.json";
 
 function state_dir(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), STATE_DIR);
-}
-
-function features_path(config: LobsterFarmConfig): string {
-  return join(state_dir(config), FEATURES_FILE);
 }
 
 function pr_reviews_path(config: LobsterFarmConfig): string {
@@ -22,31 +17,6 @@ function pr_reviews_path(config: LobsterFarmConfig): string {
 
 function pool_state_path(config: LobsterFarmConfig): string {
   return join(state_dir(config), POOL_STATE_FILE);
-}
-
-/** Save all features to disk. */
-export async function save_features(
-  features: FeatureState[],
-  config: LobsterFarmConfig,
-): Promise<void> {
-  const path = features_path(config);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(features, null, 2), "utf-8");
-}
-
-/** Load features from disk. Returns empty array if file doesn't exist. */
-export async function load_features(
-  config: LobsterFarmConfig,
-): Promise<FeatureState[]> {
-  const path = features_path(config);
-  try {
-    const content = await readFile(path, "utf-8");
-    const data: unknown = JSON.parse(content);
-    if (!Array.isArray(data)) return [];
-    return data as FeatureState[];
-  } catch {
-    return [];
-  }
 }
 
 // ── PR Review State ──
@@ -201,7 +171,7 @@ export interface SessionLogEntry {
   entity_id: string;
   feature_id: string | null;
   archetype: ArchetypeRole;
-  phase: Phase | null;
+  phase: string | null;
   source: "queue" | "pool";
   started_at: string;           // ISO timestamp
   ended_at: string | null;      // ISO timestamp, null if still running

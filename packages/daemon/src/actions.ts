@@ -1,11 +1,28 @@
 import { execFile, exec as execCb } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { FeatureState, EntityConfig, ChannelType, ArchetypeRole, ChannelMapping } from "@lobster-farm/shared";
+import type { EntityConfig, ChannelType, ArchetypeRole, ChannelMapping } from "@lobster-farm/shared";
+
+/**
+ * Minimal feature data shape used by action functions.
+ * These fields are the subset needed for git, GitHub, and Discord operations.
+ * Replaces the FeatureData Zod schema that was removed with the feature lifecycle.
+ */
+export interface FeatureData {
+  id: string;
+  entity: string;
+  githubIssue: number;
+  title: string;
+  branch: string;
+  worktreePath: string | null;
+  discordWorkRoom: string | null;
+  activeArchetype: string | null;
+  prNumber: number | null;
+  phase?: string;
+}
 import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/shared";
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
-import type { FeatureManager } from "./features.js";
 import type { BotPool } from "./pool.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
@@ -31,7 +48,7 @@ async function run(
 
 /** Create a git worktree for a feature branch. */
 export async function create_worktree(
-  feature: FeatureState,
+  feature: FeatureData,
   entity_config: EntityConfig,
 ): Promise<string> {
   const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
@@ -64,7 +81,7 @@ export async function create_worktree(
 
 /** Remove a git worktree. */
 export async function cleanup_worktree(
-  feature: FeatureState,
+  feature: FeatureData,
   entity_config: EntityConfig,
 ): Promise<void> {
   if (!feature.worktreePath) return;
@@ -93,7 +110,7 @@ export async function cleanup_worktree(
 
 /** Create a pull request for a feature. Returns the PR number. */
 export async function create_pr(
-  feature: FeatureState,
+  feature: FeatureData,
   entity_config: EntityConfig,
 ): Promise<number> {
   const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
@@ -118,7 +135,7 @@ export async function create_pr(
 
 /** Merge a pull request. Idempotent — treats "already merged" as success. */
 export async function merge_pr(
-  feature: FeatureState,
+  feature: FeatureData,
   _entity_config: EntityConfig,
 ): Promise<void> {
   if (!feature.prNumber) {
@@ -149,7 +166,7 @@ export async function merge_pr(
 
 /** Run tests in a worktree. Returns true if tests pass. */
 export async function run_tests(
-  feature: FeatureState,
+  feature: FeatureData,
   command: string = "npm test",
 ): Promise<boolean> {
   if (!feature.worktreePath) {
@@ -181,18 +198,11 @@ export async function run_tests(
 /** Global Discord bot reference, set by the daemon on startup. */
 let _discord: DiscordBot | null = null;
 
-/** Global feature manager reference, set by the daemon on startup. */
-let _features: FeatureManager | null = null;
-
 /** Global bot pool reference, set by the daemon on startup. */
 let _pool: BotPool | null = null;
 
 export function set_discord_bot(bot: DiscordBot | null): void {
   _discord = bot;
-}
-
-export function set_feature_manager(fm: FeatureManager | null): void {
-  _features = fm;
 }
 
 export function set_pool(pool: BotPool | null): void {
@@ -218,38 +228,6 @@ export async function notify(
   }
 }
 
-/**
- * Send a feature-scoped notification. Routes to work room if assigned.
- * No fallback — if no work room is assigned, the notification is not sent to Discord.
- * Phase transitions are still logged to console via the log line below.
- */
-export async function notify_feature(
-  feature: FeatureState,
-  message: string,
-  entity_config?: EntityConfig,
-  options?: { also_alerts?: boolean; also_general?: boolean },
-): Promise<void> {
-  const archetype = (feature.activeArchetype ?? "system") as ArchetypeRole | "system";
-
-  // Primary: send to work room (by channel ID). No work_log fallback —
-  // interactive builders post their own progress in work rooms.
-  if (feature.discordWorkRoom && _discord && is_discord_snowflake(feature.discordWorkRoom)) {
-    await _discord.send_as_agent(feature.discordWorkRoom, message, archetype);
-    console.log(`[actions:notify] [work_room:${feature.discordWorkRoom}] ${message}`);
-  } else {
-    // Still log to console so phase transitions appear in daily logs
-    console.log(`[actions:notify] [no_room] ${message}`);
-  }
-
-  // Secondary channels
-  if (options?.also_alerts) {
-    await notify("alerts", message, entity_config, archetype);
-  }
-  if (options?.also_general) {
-    await notify("general", message, entity_config, archetype);
-  }
-}
-
 // ── Entity config persistence ──
 
 /** Persist an entity's config back to YAML. Used after modifying dynamic channels. */
@@ -267,7 +245,7 @@ export async function persist_entity_config(
 
 /** Assign a work room to a feature. Finds a free static room or creates a dynamic one. */
 export async function assign_work_room(
-  feature: FeatureState,
+  feature: FeatureData,
   entity_config: EntityConfig,
 ): Promise<string | null> {
   // If already assigned (e.g., review→build bounce), return existing room
@@ -283,16 +261,8 @@ export async function assign_work_room(
     (c: ChannelMapping) => c.type === "work_room" && is_discord_snowflake(c.id),
   );
 
-  // Find rooms not assigned to an active (non-done) feature
-  const active = _features?.get_features_by_entity(feature.entity)
-    .filter(f => f.phase !== "done" && f.id !== feature.id) ?? [];
-  const occupied = new Set(
-    active.map(f => f.discordWorkRoom).filter((id): id is string => Boolean(id)),
-  );
-
-  // Also mark rooms with active pool assignments as occupied.
-  // This prevents feature deployments from overwriting manual pool sessions
-  // (e.g., an interactive planner assigned via POST /pool/assign).
+  // Find rooms not occupied by active pool assignments.
+  const occupied = new Set<string>();
   if (_pool) {
     for (const room of work_rooms) {
       const assignment = _pool.get_assignment(room.id);
@@ -358,7 +328,7 @@ export async function assign_work_room(
 
 /** Release a work room from a feature. Resets static rooms, deletes dynamic ones. */
 export async function release_work_room(
-  feature: FeatureState,
+  feature: FeatureData,
   entity_config: EntityConfig,
 ): Promise<void> {
   if (!feature.discordWorkRoom) return;
@@ -445,7 +415,7 @@ export async function detect_review_outcome(
 
 /** Update the topic of a feature's work room. */
 export async function update_work_room_topic(
-  feature: FeatureState,
+  feature: FeatureData,
   topic: string,
 ): Promise<void> {
   if (!feature.discordWorkRoom || !_discord) return;
@@ -485,18 +455,22 @@ export function classify_merge_error(error: string): MergeErrorKind {
 /**
  * Reset topics on unoccupied work rooms to "Available".
  * Called on daemon startup to clear stale topics from previous runs.
- * Rooms with active (non-done) features keep their current topic.
+ * Rooms with active pool assignments keep their current topic.
  */
 export async function reset_idle_work_room_topics(
   registry: EntityRegistry,
 ): Promise<void> {
-  if (!_discord || !_features) return;
+  if (!_discord) return;
 
-  // Collect work rooms that have an active feature
+  // Collect work rooms with active pool assignments
   const active_rooms = new Set<string>();
-  for (const feature of _features.list_features()) {
-    if (feature.discordWorkRoom && feature.phase !== "done") {
-      active_rooms.add(feature.discordWorkRoom);
+  if (_pool) {
+    for (const entity_config of registry.get_active()) {
+      for (const channel of entity_config.entity.channels.list) {
+        if (channel.type === "work_room" && _pool.get_assignment(channel.id)) {
+          active_rooms.add(channel.id);
+        }
+      }
     }
   }
 
@@ -509,7 +483,7 @@ export async function reset_idle_work_room_topics(
         !active_rooms.has(channel.id) &&
         is_discord_snowflake(channel.id)
       ) {
-        await _discord.set_channel_topic(channel.id, "🟢 Available");
+        await _discord.set_channel_topic(channel.id, "\u{1F7E2} Available");
         reset_count++;
       }
     }

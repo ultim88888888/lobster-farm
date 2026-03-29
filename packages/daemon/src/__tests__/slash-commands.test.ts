@@ -16,7 +16,7 @@ describe("build_slash_commands", () => {
   it("returns all expected commands", () => {
     const names = commands.map(c => c.name);
     expect(names).toEqual([
-      "help", "status", "features", "plan", "approve", "advance",
+      "help", "status",
       "swap", "scaffold", "room", "close", "resume", "compact", "reset",
       "archives",
     ]);
@@ -27,14 +27,6 @@ describe("build_slash_commands", () => {
       expect(cmd.name).toBeTruthy();
       expect(cmd.description).toBeTruthy();
     }
-  });
-
-  it("/plan has a required title option", () => {
-    const plan = commands.find(c => c.name === "plan")!;
-    const options = plan.options;
-    expect(options).toHaveLength(1);
-    expect(options[0]!.toJSON().name).toBe("title");
-    expect(options[0]!.toJSON().required).toBe(true);
   });
 
   it("/status has an optional scope option with entity/all choices", () => {
@@ -95,17 +87,6 @@ describe("build_slash_commands", () => {
     expect(bp_opt.required).toBeFalsy();
   });
 
-  it("/approve and /advance have required feature options", () => {
-    for (const cmd_name of ["approve", "advance"]) {
-      const cmd = commands.find(c => c.name === cmd_name)!;
-      const options = cmd.options;
-      expect(options).toHaveLength(1);
-      const opt = options[0]!.toJSON();
-      expect(opt.name).toBe("feature");
-      expect(opt.required).toBe(true);
-    }
-  });
-
   it("/help, /compact, /reset, /archives have no options", () => {
     for (const cmd_name of ["help", "compact", "reset", "archives"]) {
       const cmd = commands.find(c => c.name === cmd_name)!;
@@ -148,12 +129,12 @@ describe("CommandTarget contract", () => {
 // ── Ephemeral commands ──
 
 describe("EPHEMERAL_COMMANDS", () => {
-  it("EPHEMERAL_COMMAND_NAMES matches the spec (help, status, features, archives)", () => {
-    expect([...EPHEMERAL_COMMAND_NAMES]).toEqual(["help", "status", "features", "archives"]);
+  it("EPHEMERAL_COMMAND_NAMES matches the spec (help, status, archives)", () => {
+    expect([...EPHEMERAL_COMMAND_NAMES]).toEqual(["help", "status", "archives"]);
   });
 
   it("all ephemeral and public commands are registered", () => {
-    const public_names = ["plan", "approve", "advance", "swap", "scaffold",
+    const public_names = ["swap", "scaffold",
       "room", "close", "resume", "compact", "reset"];
 
     const all_commands = build_slash_commands();
@@ -183,22 +164,6 @@ function mock_interaction(
 }
 
 describe("extract_slash_args", () => {
-  it("/plan extracts title", () => {
-    expect(extract_slash_args(mock_interaction("plan", { title: "Add auth" }))).toEqual(["Add auth"]);
-  });
-
-  it("/plan with no title returns empty string", () => {
-    expect(extract_slash_args(mock_interaction("plan"))).toEqual([""]);
-  });
-
-  it("/approve extracts feature id", () => {
-    expect(extract_slash_args(mock_interaction("approve", { feature: "feat-42" }))).toEqual(["feat-42"]);
-  });
-
-  it("/advance with no feature returns empty array", () => {
-    expect(extract_slash_args(mock_interaction("advance"))).toEqual([]);
-  });
-
   it("/swap extracts agent name", () => {
     expect(extract_slash_args(mock_interaction("swap", { agent: "builder" }))).toEqual(["builder"]);
   });

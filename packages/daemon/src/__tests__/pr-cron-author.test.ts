@@ -44,8 +44,6 @@ describe("PR cron — author-based alert labeling", () => {
   let mock_registry: { get: ReturnType<typeof vi.fn>; get_active: ReturnType<typeof vi.fn>; get_all: ReturnType<typeof vi.fn> };
   let mock_session_manager: { spawn: ReturnType<typeof vi.fn>; on: ReturnType<typeof vi.fn>; removeListener: ReturnType<typeof vi.fn> };
   let mock_discord: { send_to_entity: ReturnType<typeof vi.fn> };
-  let mock_feature_manager: { find_by_pr: ReturnType<typeof vi.fn> };
-
   beforeEach(() => {
     alerts = [];
 
@@ -67,10 +65,6 @@ describe("PR cron — author-based alert labeling", () => {
         return Promise.resolve();
       }),
     };
-
-    mock_feature_manager = {
-      find_by_pr: vi.fn().mockReturnValue(null), // No linked feature — triggers the author check
-    };
   });
 
   async function create_cron() {
@@ -80,7 +74,6 @@ describe("PR cron — author-based alert labeling", () => {
       mock_session_manager as any,
       make_config(),
       mock_discord as any,
-      mock_feature_manager as any,
     );
   }
 

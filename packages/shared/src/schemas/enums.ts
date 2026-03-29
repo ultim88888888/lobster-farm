@@ -18,16 +18,6 @@ export const ChannelTypeSchema = z.enum([
 ]);
 export type ChannelType = z.infer<typeof ChannelTypeSchema>;
 
-export const PhaseSchema = z.enum([
-  "plan",
-  "design",
-  "build",
-  "review",
-  "ship",
-  "done",
-]);
-export type Phase = z.infer<typeof PhaseSchema>;
-
 export const EntityStatusSchema = z.enum([
   "active",
   "paused",

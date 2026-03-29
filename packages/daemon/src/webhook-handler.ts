@@ -17,10 +17,9 @@ import { expand_home } from "@lobster-farm/shared";
 import type { GitHubAppAuth } from "./github-app.js";
 import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
-import type { FeatureManager } from "./features.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
-import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
+import { fetch_review_comments, build_review_fix_prompt } from "./review-utils.js";
 import {
   extract_first_linked_issue,
   extract_linked_issues,
@@ -37,7 +36,6 @@ export interface WebhookContext {
   github_app: GitHubAppAuth;
   session_manager: ClaudeSessionManager;
   registry: EntityRegistry;
-  feature_manager: FeatureManager;
   discord: DiscordBot | null;
 }
 
@@ -373,14 +371,7 @@ async function handle_review_completion(
   );
 
   // Route outcome
-  const linked_feature = ctx.feature_manager.find_by_pr(pr.number) ?? null;
-
-  if (linked_feature) {
-    // Feature-managed PR — the feature manager handles transitions
-    console.log(
-      `[webhook] PR #${String(pr.number)} linked to feature ${linked_feature.id} — deferring to feature manager`,
-    );
-  } else if (outcome === "changes_requested") {
+  if (outcome === "changes_requested") {
     // Spawn builder to fix
     await spawn_fixer(entity_id, repo_path, pr, ctx);
     await notify_alerts(

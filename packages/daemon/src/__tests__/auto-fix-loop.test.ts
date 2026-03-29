@@ -41,7 +41,7 @@ import {
   build_review_fix_prompt,
   fetch_review_comments,
   check_merge_conflicts,
-} from "../features.js";
+} from "../review-utils.js";
 
 /**
  * Configure execFile mock to return specific stdout/error for sequential calls.
@@ -170,61 +170,3 @@ describe("check_merge_conflicts", () => {
   });
 });
 
-// ── reviewBounceCount schema field ──
-
-describe("reviewBounceCount schema field", () => {
-  it("defaults to 0 when not provided", async () => {
-    const { FeatureStateSchema } = await import("@lobster-farm/shared");
-    const feature = FeatureStateSchema.parse({
-      id: "test-1",
-      entity: "test",
-      githubIssue: 1,
-      title: "Test",
-      phase: "plan",
-      branch: "feature/1-test",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    expect(feature.reviewBounceCount).toBe(0);
-  });
-
-  it("preserves an explicit bounce count", async () => {
-    const { FeatureStateSchema } = await import("@lobster-farm/shared");
-    const feature = FeatureStateSchema.parse({
-      id: "test-2",
-      entity: "test",
-      githubIssue: 2,
-      title: "Test",
-      phase: "review",
-      branch: "feature/2-test",
-      reviewBounceCount: 3,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    expect(feature.reviewBounceCount).toBe(3);
-  });
-});
-
-// ── ESCALATE marker detection ──
-
-describe("ESCALATE marker detection", () => {
-  it("detects ESCALATE in review comments (uppercase)", () => {
-    const comments = "This PR has security issues.\n\nESCALATE: needs human review of the auth flow.";
-    expect(comments.toUpperCase().includes("ESCALATE")).toBe(true);
-  });
-
-  it("does not trigger on normal review comments", () => {
-    const comments = "Please fix the null check on line 42.";
-    expect(comments.toUpperCase().includes("ESCALATE")).toBe(false);
-  });
-
-  it("detects escalate in lowercase (case-insensitive check)", () => {
-    const comments = "I think we need to escalate this to a senior.";
-    expect(comments.toUpperCase().includes("ESCALATE")).toBe(true);
-  });
-
-  it("detects ESCALATE in mixed case", () => {
-    const comments = "Escalate: auth issue needs human eyes.";
-    expect(comments.toUpperCase().includes("ESCALATE")).toBe(true);
-  });
-});

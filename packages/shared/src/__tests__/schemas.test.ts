@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   LobsterFarmConfigSchema,
   EntityConfigSchema,
-  FeatureStateSchema,
   TemplateVariablesSchema,
   ArchetypeRoleSchema,
-  PhaseSchema,
   ChannelTypeSchema,
 } from "../schemas/index.js";
 
@@ -14,12 +12,6 @@ describe("enums", () => {
     expect(ArchetypeRoleSchema.parse("planner")).toBe("planner");
     expect(ArchetypeRoleSchema.parse("builder")).toBe("builder");
     expect(() => ArchetypeRoleSchema.parse("invalid")).toThrow();
-  });
-
-  it("validates phases", () => {
-    expect(PhaseSchema.parse("plan")).toBe("plan");
-    expect(PhaseSchema.parse("done")).toBe("done");
-    expect(() => PhaseSchema.parse("invalid")).toThrow();
   });
 
   it("validates channel types", () => {
@@ -181,42 +173,6 @@ describe("EntityConfigSchema", () => {
     expect(() =>
       EntityConfigSchema.parse({
         entity: { ...MINIMAL_ENTITY.entity, id: "has spaces" },
-      }),
-    ).toThrow();
-  });
-});
-
-describe("FeatureStateSchema", () => {
-  it("parses a complete feature state", () => {
-    const now = new Date().toISOString();
-    const state = FeatureStateSchema.parse({
-      id: "alpha-42",
-      entity: "alpha",
-      githubIssue: 42,
-      title: "Candlestick chart module",
-      phase: "build",
-      branch: "feature/42-candlestick-chart",
-      createdAt: now,
-      updatedAt: now,
-    });
-    expect(state.id).toBe("alpha-42");
-    expect(state.priority).toBe("medium");
-    expect(state.blocked).toBe(false);
-    expect(state.activeDna).toEqual([]);
-    expect(state.sessionId).toBeNull();
-  });
-
-  it("rejects invalid phase", () => {
-    expect(() =>
-      FeatureStateSchema.parse({
-        id: "x",
-        entity: "x",
-        githubIssue: 1,
-        title: "x",
-        phase: "invalid",
-        branch: "x",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
       }),
     ).toThrow();
   });

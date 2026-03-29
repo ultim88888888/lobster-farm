@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import type { FeatureState, LobsterFarmConfig, EntityConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
-import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
+import type { LobsterFarmConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
+import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 
 // ── Test helpers ──
 
@@ -10,190 +10,6 @@ function make_config(): LobsterFarmConfig {
     concurrency: { max_active_sessions: 2, max_queue_depth: 20 },
   });
 }
-
-function make_feature(overrides: Partial<FeatureState> = {}): FeatureState {
-  return {
-    id: "alpha-42",
-    entity: "alpha",
-    githubIssue: 42,
-    title: "Test Feature",
-    phase: "build",
-    priority: "medium",
-    branch: "feature/42-test-feature",
-    worktreePath: "/tmp/worktree",
-    discordWorkRoom: null,
-    activeArchetype: "builder",
-    activeDna: ["coding-dna"],
-    sessionId: null,
-    lastSessionId: null,
-    lastBuilderSessionId: null,
-    dependsOn: [],
-    blocked: false,
-    blockedReason: null,
-    approved: false,
-    labels: [],
-    prNumber: null,
-    agentDone: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    ...overrides,
-  };
-}
-
-// ── Schema tests ──
-
-describe("FeatureState schema", () => {
-  it("includes lastBuilderSessionId field with null default", () => {
-    const feature = make_feature();
-    expect(feature.lastBuilderSessionId).toBeNull();
-  });
-
-  it("accepts a string value for lastBuilderSessionId", () => {
-    const feature = make_feature({ lastBuilderSessionId: "session-abc-123" });
-    expect(feature.lastBuilderSessionId).toBe("session-abc-123");
-  });
-});
-
-// ── Session lifecycle tests (features.ts) ──
-
-describe("Session lifecycle — builder session preservation", () => {
-  it("stores lastBuilderSessionId when builder starts", () => {
-    // Simulate on_session_started behavior
-    const feature = make_feature({ activeArchetype: "builder" });
-    const session_id = "builder-session-001";
-
-    // Mimic FeatureManager.on_session_started
-    feature.sessionId = session_id;
-    feature.lastSessionId = session_id;
-    if (feature.activeArchetype === "builder") {
-      feature.lastBuilderSessionId = session_id;
-    }
-
-    expect(feature.lastBuilderSessionId).toBe("builder-session-001");
-    expect(feature.lastSessionId).toBe("builder-session-001");
-  });
-
-  it("does NOT overwrite lastBuilderSessionId when reviewer starts", () => {
-    const feature = make_feature({
-      activeArchetype: "reviewer",
-      lastBuilderSessionId: "builder-session-001",
-    });
-    const reviewer_session_id = "reviewer-session-002";
-
-    // Mimic on_session_started for reviewer
-    feature.sessionId = reviewer_session_id;
-    feature.lastSessionId = reviewer_session_id;
-    // Only set lastBuilderSessionId for builders
-    if (feature.activeArchetype === "builder") {
-      feature.lastBuilderSessionId = reviewer_session_id;
-    }
-
-    expect(feature.lastBuilderSessionId).toBe("builder-session-001"); // preserved
-    expect(feature.lastSessionId).toBe("reviewer-session-002"); // overwritten
-  });
-
-  it("uses lastBuilderSessionId for resume on review→build bounce", () => {
-    const feature = make_feature({
-      phase: "review",
-      lastBuilderSessionId: "builder-session-001",
-      lastSessionId: "reviewer-session-002",
-    });
-
-    // Mimic spawn_phase_agent resume logic
-    const phase_archetype = "builder";
-    const is_builder_bounce = phase_archetype === "builder" && Boolean(feature.lastBuilderSessionId);
-    const resume_id = is_builder_bounce ? feature.lastBuilderSessionId : undefined;
-
-    expect(is_builder_bounce).toBe(true);
-    expect(resume_id).toBe("builder-session-001");
-  });
-
-  it("does NOT resume for non-builder phase transitions", () => {
-    const feature = make_feature({
-      phase: "plan",
-      lastBuilderSessionId: null,
-      lastSessionId: "planner-session-001",
-    });
-
-    const phase_archetype = "designer";
-    const is_builder_bounce = phase_archetype === "builder" && Boolean(feature.lastBuilderSessionId);
-    const resume_id = is_builder_bounce ? feature.lastBuilderSessionId : undefined;
-
-    expect(is_builder_bounce).toBe(false);
-    expect(resume_id).toBeUndefined();
-  });
-});
-
-// ── Review outcome routing tests ──
-
-describe("Review outcome routing", () => {
-  it("maps approved to ship advance", () => {
-    const outcome = "approved";
-    let next_phase: string | null = null;
-
-    switch (outcome) {
-      case "approved": next_phase = "ship"; break;
-      case "changes_requested": next_phase = "build"; break;
-      case "pending": next_phase = null; break;
-    }
-
-    expect(next_phase).toBe("ship");
-  });
-
-  it("maps changes_requested to build bounce", () => {
-    const outcome = "changes_requested";
-    let next_phase: string | null = null;
-    let should_notify_alerts = false;
-
-    switch (outcome) {
-      case "approved": next_phase = "ship"; break;
-      case "changes_requested":
-        next_phase = "build";
-        should_notify_alerts = true;
-        break;
-      case "pending": next_phase = null; break;
-    }
-
-    expect(next_phase).toBe("build");
-    expect(should_notify_alerts).toBe(true);
-  });
-
-  it("blocks feature on pending outcome", () => {
-    const outcome = "pending";
-    let should_block = false;
-
-    switch (outcome) {
-      case "approved": break;
-      case "changes_requested": break;
-      case "pending":
-        should_block = true;
-        break;
-    }
-
-    expect(should_block).toBe(true);
-  });
-});
-
-// ── find_by_pr tests ──
-
-describe("find_by_pr", () => {
-  it("finds a feature by PR number", () => {
-    const features = new Map<string, FeatureState>();
-    features.set("alpha-42", make_feature({ prNumber: 99 }));
-    features.set("alpha-43", make_feature({ id: "alpha-43", prNumber: 100 }));
-
-    const find_by_pr = (pr_number: number): FeatureState | null => {
-      for (const feature of features.values()) {
-        if (feature.prNumber === pr_number) return feature;
-      }
-      return null;
-    };
-
-    expect(find_by_pr(99)?.id).toBe("alpha-42");
-    expect(find_by_pr(100)?.id).toBe("alpha-43");
-    expect(find_by_pr(999)).toBeNull();
-  });
-});
 
 // ── Pool tests — park-and-resume, eviction priority ──
 
@@ -354,60 +170,14 @@ describe("Discord — !reset interception", () => {
   });
 });
 
-// ── PR Cron — external PR handling tests ──
-
-describe("PR Cron — review outcome routing", () => {
-  it("defers feature-linked PRs to feature manager", () => {
-    const features = new Map<string, FeatureState>();
-    features.set("alpha-42", make_feature({ prNumber: 99 }));
-
-    const find_by_pr = (pr_number: number): FeatureState | null => {
-      for (const feature of features.values()) {
-        if (feature.prNumber === pr_number) return feature;
-      }
-      return null;
-    };
-
-    const linked = find_by_pr(99);
-    expect(linked).not.toBeNull();
-    // When linked, pr-cron should defer — not spawn a builder or notify
-  });
-
-  it("handles external PR with changes_requested", () => {
-    const features = new Map<string, FeatureState>();
-    // No features linked to PR #200
-
-    const linked = (() => {
-      for (const feature of features.values()) {
-        if (feature.prNumber === 200) return feature;
-      }
-      return null;
-    })();
-
-    const review_state = "changes_requested";
-
-    expect(linked).toBeNull();
-    // External PR — should spawn builder and notify alerts
-    expect(review_state).toBe("changes_requested");
-  });
-
-  it("escalates approved external PRs to alerts (never auto-merges)", () => {
-    const linked = null; // external PR
-    const review_state = "approved";
-
-    expect(linked).toBeNull();
-    // Should notify alerts, NOT merge
-    expect(review_state).toBe("approved");
-  });
-});
-
 // ── Worktree / work room idempotency tests ──
 
 describe("Actions — idempotency on bounce", () => {
   it("assign_work_room returns existing room if already assigned", () => {
-    const feature = make_feature({ discordWorkRoom: "existing-room-123" });
+    // FeatureData with discordWorkRoom already set — assign_work_room
+    // returns early with the existing room ID.
+    const feature = { discordWorkRoom: "existing-room-123" };
 
-    // Mimic the guard at the top of assign_work_room
     if (feature.discordWorkRoom) {
       const result = feature.discordWorkRoom;
       expect(result).toBe("existing-room-123");
@@ -415,7 +185,7 @@ describe("Actions — idempotency on bounce", () => {
   });
 
   it("assign_work_room proceeds normally if not assigned", () => {
-    const feature = make_feature({ discordWorkRoom: null });
+    const feature = { discordWorkRoom: null };
     expect(feature.discordWorkRoom).toBeNull();
     // Would proceed to find a free room
   });
@@ -440,64 +210,6 @@ describe("Actions — merge_pr idempotency", () => {
     const msg = "GraphQL: Branch protections prevent merge";
     const is_already_merged = msg.includes("already been merged") || msg.includes("MERGED");
     expect(is_already_merged).toBe(false);
-  });
-});
-
-// ── Full review bounce flow (integration-style) ──
-
-describe("Full review bounce flow", () => {
-  it("preserves builder session through review and resumes on bounce", () => {
-    // 1. Build phase — builder starts
-    const feature = make_feature({
-      phase: "build",
-      activeArchetype: "builder",
-    });
-
-    const builder_session = "builder-session-abc";
-    feature.sessionId = builder_session;
-    feature.lastSessionId = builder_session;
-    feature.lastBuilderSessionId = builder_session;
-
-    // 2. Build completes → advance to review
-    feature.phase = "review";
-    feature.activeArchetype = "reviewer";
-    feature.sessionId = null;
-    feature.agentDone = false;
-
-    // 3. Reviewer starts
-    const reviewer_session = "reviewer-session-xyz";
-    feature.sessionId = reviewer_session;
-    feature.lastSessionId = reviewer_session;
-    // lastBuilderSessionId NOT overwritten
-
-    expect(feature.lastBuilderSessionId).toBe("builder-session-abc");
-    expect(feature.lastSessionId).toBe("reviewer-session-xyz");
-
-    // 4. Review completes with changes_requested → bounce to build
-    feature.phase = "build";
-    feature.activeArchetype = "builder";
-    feature.sessionId = null;
-
-    // 5. Resume logic picks up the builder session
-    const is_builder_bounce = feature.activeArchetype === "builder" && Boolean(feature.lastBuilderSessionId);
-    const resume_id = is_builder_bounce ? feature.lastBuilderSessionId : undefined;
-
-    expect(resume_id).toBe("builder-session-abc");
-  });
-
-  it("clears session state on feature done", () => {
-    const feature = make_feature({
-      phase: "done",
-      sessionId: null,
-      lastSessionId: "some-session",
-      lastBuilderSessionId: "builder-session",
-      worktreePath: null,
-      discordWorkRoom: null,
-    });
-
-    // Feature is done — session IDs are historical but the active session is cleared
-    expect(feature.sessionId).toBeNull();
-    expect(feature.phase).toBe("done");
   });
 });
 
