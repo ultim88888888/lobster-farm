@@ -181,8 +181,8 @@ describe("fetch_subscription_usage", () => {
     };
 
     const api_response: SubscriptionUsageResponse = {
-      five_hour: { utilization: 0.1, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
-      extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 23.5, utilization: 0.235 },
+      five_hour: { utilization: 10, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+      extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 23.5, utilization: 23.5 },
     };
 
     fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {

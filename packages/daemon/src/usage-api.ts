@@ -37,7 +37,7 @@ export interface SubscriptionUsageResponse {
 export interface SubscriptionUsageSummary {
   /** Raw API response for callers that want fine-grained data. */
   raw: SubscriptionUsageResponse;
-  /** e.g., "5h: 42% | Weekly: 62% (resets in 2d 4h)" */
+  /** e.g., "5h: 5% | Weekly: 29% (resets in 3d 13h)" */
   summary: string;
 }
 
