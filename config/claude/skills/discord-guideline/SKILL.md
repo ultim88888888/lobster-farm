@@ -34,7 +34,7 @@ curl -s -X POST http://localhost:7749/scaffold/entity \
   -d '{"entity_id": "my-entity", "entity_name": "My Entity"}'
 ```
 
-Currently, entity scaffolding is also available via `!lf scaffold entity <id> <name>` in Discord.
+Entity scaffolding is also available via the `/scaffold` slash command in Discord.
 
 ## Channel Structure
 

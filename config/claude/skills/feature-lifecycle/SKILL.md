@@ -30,7 +30,7 @@ When the spec is solid, Gary creates a GitHub issue as the record. The issue is 
 
 ### 2. Approval (in Discord)
 
-Gary posts the spec summary in the work room and asks for approval. You approve right there in the chat — "looks good, let's build it." No need for `!lf approve` unless you want to use it.
+Gary posts the spec summary in the work room and asks for approval. You approve right there in the chat — "looks good, let's build it."
 
 Gary decides whether pre-PR approval is needed based on the feature type:
 - **Visual work (UI, design):** show screenshots/preview before PR
@@ -54,7 +54,7 @@ The PR triggers the `pr-review-merge` SOP independently. See that skill for deta
 
 ### 5. Design (when needed)
 
-For visual work, Gary can spawn Pearl (designer) as a subagent, or you can ask to talk to Pearl directly via `!lf swap pearl`. Pearl creates design artifacts — brand kits, component libraries, UI prototypes. Swap back to Gary when done.
+For visual work, Gary can spawn Pearl (designer) as a subagent, or you can ask to talk to Pearl directly via `/swap pearl`. Pearl creates design artifacts — brand kits, component libraries, UI prototypes. Swap back to Gary when done.
 
 ## Agent Model
 
@@ -62,7 +62,7 @@ For visual work, Gary can spawn Pearl (designer) as a subagent, or you can ask t
 
 **Subagents, not phase cycling.** Gary spawns Bob, Pearl, or Ray as subagents within his session. No pool bot cycling, no cold starts, no context loss. The subagent inherits Gary's full conversation context.
 
-**Direct agent access via swap.** If you want to riff directly with Pearl on design or Bob on implementation, use `!lf swap pearl` or `!lf swap bob` in a work room. The daemon swaps the pool bot's archetype.
+**Direct agent access via swap.** If you want to riff directly with Pearl on design or Bob on implementation, use `/swap pearl` or `/swap bob` in a work room. The daemon swaps the pool bot's archetype.
 
 ## Agent Behavior
 

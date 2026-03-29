@@ -68,7 +68,7 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 ### How Agents Work Together
 - **{{PLANNER_NAME}} is the orchestrator** for each entity. Users riff with {{PLANNER_NAME}} in Discord. When work needs doing, {{PLANNER_NAME}} spawns other agents as subagents — {{BUILDER_NAME}} for code, {{DESIGNER_NAME}} for design, {{OPERATOR_NAME}} for infra.
 - **Subagents inherit full context** from the parent conversation. No information loss on handoff.
-- **Users can swap agents directly** via `!lf swap <agent>` if they want to riff with a specific archetype.
+- **Users can swap agents directly** via `/swap <agent>` if they want to riff with a specific archetype.
 - **PR review is independent.** The Reviewer has never seen the code before — fresh eyes every time. Review is triggered by PR creation, not by the feature lifecycle.
 - **GitHub issues are the spec record.** {{PLANNER_NAME}} creates them as output of the planning conversation. PR bodies must include `Closes #{issue}` for auto-close on merge.
 

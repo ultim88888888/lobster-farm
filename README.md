@@ -33,14 +33,12 @@ node packages/cli/dist/index.js start
 node packages/daemon/dist/index.js
 ```
 
-Then in Discord:
+Then in Discord, use slash commands:
 ```
-!lf scaffold entity alpha "Trading Platform" --repo git@github.com:org/alpha.git
-!lf plan alpha "First feature"
-!lf approve alpha-1
-!lf advance alpha-1
-!lf status
-!lf help
+/scaffold entity:alpha name:"Trading Platform"
+/plan entity:alpha title:"First feature"
+/status
+/help
 ```
 
 ## Architecture
@@ -86,17 +84,21 @@ docs/         Architecture specs
 | `lobsterfarm stop` | Stop the daemon |
 | `lobsterfarm status` | Show daemon status |
 
-## Discord Commands
+## Discord Slash Commands
 
 | Command | Description |
 |---------|-------------|
-| `!lf help` | Show all commands |
-| `!lf status` | Daemon status |
-| `!lf scaffold entity <id> <name>` | Create entity with Discord channels |
-| `!lf plan <entity> <title>` | Create a feature |
-| `!lf approve <feature-id>` | Approve current phase gate |
-| `!lf advance <feature-id>` | Advance to next phase |
-| `!lf features [entity]` | List features |
+| `/help` | Show all commands |
+| `/status` | Daemon and session status |
+| `/scaffold` | Create entity with Discord channels |
+| `/plan` | Create a feature |
+| `/features` | List features |
+| `/swap` | Switch agent archetype in a work room |
+| `/room` | Create a new work room |
+| `/close` | Close and archive a work room session |
+| `/resume` | Restore an archived session |
+| `/archives` | List archived sessions |
+| `/reset` | Release current bot, fresh assignment on next message |
 
 ## License
 

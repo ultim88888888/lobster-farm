@@ -152,9 +152,9 @@ export function route_message(msg: RoutedMessage): RouteAction {
       type: "ask_clarification",
       message:
         "I'm not sure what you'd like me to do. Try:\n" +
-        "• `!lf plan <entity> <title>` — start planning a feature\n" +
-        "• `!lf features` — list active features\n" +
-        "• `!lf status` — check daemon status\n" +
+        "• `/plan <title>` — start planning a feature\n" +
+        "• `/features` — list active features\n" +
+        "• `/status` — check daemon status\n" +
         "• Or describe what you need (e.g., \"build the login page\")",
     };
   }

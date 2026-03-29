@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import {
   build_slash_commands,
   extract_slash_args,
+  format_relative_time,
   EPHEMERAL_COMMAND_NAMES,
   type CommandTarget,
   type SlashInteractionLike,
@@ -17,6 +18,7 @@ describe("build_slash_commands", () => {
     expect(names).toEqual([
       "help", "status", "features", "plan", "approve", "advance",
       "swap", "scaffold", "room", "close", "resume", "compact", "reset",
+      "archives",
     ]);
   });
 
@@ -104,8 +106,8 @@ describe("build_slash_commands", () => {
     }
   });
 
-  it("/help, /compact, /reset have no options", () => {
-    for (const cmd_name of ["help", "compact", "reset"]) {
+  it("/help, /compact, /reset, /archives have no options", () => {
+    for (const cmd_name of ["help", "compact", "reset", "archives"]) {
       const cmd = commands.find(c => c.name === cmd_name)!;
       expect(cmd.options).toHaveLength(0);
     }
@@ -146,8 +148,8 @@ describe("CommandTarget contract", () => {
 // ── Ephemeral commands ──
 
 describe("EPHEMERAL_COMMANDS", () => {
-  it("EPHEMERAL_COMMAND_NAMES matches the spec (help, status, features)", () => {
-    expect([...EPHEMERAL_COMMAND_NAMES]).toEqual(["help", "status", "features"]);
+  it("EPHEMERAL_COMMAND_NAMES matches the spec (help, status, features, archives)", () => {
+    expect([...EPHEMERAL_COMMAND_NAMES]).toEqual(["help", "status", "features", "archives"]);
   });
 
   it("all ephemeral and public commands are registered", () => {
@@ -258,5 +260,46 @@ describe("extract_slash_args", () => {
 
   it("/help returns empty array (no options)", () => {
     expect(extract_slash_args(mock_interaction("help"))).toEqual([]);
+  });
+
+  it("/archives returns empty array (no options)", () => {
+    expect(extract_slash_args(mock_interaction("archives"))).toEqual([]);
+  });
+});
+
+// ── format_relative_time ──
+
+describe("format_relative_time", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns 'just now' for timestamps less than a minute ago", () => {
+    vi.useFakeTimers({ now: new Date("2026-03-28T12:00:00Z") });
+    expect(format_relative_time("2026-03-28T12:00:00Z")).toBe("just now");
+    expect(format_relative_time("2026-03-28T11:59:30Z")).toBe("just now");
+  });
+
+  it("returns minutes for timestamps under an hour ago", () => {
+    vi.useFakeTimers({ now: new Date("2026-03-28T12:00:00Z") });
+    expect(format_relative_time("2026-03-28T11:55:00Z")).toBe("5m ago");
+    expect(format_relative_time("2026-03-28T11:15:00Z")).toBe("45m ago");
+  });
+
+  it("returns hours for timestamps under a day ago", () => {
+    vi.useFakeTimers({ now: new Date("2026-03-28T12:00:00Z") });
+    expect(format_relative_time("2026-03-28T10:00:00Z")).toBe("2h ago");
+    expect(format_relative_time("2026-03-27T13:00:00Z")).toBe("23h ago");
+  });
+
+  it("returns days for timestamps over a day ago", () => {
+    vi.useFakeTimers({ now: new Date("2026-03-28T12:00:00Z") });
+    expect(format_relative_time("2026-03-27T12:00:00Z")).toBe("1d ago");
+    expect(format_relative_time("2026-03-25T12:00:00Z")).toBe("3d ago");
+  });
+
+  it("returns 'just now' for future timestamps", () => {
+    vi.useFakeTimers({ now: new Date("2026-03-28T12:00:00Z") });
+    expect(format_relative_time("2026-03-28T13:00:00Z")).toBe("just now");
   });
 });
