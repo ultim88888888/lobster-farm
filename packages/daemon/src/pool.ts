@@ -1238,6 +1238,18 @@ export class BotPool extends EventEmitter {
       });
 
       proc.on("close", (code) => {
+        // Clean up the temp .env.op file after a delay. The tmux session
+        // starts detached (-d), so the close handler fires immediately —
+        // before `op run` inside tmux has a chance to read the file.
+        // A 30s delay gives op run plenty of time. The file only contains
+        // op:// references (not actual secrets), so a brief window is safe.
+        // Registered unconditionally so cleanup runs even on tmux failure.
+        if (github_token_ref) {
+          setTimeout(() => {
+            unlink(env_op_path).catch(() => { /* best effort cleanup */ });
+          }, 30_000);
+        }
+
         if (code !== 0) {
           console.error(`[pool] tmux new-session failed for pool-${String(bot.id)} (code ${String(code)})`);
           sentry.captureException(new Error(`tmux new-session failed for pool-${String(bot.id)} with code ${String(code)}`), {
@@ -1265,17 +1277,6 @@ export class BotPool extends EventEmitter {
             tags: { module: "pool", bot_id: String(bot.id) },
           });
           reject(new Error("tmux session did not start"));
-        }
-
-        // Clean up the temp .env.op file after a delay. The tmux session
-        // starts detached (-d), so the close handler fires immediately —
-        // before `op run` inside tmux has a chance to read the file.
-        // A 30s delay gives op run plenty of time. The file only contains
-        // op:// references (not actual secrets), so a brief window is safe.
-        if (github_token_ref) {
-          setTimeout(() => {
-            unlink(env_op_path).catch(() => { /* best effort cleanup */ });
-          }, 30_000);
         }
       });
     });
