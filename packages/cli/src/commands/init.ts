@@ -246,14 +246,35 @@ export const init_command = new Command("init")
         p.note(
           "Create a service account at https://my.1password.com → Developer → Service Accounts\n\n" +
             "Grant it:\n" +
-            "  • Create and manage vaults (each entity gets its own vault)\n" +
-            "  • Read/write access to a master \"lobsterfarm\" vault for shared credentials",
+            '  • "Create and manage vaults" permission (LobsterFarm will create vaults automatically)\n\n' +
+            "Note: Vaults created by the service account are auto-shared with it.\n" +
+            "You may need to share new vaults with your personal account too —\n" +
+            "go to 1Password app → Vaults → [vault name] → Sharing → Add your account",
           "1Password Setup",
         );
         await prompt_and_save_op_token(path_overrides);
         op.token_configured = true;
         op.status = "op CLI installed, service account token configured";
       }
+    }
+
+    // Auto-create command-center vault after 1Password token is configured
+    if (op.cli_installed && op.token_configured) {
+      const { exec_command } = await import("../lib/process.js");
+      const vault_result = await exec_command("op vault create command-center --format json");
+      if (vault_result.exitCode === 0) {
+        p.log.success("1Password vault 'command-center' created");
+      } else if (vault_result.stderr?.includes("already exists")) {
+        p.log.info("1Password vault 'command-center' already exists");
+      } else {
+        p.log.warning("Could not create command-center vault. Create it manually: op vault create command-center");
+      }
+
+      p.log.warning(
+        'New vaults are only accessible to the service account by default.\n' +
+        'Share the "command-center" vault with yourself:\n' +
+        "  1Password app → Vaults → command-center → Sharing → Add your account",
+      );
     }
 
     // ── Step 7: Bun (required by Discord channel plugin) ──

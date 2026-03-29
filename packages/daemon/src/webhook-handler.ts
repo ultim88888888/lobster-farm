@@ -83,7 +83,7 @@ function read_body(req: IncomingMessage): Promise<string> {
 }
 
 /**
- * Map a GitHub repo full_name (e.g. "ultim88888888/lobster-farm") to an entity.
+ * Map a GitHub repo full_name (e.g. "my-org/my-repo") to an entity.
  * Checks each entity's repo URLs for a match.
  */
 function find_entity_for_repo(

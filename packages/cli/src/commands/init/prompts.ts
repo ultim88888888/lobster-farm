@@ -171,7 +171,7 @@ export async function prompt_github(): Promise<{
 }> {
   const username = await p.text({
     message: "Default GitHub account (used for all entities unless overridden):",
-    placeholder: "e.g. spacelobsterfarm",
+    placeholder: "e.g. my-org",
     defaultValue: "",
   });
   if (p.isCancel(username)) {

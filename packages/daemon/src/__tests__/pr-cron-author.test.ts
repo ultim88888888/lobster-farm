@@ -100,19 +100,19 @@ describe("PR cron — author-based alert labeling", () => {
   }
 
   it("labels internal PR without 'External' prefix when author matches github.user", async () => {
-    mock_registry.get.mockReturnValue(make_entity("ultim88888888"));
+    mock_registry.get.mockReturnValue(make_entity("test-org"));
     const cron = await create_cron();
 
-    await trigger_review(cron, "ultim88888888", "changes_requested");
+    await trigger_review(cron, "test-org", "changes_requested");
 
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toMatch(/^PR #42:/);
     expect(alerts[0]).not.toContain("External");
-    expect(alerts[0]).not.toContain("@ultim88888888");
+    expect(alerts[0]).not.toContain("@test-org");
   });
 
   it("labels external PR with 'External' prefix and @author when author differs", async () => {
-    mock_registry.get.mockReturnValue(make_entity("ultim88888888"));
+    mock_registry.get.mockReturnValue(make_entity("test-org"));
     const cron = await create_cron();
 
     await trigger_review(cron, "contributor123", "changes_requested");
@@ -125,14 +125,14 @@ describe("PR cron — author-based alert labeling", () => {
     mock_registry.get.mockReturnValue(make_entity()); // No github user configured
     const cron = await create_cron();
 
-    await trigger_review(cron, "ultim88888888", "changes_requested");
+    await trigger_review(cron, "test-org", "changes_requested");
 
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatch(/^External PR #42 from @ultim88888888:/);
+    expect(alerts[0]).toMatch(/^External PR #42 from @test-org:/);
   });
 
   it("labels approved+merged internal PR without 'External'", async () => {
-    mock_registry.get.mockReturnValue(make_entity("ultim88888888"));
+    mock_registry.get.mockReturnValue(make_entity("test-org"));
 
     // Mock check_pr_merged — we need execFile to return MERGED state
     const { execFile } = await import("node:child_process");
@@ -143,7 +143,7 @@ describe("PR cron — author-based alert labeling", () => {
     // Mock the private check_pr_merged to return true
     (cron as any).check_pr_merged = vi.fn().mockResolvedValue(true);
 
-    await trigger_review(cron, "ultim88888888", "approved");
+    await trigger_review(cron, "test-org", "approved");
 
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toMatch(/^PR #42:/);
@@ -152,7 +152,7 @@ describe("PR cron — author-based alert labeling", () => {
   });
 
   it("labels approved+merged external PR with 'External' and @author", async () => {
-    mock_registry.get.mockReturnValue(make_entity("ultim88888888"));
+    mock_registry.get.mockReturnValue(make_entity("test-org"));
     const cron = await create_cron();
 
     (cron as any).check_pr_merged = vi.fn().mockResolvedValue(true);
@@ -165,7 +165,7 @@ describe("PR cron — author-based alert labeling", () => {
   });
 
   it("labels approved but unmerged external PR with human merge note", async () => {
-    mock_registry.get.mockReturnValue(make_entity("ultim88888888"));
+    mock_registry.get.mockReturnValue(make_entity("test-org"));
     const cron = await create_cron();
 
     (cron as any).check_pr_merged = vi.fn().mockResolvedValue(false);
@@ -178,7 +178,7 @@ describe("PR cron — author-based alert labeling", () => {
   });
 
   it("still spawns fixer for both internal and external PRs needing changes", async () => {
-    mock_registry.get.mockReturnValue(make_entity("ultim88888888"));
+    mock_registry.get.mockReturnValue(make_entity("test-org"));
     const cron = await create_cron();
 
     // Stub the fixer spawn to track calls
@@ -186,7 +186,7 @@ describe("PR cron — author-based alert labeling", () => {
     (cron as any).spawn_external_pr_fixer = spawn_fixer;
 
     // Internal PR
-    await trigger_review(cron, "ultim88888888", "changes_requested");
+    await trigger_review(cron, "test-org", "changes_requested");
     expect(spawn_fixer).toHaveBeenCalledTimes(1);
 
     // External PR

@@ -78,11 +78,11 @@ describe("extract_first_linked_issue", () => {
 
 describe("nwo_from_url", () => {
   it("parses HTTPS URL", () => {
-    expect(nwo_from_url("https://github.com/ultim88888888/lobster-farm.git")).toBe("ultim88888888/lobster-farm");
+    expect(nwo_from_url("https://github.com/test-org/lobster-farm.git")).toBe("test-org/lobster-farm");
   });
 
   it("parses SSH URL", () => {
-    expect(nwo_from_url("git@github.com:ultim88888888/lobster-farm.git")).toBe("ultim88888888/lobster-farm");
+    expect(nwo_from_url("git@github.com:test-org/lobster-farm.git")).toBe("test-org/lobster-farm");
   });
 
   it("handles URL without .git suffix", () => {

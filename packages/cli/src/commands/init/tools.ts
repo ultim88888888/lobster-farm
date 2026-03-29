@@ -471,7 +471,7 @@ async function setup_sentry(
     p.note(
       "Generate a Sentry auth token at:\n" +
       "https://sentry.io/settings/account/api/auth-tokens/\n\n" +
-      "Scopes needed: project:read, project:write, org:read, event:read, event:write",
+      "Required scopes: project:write, org:read",
       "Sentry Token",
     );
     const prompted_token = await p.password({ message: "Paste your Sentry auth token:" });

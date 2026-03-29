@@ -18,7 +18,7 @@ function sign_payload(payload: string, secret: string = WEBHOOK_SECRET): string 
 function make_pr_payload(
   action: string = "opened",
   pr_number: number = 42,
-  repo_full_name: string = "ultim88888888/lobster-farm",
+  repo_full_name: string = "test-org/lobster-farm",
   overrides: Record<string, unknown> = {},
 ): string {
   return JSON.stringify({
@@ -96,7 +96,7 @@ function make_registry(): EntityRegistry {
           repos: [
             {
               name: "lobster-farm",
-              url: "https://github.com/ultim88888888/lobster-farm.git",
+              url: "https://github.com/test-org/lobster-farm.git",
               path: "/tmp/test-repo",
             },
           ],
@@ -199,7 +199,7 @@ describe("handle_github_webhook", () => {
     });
 
     it("does not spawn reviewer for pull_request.closed without merge", async () => {
-      const body = make_pr_payload("closed", 300, "ultim88888888/lobster-farm", { merged: false });
+      const body = make_pr_payload("closed", 300, "test-org/lobster-farm", { merged: false });
       const req = make_request(body, {
         "x-github-event": "pull_request",
         "x-hub-signature-256": sign_payload(body),
@@ -223,7 +223,7 @@ describe("handle_github_webhook", () => {
       const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
       try {
-        const body = make_pr_payload("closed", 300, "ultim88888888/lobster-farm", { merged: true });
+        const body = make_pr_payload("closed", 300, "test-org/lobster-farm", { merged: true });
         const req = make_request(body, {
           "x-github-event": "pull_request",
           "x-hub-signature-256": sign_payload(body),
@@ -237,11 +237,11 @@ describe("handle_github_webhook", () => {
         await vi.waitFor(() => {
           // Should have called fetch for the comment + close API calls on issue #10
           expect(fetch_spy).toHaveBeenCalledWith(
-            "https://api.github.com/repos/ultim88888888/lobster-farm/issues/10/comments",
+            "https://api.github.com/repos/test-org/lobster-farm/issues/10/comments",
             expect.objectContaining({ method: "POST" }),
           );
           expect(fetch_spy).toHaveBeenCalledWith(
-            "https://api.github.com/repos/ultim88888888/lobster-farm/issues/10",
+            "https://api.github.com/repos/test-org/lobster-farm/issues/10",
             expect.objectContaining({ method: "PATCH" }),
           );
         }, { timeout: 2000 });

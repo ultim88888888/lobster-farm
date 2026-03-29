@@ -262,8 +262,7 @@ export class PRReviewCron {
     }
 
     // Extract feedback timestamps from reviews and comments.
-    // Note: we don't filter by author here. In this codebase all reviews come from
-    // the same GitHub account (ultim88888888). If CI bots start posting comments,
+    // Note: we don't filter by author here. If CI bots start posting comments,
     // add author filtering (e.g., skip authors with [bot] suffix or known CI logins).
     const feedback_timestamps: number[] = [];
 

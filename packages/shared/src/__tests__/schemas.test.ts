@@ -154,13 +154,13 @@ describe("EntityConfigSchema", () => {
       entity: {
         ...MINIMAL_ENTITY.entity,
         accounts: {
-          github: { org: "spacelobsterfarm", user: "ultim88888888" },
+          github: { org: "test-org", user: "test-org" },
           vercel: { project: "alpha-platform" },
           sentry: { project: "alpha" },
         },
       },
     });
-    expect(config.entity.accounts.github?.org).toBe("spacelobsterfarm");
+    expect(config.entity.accounts.github?.org).toBe("test-org");
     expect(config.entity.accounts.vercel?.project).toBe("alpha-platform");
   });
 
