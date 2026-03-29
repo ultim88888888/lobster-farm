@@ -26,6 +26,7 @@ import {
   fetch_issue_context,
   close_linked_issues,
 } from "./issue-utils.js";
+import { cleanup_after_merge } from "./worktree-cleanup.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -210,7 +211,7 @@ async function route_event(
       `[webhook] pull_request.closed (merged) for #${String(pr.number)} ` +
       `in ${match.entity_id} (${repo_full_name})`,
     );
-    await handle_pr_merged(pr, repo_full_name, ctx);
+    await handle_pr_merged(pr, repo_full_name, match.repo_path, ctx);
     return;
   }
 
@@ -518,51 +519,71 @@ function build_reviewer_prompt(
 // ── Merged PR handling ──
 
 /**
- * Handle a PR that was just merged: close any linked issues.
+ * Handle a PR that was just merged: close linked issues and clean up worktrees.
  *
  * GitHub Apps don't trigger auto-close when they merge PRs, so we do it
- * explicitly via the REST API. Failures are logged but never thrown.
+ * explicitly via the REST API. Worktree cleanup removes the branch's worktree
+ * and local branch ref. Both operations are best-effort — failures are logged
+ * but never thrown.
  */
 async function handle_pr_merged(
   pr: WebhookPR,
   repo_full_name: string,
+  repo_path: string,
   ctx: WebhookContext,
 ): Promise<void> {
+  // Close linked issues
   const issue_numbers = extract_linked_issues(pr.body, pr.title);
   if (issue_numbers.length === 0) {
     console.log(`[webhook] Merged PR #${String(pr.number)} has no linked issues to close`);
-    return;
-  }
-
-  let gh_token: string;
-  try {
-    gh_token = await ctx.github_app.get_token();
-  } catch (err) {
-    console.error(`[webhook] Failed to get token for issue closing: ${String(err)}`);
-    sentry.captureException(err, {
-      tags: { module: "webhook", action: "close_issues" },
-      contexts: { pr: { number: pr.number, title: pr.title } },
-    });
-    return;
-  }
-
-  console.log(
-    `[webhook] Closing linked issues ${issue_numbers.map(n => `#${String(n)}`).join(", ")} ` +
-    `for merged PR #${String(pr.number)}`,
-  );
-
-  const results = await close_linked_issues(repo_full_name, pr.number, issue_numbers, gh_token);
-
-  for (const result of results) {
-    if (!result.success) {
-      sentry.captureException(new Error(result.error ?? "unknown"), {
-        tags: { module: "webhook", action: "close_issue" },
-        contexts: {
-          pr: { number: pr.number, title: pr.title },
-          issue: { number: result.issue_number },
-        },
+  } else {
+    let gh_token: string;
+    try {
+      gh_token = await ctx.github_app.get_token();
+    } catch (err) {
+      console.error(`[webhook] Failed to get token for issue closing: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "webhook", action: "close_issues" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
       });
+      // Continue to worktree cleanup even if issue closing fails
+      gh_token = "";
     }
+
+    if (gh_token) {
+      console.log(
+        `[webhook] Closing linked issues ${issue_numbers.map(n => `#${String(n)}`).join(", ")} ` +
+        `for merged PR #${String(pr.number)}`,
+      );
+
+      const results = await close_linked_issues(repo_full_name, pr.number, issue_numbers, gh_token);
+
+      for (const result of results) {
+        if (!result.success) {
+          sentry.captureException(new Error(result.error ?? "unknown"), {
+            tags: { module: "webhook", action: "close_issue" },
+            contexts: {
+              pr: { number: pr.number, title: pr.title },
+              issue: { number: result.issue_number },
+            },
+          });
+        }
+      }
+    }
+  }
+
+  // Clean up worktrees for the merged branch
+  try {
+    await cleanup_after_merge(repo_path, pr.head.ref);
+  } catch (err) {
+    // Best-effort — never let cleanup break the merge handler
+    console.error(
+      `[webhook] Worktree cleanup failed for branch ${pr.head.ref}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "webhook", action: "worktree_cleanup" },
+      contexts: { pr: { number: pr.number, branch: pr.head.ref } },
+    });
   }
 }
 

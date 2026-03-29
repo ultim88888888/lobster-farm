@@ -14,6 +14,7 @@ import { PRReviewCron } from "./pr-cron.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { append_session_log } from "./persistence.js";
+import { sweep_stale_worktrees } from "./worktree-cleanup.js";
 import * as sentry from "./sentry.js";
 
 async function main(): Promise<void> {
@@ -240,6 +241,19 @@ async function main(): Promise<void> {
   );
   await pr_cron.start(cron_interval_ms);
 
+  // Start periodic worktree sweep (hourly) — cleans up stale worktrees from
+  // merged PRs that the webhook handler missed or from manual merges.
+  const WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+  const worktree_sweep_timer = setInterval(() => {
+    void sweep_stale_worktrees(registry).catch((err) => {
+      console.error(`[worktree-cleanup] Sweep failed: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "worktree-cleanup", action: "sweep" },
+      });
+    });
+  }, WORKTREE_SWEEP_INTERVAL_MS);
+  console.log("[worktree-cleanup] Stale worktree sweep scheduled (every 60 min)");
+
   // Write PID file
   await write_pid(config);
   console.log(`PID file written (pid: ${String(process.pid)})`);
@@ -272,6 +286,7 @@ async function main(): Promise<void> {
     // Enter drain mode — no new work accepted
     pool.drain();
     pr_cron.stop();
+    clearInterval(worktree_sweep_timer);
 
     // Check for active work
     const work_check = pool.has_active_work();
