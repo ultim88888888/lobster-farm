@@ -57,6 +57,85 @@ export function format_duration(start: Date): string {
   return `${String(minutes)}m`;
 }
 
+/** Format seconds as a human-readable uptime string (e.g., "4h 22m"). */
+export function format_uptime(seconds: number): string {
+  if (seconds < 0) return "0m";
+  const total_minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(total_minutes / 60);
+  const minutes = total_minutes % 60;
+  if (hours > 0) return `${String(hours)}h ${String(minutes)}m`;
+  return `${String(minutes)}m`;
+}
+
+// ── Cross-entity dashboard types ──
+
+/** A session entry for the cross-entity dashboard. Pre-resolved to strings
+ * so the formatting function is pure and testable without Discord/pool deps. */
+export interface DashboardSession {
+  channel_name: string;
+  agent_label: string;
+  duration: string;
+}
+
+/** A single entity's section in the cross-entity dashboard. */
+export interface DashboardEntity {
+  id: string;
+  sessions: DashboardSession[];
+}
+
+/** All data needed to render the cross-entity status dashboard. */
+export interface DashboardData {
+  uptime: string;
+  pool_assigned: number;
+  pool_total: number;
+  entities: DashboardEntity[];
+}
+
+/** Render the cross-entity status dashboard as a Discord-safe string.
+ * Pure function: all data pre-resolved, no side effects.
+ * Truncates to stay within Discord's 2000-character message limit. */
+export function format_cross_entity_dashboard(data: DashboardData): string {
+  const DISCORD_MAX = 2000;
+  const TRUNCATION_RESERVE = 60; // room for "... and N more entities"
+
+  const lines: string[] = ["**LobsterFarm Status**", ""];
+
+  lines.push(`**Daemon:** running (uptime: ${data.uptime})`);
+  lines.push(`**Pool:** ${String(data.pool_assigned)}/${String(data.pool_total)} assigned, ${String(data.pool_total - data.pool_assigned)} free`);
+  lines.push("");
+
+  let truncated_count = 0;
+  for (let i = 0; i < data.entities.length; i++) {
+    const entity = data.entities[i]!;
+    const section_lines: string[] = [`--- ${entity.id} ---`];
+
+    if (entity.sessions.length > 0) {
+      section_lines.push("Sessions:");
+      for (const s of entity.sessions) {
+        section_lines.push(`  \u2022 ${s.channel_name} \u2014 ${s.agent_label} \u2014 ${s.duration}`);
+      }
+    } else {
+      section_lines.push("No active work.");
+    }
+    section_lines.push("");
+
+    // Check if adding this section would exceed the limit
+    const candidate = lines.join("\n") + "\n" + section_lines.join("\n");
+    if (candidate.length > DISCORD_MAX - TRUNCATION_RESERVE) {
+      truncated_count = data.entities.length - i;
+      break;
+    }
+
+    lines.push(...section_lines);
+  }
+
+  if (truncated_count > 0) {
+    lines.push(`\u2026 and ${String(truncated_count)} more entities`);
+  }
+
+  return lines.join("\n").trim();
+}
+
 /** Format an ISO timestamp as a relative time string (e.g., "2h ago", "3d ago"). */
 export function format_relative_time(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime();
@@ -1229,10 +1308,10 @@ export class DiscordBot extends EventEmitter {
     // Build pool summary (used in all contexts)
     const pool_summary = pool ? this.format_pool_summary(pool) : null;
 
-    // No entity context — global channel (e.g., #command-center)
+    // Global channel (e.g., #command-center) — show cross-entity dashboard
     if (!is_entity_channel) {
-      await target.reply("No active session in this channel." +
-        (pool_summary ? `\n\n${pool_summary}` : ""));
+      const response = this.format_cross_entity_status(pool);
+      await target.reply(response);
       return;
     }
 
@@ -1323,6 +1402,73 @@ export class DiscordBot extends EventEmitter {
   private format_pool_summary(pool: BotPool): string {
     const status = pool.get_status();
     return `Pool: ${String(status.assigned)}/${String(status.total)} assigned, ${String(status.free)} free`;
+  }
+
+  /** Build the cross-entity status dashboard shown in #command-center.
+   * Gathers data from registry and pool, then delegates to the pure
+   * format_cross_entity_dashboard() function for rendering. */
+  format_cross_entity_status(pool: BotPool | null): string {
+    const entities = this.registry.get_active();
+    const status = pool?.get_status();
+    const assigned_bots = pool?.get_assigned_bots() ?? [];
+
+    // Group assigned bots by entity
+    const bots_by_entity = new Map<string, typeof assigned_bots[number][]>();
+    for (const bot of assigned_bots) {
+      if (!bot.entity_id) continue;
+      const list = bots_by_entity.get(bot.entity_id) ?? [];
+      list.push(bot);
+      bots_by_entity.set(bot.entity_id, list);
+    }
+
+    // Build dashboard data with all names/labels pre-resolved
+    const dashboard_entities: DashboardEntity[] = entities.map(entity_config => {
+      const eid = entity_config.entity.id;
+      const entity_bots = bots_by_entity.get(eid) ?? [];
+      return {
+        id: eid,
+        sessions: entity_bots.map(bot => {
+          const identity = bot.archetype
+            ? this.resolve_agent_identity(bot.archetype)
+            : null;
+          return {
+            channel_name: this.resolve_channel_display_name(bot.channel_id),
+            agent_label: identity
+              ? `${identity.name} (${bot.archetype})`
+              : "unknown",
+            duration: bot.assigned_at ? format_duration(bot.assigned_at) : "?",
+          };
+        }),
+      };
+    });
+
+    return format_cross_entity_dashboard({
+      uptime: format_uptime(process.uptime()),
+      pool_assigned: status?.assigned ?? 0,
+      pool_total: status?.total ?? 0,
+      entities: dashboard_entities,
+    });
+  }
+
+  /** Resolve a channel ID to a display name.
+   * Uses the Discord.js channel cache when available, falls back to the
+   * channel_type from the channel map, and finally to the raw ID. */
+  private resolve_channel_display_name(channel_id: string | null): string {
+    if (!channel_id) return "unknown";
+
+    // Try Discord.js cache first (has actual channel names)
+    const discord_channel = this.client.channels.cache.get(channel_id);
+    if (discord_channel && "name" in discord_channel && typeof discord_channel.name === "string") {
+      return `#${discord_channel.name}`;
+    }
+
+    // Fall back to channel type from our mapping
+    const entry = this.channel_map.get(channel_id);
+    if (entry) {
+      return `#${entry.channel_type.replace(/_/g, "-")}`;
+    }
+
+    return `#${channel_id}`;
   }
 
   private async handle_scaffold_command(

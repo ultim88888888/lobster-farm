@@ -828,6 +828,12 @@ export class BotPool extends EventEmitter {
     await this.release(channel_id);
   }
 
+  /** Get all bots currently assigned to a channel (state === "assigned").
+   * Returns read-only snapshots — callers must not mutate the returned objects. */
+  get_assigned_bots(): readonly PoolBot[] {
+    return this.bots.filter(b => b.state === "assigned");
+  }
+
   /** Get pool status. */
   get_status(): PoolStatus {
     return {
