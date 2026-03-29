@@ -725,7 +725,7 @@ export class BotPool extends EventEmitter {
 
   /** Release a bot from its channel assignment. */
   async release(channel_id: string): Promise<void> {
-    const bot = this.bots.find(b => b.channel_id === channel_id);
+    const bot = this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
     if (!bot) return;
 
     // Synchronous in-flight lock: prevents double-release when two callers

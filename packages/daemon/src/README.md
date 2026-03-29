@@ -16,7 +16,6 @@ The LobsterFarm daemon process. Manages entities, spawns Claude Code agent sessi
 - `pool.ts` -- `BotPool`. Manages a pool of Discord bot accounts (pool-0 through pool-N) for assigning to channels. Handles assignment, release, LRU eviction, parking (session preservation), nickname setting, and pre-assignment of planners to entity #general channels.
 - `actions.ts` -- Side-effect functions: git worktree create/cleanup, GitHub PR create/merge via `gh`, test runner, and Discord notification dispatch.
 - `review-utils.ts` -- Utility functions for PR review feedback: fetch review comments from GitHub and build fix prompts for the auto-fix loop.
-- `context.ts` -- Compiles the context payload injected into agent sessions: entity memory path, daily log paths, and project CLAUDE.md content.
 - `hooks.ts` -- Post-session hooks. Extracts session learnings via Haiku and appends them to daily logs. Also manages the global learnings file.
 - `models.ts` -- Maps abstract model tiers (opus/sonnet/haiku + think level) to Claude CLI flags.
 - `persistence.ts` -- JSON file persistence for PR review state and pool state. Saves to and loads from `~/.lobsterfarm/state/`.
