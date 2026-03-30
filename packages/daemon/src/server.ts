@@ -369,6 +369,9 @@ const handle_scaffold_entity: RouteHandler = async (req, res, ctx) => {
 const handle_reload: RouteHandler = async (_req, res, ctx) => {
   try {
     await ctx.registry.load_all();
+    if (ctx.discord) {
+      ctx.discord.build_channel_map();
+    }
     json_response(res, 200, {
       ok: true,
       entities: ctx.registry.count(),
