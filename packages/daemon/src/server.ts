@@ -83,6 +83,7 @@ const handle_status: RouteHandler = (_req, res, ctx) => {
       })),
     },
     queue: queue_stats,
+    pool: ctx.pool?.get_status() ?? null,
     commander: ctx.commander?.health_check() ?? { state: "not_configured" },
     github_app: ctx.github_app ? "configured" : "not_configured",
   });
