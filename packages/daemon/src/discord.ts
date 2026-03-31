@@ -621,22 +621,6 @@ export class DiscordBot extends EventEmitter {
 
   // ── Channel management ──
 
-  /** Set a channel's topic. No-op if disconnected or channel not found. */
-  async set_channel_topic(channel_id: string, topic: string): Promise<void> {
-    if (!this.connected) return;
-    try {
-      const channel = await this.client.channels.fetch(channel_id);
-      if (channel?.isTextBased() && !channel.isDMBased()) {
-        await (channel as TextChannel).setTopic(topic);
-      }
-    } catch (err) {
-      console.error(`[discord] Failed to set topic for ${channel_id}: ${String(err)}`);
-      sentry.captureException(err, {
-        tags: { module: "discord", action: "set_topic" },
-      });
-    }
-  }
-
   /** Create a text channel under a category. Returns the channel ID, or null on failure. */
   async create_channel(
     category_id: string,

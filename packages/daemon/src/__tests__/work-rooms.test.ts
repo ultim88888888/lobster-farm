@@ -80,7 +80,6 @@ function make_mock_discord() {
     send: vi.fn().mockResolvedValue(undefined),
     send_as_agent: vi.fn().mockResolvedValue(undefined),
     send_to_entity: vi.fn().mockResolvedValue(undefined),
-    set_channel_topic: vi.fn().mockResolvedValue(undefined),
     create_channel: vi.fn().mockResolvedValue(DYN_WR),
     delete_channel: vi.fn().mockResolvedValue(true),
     build_channel_map: vi.fn(),
@@ -198,32 +197,6 @@ describe("Work Room Assignment", () => {
       expect(dynamic_entry?.assigned_feature).toBe("alpha-42");
     });
 
-    it("sets channel topic with title on assignment", async () => {
-      const feature = make_feature();
-      const entity = make_entity_config(make_static_work_rooms(3));
-
-      await actions.assign_work_room(feature, entity);
-
-      expect(discord.set_channel_topic).toHaveBeenCalledWith(
-        WR_IDS[0],
-        "\u{1F528} #42: Test Feature",
-      );
-    });
-
-    it("truncates long title in channel topic on assignment", async () => {
-      const long_title = "A".repeat(80);
-      const feature = make_feature({ title: long_title });
-      const entity = make_entity_config(make_static_work_rooms(3));
-
-      await actions.assign_work_room(feature, entity);
-
-      const expected_title = "A".repeat(57) + "...";
-      expect(discord.set_channel_topic).toHaveBeenCalledWith(
-        WR_IDS[0],
-        `\u{1F528} #42: ${expected_title}`,
-      );
-    });
-
     it("rebuilds channel map after assignment", async () => {
       const feature = make_feature();
       const entity = make_entity_config(make_static_work_rooms(3));
@@ -328,17 +301,6 @@ describe("Work Room Assignment", () => {
   });
 
   describe("release_work_room", () => {
-    it("resets static room topic to Available", async () => {
-      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
-      const channels = make_static_work_rooms(3);
-      channels[1]!.assigned_feature = "alpha-42";
-      const entity = make_entity_config(channels);
-
-      await actions.release_work_room(feature, entity);
-
-      expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[0], "\u{1F7E2} Available");
-    });
-
     it("clears assigned_feature on static room", async () => {
       const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
       const channels = make_static_work_rooms(3);
@@ -433,7 +395,6 @@ describe("Work Room Assignment", () => {
       await actions.release_work_room(feature, entity);
 
       expect(discord.send).not.toHaveBeenCalled();
-      expect(discord.set_channel_topic).not.toHaveBeenCalled();
       expect(discord.delete_channel).not.toHaveBeenCalled();
     });
 
@@ -448,135 +409,6 @@ describe("Work Room Assignment", () => {
       expect(wr2).toBeDefined();
       expect(wr2?.type).toBe("work_room");
     });
-  });
-});
-
-describe("Channel Topic Updates", () => {
-  let discord: ReturnType<typeof make_mock_discord>;
-
-  beforeEach(() => {
-    discord = make_mock_discord();
-    // @ts-expect-error — mock does not implement full DiscordBot interface
-    actions.set_discord_bot(discord);
-  });
-
-  describe("update_work_room_topic", () => {
-    it("updates topic when work room is assigned", async () => {
-      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
-
-      await actions.update_work_room_topic(feature, "\u{1F7E3} alpha-42 \u2014 #42 \u2014 In Review");
-
-      expect(discord.set_channel_topic).toHaveBeenCalledWith(
-        WR_IDS[0],
-        "\u{1F7E3} alpha-42 \u2014 #42 \u2014 In Review",
-      );
-    });
-
-    it("is a no-op when no work room is assigned", async () => {
-      const feature = make_feature({ discordWorkRoom: null });
-
-      await actions.update_work_room_topic(feature, "some topic");
-
-      expect(discord.set_channel_topic).not.toHaveBeenCalled();
-    });
-
-    it("is a no-op when no discord bot is available", async () => {
-      actions.set_discord_bot(null);
-      const feature = make_feature({ discordWorkRoom: WR_IDS[0] });
-
-      await actions.update_work_room_topic(feature, "some topic");
-
-      // No error thrown, function returns silently
-    });
-  });
-});
-
-describe("Startup Topic Reset", () => {
-  let discord: ReturnType<typeof make_mock_discord>;
-
-  beforeEach(() => {
-    discord = make_mock_discord();
-    // @ts-expect-error — mock does not implement full DiscordBot interface
-    actions.set_discord_bot(discord);
-    actions.set_pool(null);
-  });
-
-  it("resets all work rooms to Available when no pool assignments", async () => {
-    const entity = make_entity_config(make_static_work_rooms(3));
-    const registry = {
-      get_active: vi.fn().mockReturnValue([entity]),
-    };
-
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    // All 3 work rooms should be reset
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[0], "\u{1F7E2} Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[1], "\u{1F7E2} Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[2], "\u{1F7E2} Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledTimes(3);
-  });
-
-  it("preserves topic on work rooms with active pool assignments", async () => {
-    const entity = make_entity_config(make_static_work_rooms(3));
-    // Pool has a bot assigned to wr-1
-    // @ts-expect-error — mock pool
-    actions.set_pool(make_mock_pool({ [WR_IDS[0]]: { id: 0, archetype: "builder" } }));
-
-    const registry = {
-      get_active: vi.fn().mockReturnValue([entity]),
-    };
-
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    // wr-1 has an active pool assignment — should NOT be reset
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(WR_IDS[0], "\u{1F7E2} Available");
-    // wr-2 and wr-3 should be reset
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[1], "\u{1F7E2} Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(WR_IDS[2], "\u{1F7E2} Available");
-    expect(discord.set_channel_topic).toHaveBeenCalledTimes(2);
-  });
-
-  it("is a no-op when no discord bot is available", async () => {
-    actions.set_discord_bot(null);
-
-    const registry = {
-      get_active: vi.fn().mockReturnValue([]),
-    };
-
-    // Should not throw
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    expect(registry.get_active).not.toHaveBeenCalled();
-  });
-
-  it("only touches work_room channels, not general or alerts", async () => {
-    const entity = make_entity_config(make_static_work_rooms(3));
-    const registry = {
-      get_active: vi.fn().mockReturnValue([entity]),
-    };
-
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    // Should not be called for gen-1 or al-1
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(GEN_ID, expect.anything());
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith(AL_ID, expect.anything());
-  });
-
-  it("is a no-op with 0 static work rooms", async () => {
-    const entity = make_entity_config(make_static_work_rooms(0));
-    const registry = {
-      get_active: vi.fn().mockReturnValue([entity]),
-    };
-
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    // No work rooms -> no topics to reset
-    expect(discord.set_channel_topic).not.toHaveBeenCalled();
   });
 });
 

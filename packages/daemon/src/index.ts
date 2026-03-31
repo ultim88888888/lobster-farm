@@ -5,7 +5,7 @@ import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
 import { TaskQueue } from "./queue.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
-import { set_discord_bot, set_pool, reset_idle_work_room_topics } from "./actions.js";
+import { set_discord_bot, set_pool } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
@@ -183,11 +183,6 @@ async function main(): Promise<void> {
         tags: { module: "startup", phase: "avatars" },
       });
     }
-  }
-
-  // Reset stale work room topics from previous daemon runs
-  if (discord_connected) {
-    await reset_idle_work_room_topics(registry);
   }
 
   // Proactively resume bots that were assigned before shutdown.

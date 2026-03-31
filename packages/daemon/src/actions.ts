@@ -24,7 +24,6 @@ import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/share
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
-import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -310,17 +309,6 @@ export async function assign_work_room(
     await persist_entity_config(entity_config);
   }
 
-  // Set channel topic with truncated title
-  if (_discord && channel_id) {
-    const short_title = feature.title.length > 60
-      ? feature.title.slice(0, 57) + "..."
-      : feature.title;
-    await _discord.set_channel_topic(
-      channel_id,
-      `🔨 #${String(feature.githubIssue)}: ${short_title}`,
-    );
-  }
-
   // Rebuild channel map so Discord bot routes messages correctly
   _discord?.build_channel_map();
 
@@ -351,10 +339,9 @@ export async function release_work_room(
     channels.list = channels.list.filter((c: ChannelMapping) => c.id !== channel_id);
     await persist_entity_config(entity_config);
   } else if (entry) {
-    // Static room — reset topic and clear assignment
+    // Static room — clear assignment
     entry.assigned_feature = null;
     if (_discord && is_discord_snowflake(channel_id)) {
-      await _discord.set_channel_topic(channel_id, "🟢 Available");
       await _discord.send(
         channel_id,
         `Feature ${feature.id} complete. This work room is now available.`,
@@ -422,16 +409,6 @@ export async function detect_review_outcome(
   }
 }
 
-/** Update the topic of a feature's work room. */
-export async function update_work_room_topic(
-  feature: FeatureData,
-  topic: string,
-): Promise<void> {
-  if (!feature.discordWorkRoom || !_discord) return;
-  if (!is_discord_snowflake(feature.discordWorkRoom)) return;
-  await _discord.set_channel_topic(feature.discordWorkRoom, topic);
-}
-
 // ── Merge error classification ──
 
 export type MergeErrorKind = "conflict" | "other";
@@ -459,46 +436,3 @@ export function classify_merge_error(error: string): MergeErrorKind {
   return "other";
 }
 
-// ── Startup cleanup ──
-
-/**
- * Reset topics on unoccupied work rooms to "Available".
- * Called on daemon startup to clear stale topics from previous runs.
- * Rooms with active pool assignments keep their current topic.
- */
-export async function reset_idle_work_room_topics(
-  registry: EntityRegistry,
-): Promise<void> {
-  if (!_discord) return;
-
-  // Collect work rooms with active pool assignments
-  const active_rooms = new Set<string>();
-  if (_pool) {
-    for (const entity_config of registry.get_active()) {
-      for (const channel of entity_config.entity.channels.list) {
-        if (channel.type === "work_room" && _pool.get_assignment(channel.id)) {
-          active_rooms.add(channel.id);
-        }
-      }
-    }
-  }
-
-  // Reset unoccupied work rooms (skip placeholder IDs like "wr-1" from alpha entity)
-  let reset_count = 0;
-  for (const entity_config of registry.get_active()) {
-    for (const channel of entity_config.entity.channels.list) {
-      if (
-        channel.type === "work_room" &&
-        !active_rooms.has(channel.id) &&
-        is_discord_snowflake(channel.id)
-      ) {
-        await _discord.set_channel_topic(channel.id, "\u{1F7E2} Available");
-        reset_count++;
-      }
-    }
-  }
-
-  if (reset_count > 0) {
-    console.log(`[actions] Reset ${String(reset_count)} idle work room topic(s) to Available`);
-  }
-}

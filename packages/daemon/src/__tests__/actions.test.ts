@@ -135,7 +135,6 @@ import {
   notify,
   assign_work_room,
   release_work_room,
-  reset_idle_work_room_topics,
   set_discord_bot,
   set_pool,
   type FeatureData,
@@ -196,7 +195,6 @@ function make_mock_discord() {
   return {
     send_to_entity: vi.fn(async () => {}),
     send: vi.fn(async () => {}),
-    set_channel_topic: vi.fn(async () => {}),
     create_channel: vi.fn(async () => "new-channel-123456789012345678"),
     delete_channel: vi.fn(async () => true),
     build_channel_map: vi.fn(),
@@ -775,11 +773,6 @@ describe("assign_work_room", () => {
     const result = await assign_work_room(feature, config);
 
     expect(result).toBe("12345678901234567890");
-    // Should set topic on the assigned channel
-    expect(mock_discord.set_channel_topic).toHaveBeenCalledWith(
-      "12345678901234567890",
-      expect.stringContaining("#42"),
-    );
   });
 
   it("skips rooms with non-snowflake placeholder IDs", async () => {
@@ -901,35 +894,6 @@ describe("assign_work_room", () => {
     expect(result).toBeNull();
   });
 
-  it("truncates long titles in channel topic", async () => {
-    const mock_discord = make_mock_discord();
-    set_discord_bot(mock_discord as any);
-
-    const config = make_entity_config({
-      channels: {
-        category_id: "cat-123",
-        list: [
-          {
-            type: "work_room",
-            id: "12345678901234567890",
-            purpose: "Room 1",
-          } as ChannelMapping,
-        ],
-      },
-    });
-
-    const long_title =
-      "This is a very long feature title that exceeds sixty characters and needs to be truncated";
-    const feature = make_feature({ title: long_title });
-
-    await assign_work_room(feature, config);
-
-    const topic_arg = mock_discord.set_channel_topic.mock.calls[0]?.[1] as string;
-    // Title should be truncated to 57 chars + "..."
-    expect(topic_arg.length).toBeLessThanOrEqual(70);
-    expect(topic_arg).toContain("...");
-  });
-
   it("rebuilds channel map after assignment", async () => {
     const mock_discord = make_mock_discord();
     set_discord_bot(mock_discord as any);
@@ -989,11 +953,6 @@ describe("release_work_room", () => {
 
     await release_work_room(feature, config);
 
-    // Should reset topic
-    expect(mock_discord.set_channel_topic).toHaveBeenCalledWith(
-      "12345678901234567890",
-      expect.stringContaining("Available"),
-    );
     // Should send farewell message
     expect(mock_discord.send).toHaveBeenCalledWith(
       "12345678901234567890",
@@ -1071,120 +1030,3 @@ describe("release_work_room", () => {
   });
 });
 
-describe("reset_idle_work_room_topics", () => {
-  it("no-ops when Discord bot is not set", async () => {
-    set_discord_bot(null);
-
-    const registry = {
-      get_active: vi.fn().mockReturnValue([]),
-    };
-
-    await reset_idle_work_room_topics(registry as any);
-
-    // Should not crash and should not call registry
-    expect(registry.get_active).not.toHaveBeenCalled();
-  });
-
-  it("resets unoccupied work rooms to Available", async () => {
-    const mock_discord = make_mock_discord();
-    set_discord_bot(mock_discord as any);
-
-    const registry = {
-      get_active: vi.fn().mockReturnValue([
-        make_entity_config({
-          channels: {
-            category_id: "cat-123",
-            list: [
-              {
-                type: "work_room",
-                id: "12345678901234567890",
-                purpose: "Room 1",
-              } as ChannelMapping,
-              {
-                type: "work_room",
-                id: "22345678901234567890",
-                purpose: "Room 2",
-              } as ChannelMapping,
-            ],
-          },
-        }),
-      ]),
-    };
-
-    await reset_idle_work_room_topics(registry as any);
-
-    expect(mock_discord.set_channel_topic).toHaveBeenCalledTimes(2);
-    expect(mock_discord.set_channel_topic).toHaveBeenCalledWith(
-      "12345678901234567890",
-      expect.stringContaining("Available"),
-    );
-  });
-
-  it("skips rooms with active pool assignments", async () => {
-    const mock_discord = make_mock_discord();
-    const mock_pool = make_mock_pool();
-    set_discord_bot(mock_discord as any);
-    set_pool(mock_pool as any);
-
-    // Mark first room as occupied
-    mock_pool.set_assignment("12345678901234567890", { bot_id: 1 });
-
-    const registry = {
-      get_active: vi.fn().mockReturnValue([
-        make_entity_config({
-          channels: {
-            category_id: "cat-123",
-            list: [
-              {
-                type: "work_room",
-                id: "12345678901234567890",
-                purpose: "Room 1 (occupied)",
-              } as ChannelMapping,
-              {
-                type: "work_room",
-                id: "22345678901234567890",
-                purpose: "Room 2 (free)",
-              } as ChannelMapping,
-            ],
-          },
-        }),
-      ]),
-    };
-
-    await reset_idle_work_room_topics(registry as any);
-
-    // Only the second (free) room should be reset
-    expect(mock_discord.set_channel_topic).toHaveBeenCalledTimes(1);
-    expect(mock_discord.set_channel_topic).toHaveBeenCalledWith(
-      "22345678901234567890",
-      expect.stringContaining("Available"),
-    );
-  });
-
-  it("skips rooms with non-snowflake placeholder IDs", async () => {
-    const mock_discord = make_mock_discord();
-    set_discord_bot(mock_discord as any);
-
-    const registry = {
-      get_active: vi.fn().mockReturnValue([
-        make_entity_config({
-          channels: {
-            category_id: "cat-123",
-            list: [
-              {
-                type: "work_room",
-                id: "wr-1",
-                purpose: "Placeholder",
-              } as ChannelMapping,
-            ],
-          },
-        }),
-      ]),
-    };
-
-    await reset_idle_work_room_topics(registry as any);
-
-    // Non-snowflake IDs should be skipped
-    expect(mock_discord.set_channel_topic).not.toHaveBeenCalled();
-  });
-});

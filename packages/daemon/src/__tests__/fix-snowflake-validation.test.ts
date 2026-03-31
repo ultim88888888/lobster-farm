@@ -264,58 +264,12 @@ function make_mock_discord() {
     send: vi.fn().mockResolvedValue(undefined),
     send_as_agent: vi.fn().mockResolvedValue(undefined),
     send_to_entity: vi.fn().mockResolvedValue(undefined),
-    set_channel_topic: vi.fn().mockResolvedValue(undefined),
     create_channel: vi.fn().mockResolvedValue("10000000000000050"),
     delete_channel: vi.fn().mockResolvedValue(true),
     build_channel_map: vi.fn(),
     is_connected: vi.fn().mockReturnValue(true),
   };
 }
-
-describe("reset_idle_work_room_topics — snowflake guard", () => {
-  let discord: ReturnType<typeof make_mock_discord>;
-
-  beforeEach(() => {
-    discord = make_mock_discord();
-    // @ts-expect-error — mock
-    actions.set_discord_bot(discord);
-    actions.set_pool(null);
-  });
-
-  it("skips work rooms with placeholder IDs", async () => {
-    const entity = make_actions_entity([
-      { type: "general", id: "gen-1" },
-      { type: "work_room", id: "wr-1" },
-      { type: "work_room", id: "wr-2" },
-      { type: "work_room", id: VALID_WR },
-    ]);
-    const registry = { get_active: vi.fn().mockReturnValue([entity]) };
-
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    // Only the valid snowflake channel should have its topic set
-    expect(discord.set_channel_topic).toHaveBeenCalledTimes(1);
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(VALID_WR, "\u{1F7E2} Available");
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wr-1", expect.anything());
-    expect(discord.set_channel_topic).not.toHaveBeenCalledWith("wr-2", expect.anything());
-  });
-
-  it("is a no-op when all work room IDs are placeholders", async () => {
-    const entity = make_actions_entity([
-      { type: "general", id: "gen-1" },
-      { type: "work_room", id: "wr-1" },
-      { type: "work_room", id: "wr-2" },
-      { type: "work_room", id: "wr-3" },
-    ]);
-    const registry = { get_active: vi.fn().mockReturnValue([entity]) };
-
-    // @ts-expect-error — mock registry
-    await actions.reset_idle_work_room_topics(registry);
-
-    expect(discord.set_channel_topic).not.toHaveBeenCalled();
-  });
-});
 
 describe("assign_work_room — snowflake guard", () => {
   let discord: ReturnType<typeof make_mock_discord>;
@@ -357,32 +311,6 @@ describe("assign_work_room — snowflake guard", () => {
   });
 });
 
-describe("update_work_room_topic — snowflake guard", () => {
-  let discord: ReturnType<typeof make_mock_discord>;
-
-  beforeEach(() => {
-    discord = make_mock_discord();
-    // @ts-expect-error — mock
-    actions.set_discord_bot(discord);
-  });
-
-  it("skips topic update when work room ID is a placeholder", async () => {
-    const feature = make_feature({ discordWorkRoom: "wr-1" });
-
-    await actions.update_work_room_topic(feature, "some topic");
-
-    expect(discord.set_channel_topic).not.toHaveBeenCalled();
-  });
-
-  it("updates topic when work room ID is a valid snowflake", async () => {
-    const feature = make_feature({ discordWorkRoom: VALID_WR });
-
-    await actions.update_work_room_topic(feature, "some topic");
-
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(VALID_WR, "some topic");
-  });
-});
-
 describe("release_work_room — snowflake guard", () => {
   let discord: ReturnType<typeof make_mock_discord>;
 
@@ -401,7 +329,6 @@ describe("release_work_room — snowflake guard", () => {
     await actions.release_work_room(feature, entity);
 
     // The entry is found (so assigned_feature is cleared), but no Discord API calls
-    expect(discord.set_channel_topic).not.toHaveBeenCalled();
     expect(discord.send).not.toHaveBeenCalled();
   });
 
@@ -427,7 +354,6 @@ describe("release_work_room — snowflake guard", () => {
 
     await actions.release_work_room(feature, entity);
 
-    expect(discord.set_channel_topic).toHaveBeenCalledWith(VALID_WR, "\u{1F7E2} Available");
     expect(discord.send).toHaveBeenCalled();
   });
 });
