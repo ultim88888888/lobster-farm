@@ -7,7 +7,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import { fetch_review_comments, build_review_fix_prompt } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge } from "./review-utils.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
@@ -391,6 +391,11 @@ export class PRReviewCron {
       `After posting your review:`,
       `- If you approved, merge the PR:`,
       `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
+      `- If the merge command fails (branch behind main):`,
+      `  1. Try: git fetch origin && git checkout ${pr.headRefName} && git rebase origin/main`,
+      `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.headRefName}`,
+      `  3. Then retry: gh pr merge ${String(pr.number)} --squash --delete-branch`,
+      `  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers`,
       `- If you requested changes, do NOT merge.`,
     ];
 
@@ -528,23 +533,41 @@ export class PRReviewCron {
       }
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
-      const is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
+      let is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
 
-      // Close linked issues after merge — GitHub Apps don't trigger auto-close
       if (is_merged) {
+        // Reviewer merged — close linked issues and notify
         await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
-      }
 
-      if (is_internal) {
-        await this.notify_alerts(
-          entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — ${is_merged ? "approved and merged to main" : "approved, awaiting merge"}`,
+        if (is_internal) {
+          await this.notify_alerts(
+            entity_id,
+            `PR #${String(pr.number)}: ${pr.title} — approved and merged to main`,
+          );
+        } else {
+          await this.notify_alerts(
+            entity_id,
+            `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved and merged to main`,
+          );
+        }
+      } else if (is_internal) {
+        // Internal PR not yet merged — attempt auto-merge with rebase (#166)
+        const result = await attempt_auto_merge(
+          pr.number, pr.headRefName, repo_path, this.gh_bin, gh_token,
         );
-      } else if (is_merged) {
-        await this.notify_alerts(
-          entity_id,
-          `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved and merged to main`,
-        );
+
+        if (result.merged) {
+          await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
+          await this.notify_alerts(
+            entity_id,
+            `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged to main`,
+          );
+        } else {
+          await this.notify_alerts(
+            entity_id,
+            `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
+          );
+        }
       } else {
         // External, not yet merged — escalate to human
         await this.notify_alerts(

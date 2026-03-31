@@ -33,6 +33,7 @@ vi.mock("../review-utils.js", () => ({
   fetch_review_comments: vi.fn(async () => []),
   build_review_fix_prompt: vi.fn(() => "fix prompt"),
   check_merge_conflicts: vi.fn(async () => false),
+  attempt_auto_merge: vi.fn(async () => ({ merged: true, method: "direct" })),
 }));
 
 // Mock issue-utils — default: no linked issues

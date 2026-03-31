@@ -19,12 +19,13 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
-import { fetch_review_comments, build_review_fix_prompt } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge } from "./review-utils.js";
 import {
   extract_first_linked_issue,
   extract_linked_issues,
   fetch_issue_context,
   close_linked_issues,
+  nwo_from_url,
 } from "./issue-utils.js";
 import { cleanup_after_merge } from "./worktree-cleanup.js";
 import * as sentry from "./sentry.js";
@@ -421,11 +422,35 @@ async function handle_review_completion(
   } else if (outcome === "approved") {
     // Check if reviewer already merged
     const is_merged = await check_pr_merged(repo_path, pr.number, gh_token);
-    await notify_alerts(
-      entity_id,
-      `PR #${String(pr.number)}: ${pr.title} — ${is_merged ? "approved and merged" : "approved"}`,
-      ctx,
-    );
+
+    if (!is_merged) {
+      // Attempt auto-merge with rebase fallback (#166)
+      const result = await attempt_auto_merge(
+        pr.number, pr.head.ref, repo_path, undefined, gh_token,
+      );
+
+      if (result.merged) {
+        // Post-merge cleanup: close linked issues and clean up worktrees
+        await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged`,
+          ctx,
+        );
+      } else {
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
+          ctx,
+        );
+      }
+    } else {
+      await notify_alerts(
+        entity_id,
+        `PR #${String(pr.number)}: ${pr.title} — approved and merged`,
+        ctx,
+      );
+    }
   } else {
     await notify_alerts(
       entity_id,
@@ -546,6 +571,11 @@ function build_reviewer_prompt(
     `After posting your review:`,
     `- If you approved, merge the PR:`,
     `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
+    `- If the merge command fails (branch behind main):`,
+    `  1. Try: git fetch origin && git checkout ${pr.head.ref} && git rebase origin/main`,
+    `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.head.ref}`,
+    `  3. Then retry: gh pr merge ${String(pr.number)} --squash --delete-branch`,
+    `  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers`,
     `- If you requested changes, do NOT merge.`,
   ];
 
@@ -623,6 +653,77 @@ async function handle_pr_merged(
     );
     sentry.captureException(err, {
       tags: { module: "webhook", action: "worktree_cleanup" },
+      contexts: { pr: { number: pr.number, branch: pr.head.ref } },
+    });
+  }
+}
+
+// ── Post auto-merge cleanup ──
+
+/**
+ * After a successful auto-merge, close linked issues and clean up worktrees.
+ * Derives the repo full name from the entity registry rather than the webhook
+ * payload, since this runs outside the `closed` event path.
+ * All operations are best-effort — failures are logged but never thrown.
+ */
+async function post_auto_merge_cleanup(
+  pr: WebhookPR,
+  entity_id: string,
+  repo_path: string,
+  ctx: WebhookContext,
+  installation_id?: string,
+): Promise<void> {
+  // Close linked issues
+  const issue_numbers = extract_linked_issues(pr.body, pr.title);
+  if (issue_numbers.length > 0) {
+    // Derive repo full name from entity registry
+    const entity_config = ctx.registry.get_active().find(
+      (e: { entity: { id: string } }) => e.entity.id === entity_id,
+    );
+    const repo = entity_config?.entity.repos.find(
+      (r: { path: string; url: string }) => {
+        const expanded = expand_home(r.path);
+        return expanded === repo_path;
+      },
+    );
+    const repo_full_name = repo ? nwo_from_url(repo.url) : undefined;
+
+    if (repo_full_name) {
+      try {
+        const gh_token = await resolve_token(ctx.github_app, installation_id);
+        const results = await close_linked_issues(
+          repo_full_name, pr.number, issue_numbers, gh_token,
+        );
+        for (const result of results) {
+          if (!result.success) {
+            sentry.captureException(new Error(result.error ?? "unknown"), {
+              tags: { module: "webhook", action: "auto_merge_close_issue" },
+              contexts: {
+                pr: { number: pr.number, title: pr.title },
+                issue: { number: result.issue_number },
+              },
+            });
+          }
+        }
+      } catch (err) {
+        console.error(`[webhook] Failed to close issues after auto-merge: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "webhook", action: "auto_merge_close_issues" },
+          contexts: { pr: { number: pr.number, title: pr.title } },
+        });
+      }
+    }
+  }
+
+  // Clean up worktrees
+  try {
+    await cleanup_after_merge(repo_path, pr.head.ref);
+  } catch (err) {
+    console.error(
+      `[webhook] Worktree cleanup failed after auto-merge for branch ${pr.head.ref}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "webhook", action: "auto_merge_worktree_cleanup" },
       contexts: { pr: { number: pr.number, branch: pr.head.ref } },
     });
   }
