@@ -126,7 +126,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 source "$ENV_FILE"
-exec "${node_path}" "${daemon_path}"
+exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
 `;
 }
 

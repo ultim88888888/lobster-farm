@@ -139,7 +139,7 @@ describe("generate_wrapper_sh", () => {
   it("includes correct node and daemon paths in exec", () => {
     const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js");
 
-    expect(result).toContain('exec "/opt/homebrew/bin/node" "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"');
+    expect(result).toContain('exec "/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"');
   });
 
   it("references env.sh in the standard location", () => {
