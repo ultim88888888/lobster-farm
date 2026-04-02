@@ -113,9 +113,14 @@ This is our standard deploy flow for containerized services:
 
 **Image tagging:** Always tag with both `latest` and the short SHA:
 ```yaml
+- name: Get short SHA
+  id: vars
+  run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+# Then in the docker/build-push-action step:
 tags: |
-  ${{ registry }}/${{ repo }}:latest
-  ${{ registry }}/${{ repo }}:${{ github.sha | truncate 8 }}
+  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha }}
 ```
 
 **Build caching:** Use GitHub Actions cache to speed up Docker builds:
@@ -234,6 +239,22 @@ gh secret set AWS_REGION --repo owner/repo
 - **Never hardcode in workflow files.** Always reference via `${{ secrets.NAME }}`.
 - **Document required secrets** in the repo's `.env.example` or README so it's clear what needs to be configured.
 - **Rotate regularly.** When rotating, update both 1Password and `gh secret set`.
+
+### 1Password GitHub Actions Integration
+
+For repos where avoiding manual GitHub Secrets sync is worth the added complexity, the `1password/load-secrets-action` lets workflows pull secrets directly from 1Password at runtime. This eliminates the dual-update problem on rotation — update the secret in 1Password and CI picks it up automatically.
+
+```yaml
+- uses: 1password/load-secrets-action@v2
+  with:
+    export-env: true
+  env:
+    OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    AWS_ACCESS_KEY_ID: op://vault/item/access-key-id
+    AWS_SECRET_ACCESS_KEY: op://vault/item/secret-access-key
+```
+
+**Trade-off:** Requires a 1Password Service Account and a single `OP_SERVICE_ACCOUNT_TOKEN` GitHub secret. The benefit is that all other secrets are managed exclusively in 1Password — no more `gh secret set` on every rotation. Use this for repos with many secrets or frequent rotation; stick with plain GitHub Secrets for simpler setups.
 
 ---
 
