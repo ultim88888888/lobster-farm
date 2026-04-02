@@ -77,6 +77,8 @@ on:
 - Use `dorny/paths-filter` inside a single workflow instead of `on.paths`
 - Or set required checks to only the ones that always run
 
+> **Pin third-party actions to a commit SHA in production.** Version tags like `@v3` are mutable — the maintainer can push breaking changes to the tag at any time. Use `@<commit-sha>` with a version comment: `uses: dorny/paths-filter@de90cc6415e2769e4909a7b1e1eb6ecd11855ea2  # v3.0.2`
+
 ---
 
 ## Deploy Pipeline Standards
@@ -152,7 +154,7 @@ jobs:
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v3    # pin to commit SHA in production (@v3 is mutable)
         id: filter
         with:
           filters: |
@@ -182,8 +184,9 @@ gh api repos/{owner}/{repo}/branches/main/protection \
   --field "required_status_checks[contexts][]=Lint / Type-check / Build" \
   --field "required_status_checks[contexts][]=Lint / Type-check" \
   --field "enforce_admins=false" \
-  --field "required_pull_request_reviews=null" \
-  --field "restrictions=null"
+  --field "required_pull_request_reviews=null" \   # --field sends JSON null (disables review requirement)
+  --field "restrictions=null"                       # --field sends JSON null (no push restrictions)
+  # Note: --field "key=null" sends JSON null. Don't use --raw-field here — it would send the string "null" and break the API call.
 ```
 
 ### Rules
