@@ -106,13 +106,15 @@ ${env_section}`;
  * Generate the contents of the wrapper script that sources env.sh
  * and exec's the daemon.
  *
+ * If ~/.lobsterfarm/.env.op exists and `op` is on PATH, secrets are resolved
+ * via `op run --env-file` at startup — this injects GitHub App, Sentry, and
+ * any other 1Password-backed env vars into the daemon process.
+ *
  * @param node_path   Absolute path to the node binary.
  * @param daemon_path Absolute path to the daemon entry point (index.js).
  */
 export function generate_wrapper_sh(node_path: string, daemon_path: string): string {
   const home = homedir();
-  // echo is intentional here — the #!/bin/zsh shebang guarantees zsh's echo builtin,
-  // which handles escape sequences consistently. printf would also work but is unnecessary.
   return `#!/bin/zsh
 # LobsterFarm daemon wrapper — managed by \`lf start\`, do not edit.
 # Sources env.sh for PATH and secrets, then exec's the daemon.
@@ -121,12 +123,20 @@ ENV_FILE="${home}/.lobsterfarm/env.sh"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "[start-daemon] FATAL: $ENV_FILE not found." >&2
-  echo "[start-daemon] Run \`lf start\` to regenerate it." >&2
+  echo "[start-daemon] Run \\\`lf start\\\` to regenerate it." >&2
   exit 1
 fi
 
 source "$ENV_FILE"
-exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
+
+# Resolve 1Password secrets (.env.op) if available — injects GitHub App, Sentry, etc.
+ENV_OP="${home}/.lobsterfarm/.env.op"
+if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
+  exec op run --env-file "$ENV_OP" -- "${node_path}" --max-old-space-size=8192 "${daemon_path}"
+else
+  echo "[start-daemon] WARNING: .env.op or op CLI not found — secrets from 1Password will not be injected" >&2
+  exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
+fi
 `;
 }
 

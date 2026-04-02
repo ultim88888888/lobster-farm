@@ -9,6 +9,7 @@ import {
   pid_file_path,
   daemon_log_path,
   expand_home,
+  LAUNCHD_LABEL,
 } from "@lobster-farm/shared";
 import {
   generate_env_sh,
@@ -72,63 +73,86 @@ function resolve_node_path(): string {
   }
 }
 
+/**
+ * Generate all managed infrastructure files (wrapper, plist).
+ * Always overwrites — these are managed, not user-customized.
+ * Only skips env.sh if it already exists (user may have customized it).
+ */
+async function generate_infrastructure_files(): Promise<void> {
+  const home = homedir();
+  const lf_dir = join(home, ".lobsterfarm");
+  const daemon_path = resolve_daemon_path();
+  const node_path = resolve_node_path();
+  const log_path = daemon_log_path();
+  const working_dir = expand_home("~/.lobsterfarm");
+
+  // Ensure directories exist
+  await mkdir(dirname(log_path), { recursive: true });
+  await mkdir(join(lf_dir, "bin"), { recursive: true });
+
+  // --- Generate env.sh (skip if already exists — user may have customized) ---
+  const env_sh_path = join(lf_dir, "env.sh");
+  try {
+    await access(env_sh_path);
+    console.log("env.sh already exists, skipping. Delete and re-run to regenerate.");
+  } catch {
+    const env_content = generate_env_sh();
+    await writeFile(env_sh_path, env_content, { encoding: "utf-8", mode: 0o600 });
+    console.log(`Generated env.sh at ${env_sh_path}`);
+  }
+
+  // --- Generate wrapper script (always overwrite — managed infrastructure) ---
+  const wrapper_path = join(lf_dir, "bin", "start-daemon.sh");
+  const wrapper_content = generate_wrapper_sh(node_path, daemon_path);
+  await writeFile(wrapper_path, wrapper_content, { encoding: "utf-8", mode: 0o755 });
+  await chmod(wrapper_path, 0o755);
+  console.log(`Generated wrapper script at ${wrapper_path}`);
+
+  // --- Generate and write the plist ---
+  const plist_content = generate_plist(wrapper_path, log_path, working_dir);
+  const plist = plist_path();
+  await mkdir(dirname(plist), { recursive: true });
+  await writeFile(plist, plist_content, "utf-8");
+  console.log(`Generated plist at ${plist}`);
+}
+
 export const start_command = new Command("start")
   .description("Start the LobsterFarm daemon")
-  .action(async () => {
-    // Check if already running
+  .option("--upgrade", "Regenerate wrapper/plist and restart even if already running")
+  .action(async (opts: { upgrade?: boolean }) => {
     const pid = await read_pid_file(pid_file_path());
-    if (pid !== null && is_process_running(pid)) {
-      console.log(`LobsterFarm daemon is already running (PID ${pid}).`);
-      return;
-    }
-
+    const running = pid !== null && is_process_running(pid);
     const loaded = await is_service_loaded();
-    if (loaded) {
-      console.log("LobsterFarm service is already loaded in launchctl.");
+
+    if (running && !opts.upgrade) {
+      console.log(`LobsterFarm daemon is already running (PID ${pid}).`);
+      console.log("Use 'lf start --upgrade' to regenerate wrapper scripts and restart.");
       return;
     }
 
-    const home = homedir();
-    const lf_dir = join(home, ".lobsterfarm");
-    const daemon_path = resolve_daemon_path();
-    const node_path = resolve_node_path();
-    const log_path = daemon_log_path();
-    const working_dir = expand_home("~/.lobsterfarm");
-
-    // Ensure directories exist
-    await mkdir(dirname(log_path), { recursive: true });
-    await mkdir(join(lf_dir, "bin"), { recursive: true });
-
-    // --- Generate env.sh (skip if already exists — user may have customized) ---
-    const env_sh_path = join(lf_dir, "env.sh");
-    try {
-      await access(env_sh_path);
-      console.log("env.sh already exists, skipping. Delete and re-run to regenerate.");
-    } catch {
-      const env_content = generate_env_sh();
-      await writeFile(env_sh_path, env_content, { encoding: "utf-8", mode: 0o600 });
-      console.log(`Generated env.sh at ${env_sh_path}`);
+    if (loaded && !running && !opts.upgrade) {
+      // Service is loaded in launchd but the process isn't running —
+      // likely a crash loop. Regenerate and kickstart automatically.
+      console.log("Service is loaded but daemon is not running (crash loop?). Regenerating and restarting...");
+      opts.upgrade = true;
     }
 
-    // --- Generate wrapper script (always overwrite — managed infrastructure) ---
-    const wrapper_path = join(lf_dir, "bin", "start-daemon.sh");
-    const wrapper_content = generate_wrapper_sh(node_path, daemon_path);
-    await writeFile(wrapper_path, wrapper_content, { encoding: "utf-8", mode: 0o755 });
-    // Ensure executable even if umask stripped the bit
-    await chmod(wrapper_path, 0o755);
-    console.log(`Generated wrapper script at ${wrapper_path}`);
+    // Always regenerate managed infrastructure files
+    await generate_infrastructure_files();
 
-    // --- Generate and write the plist ---
-    const plist_content = generate_plist(wrapper_path, log_path, working_dir);
-    const plist = plist_path();
-    await mkdir(dirname(plist), { recursive: true });
-    await writeFile(plist, plist_content, "utf-8");
-    console.log(`Generated plist at ${plist}`);
+    if (loaded) {
+      // Service is already loaded — kickstart to pick up new wrapper
+      const uid = process.getuid?.() ?? 501;
+      execFileSync("launchctl", [
+        "kickstart", "-k",
+        `gui/${uid}/${LAUNCHD_LABEL}`,
+      ]);
+      console.log("LobsterFarm daemon restarted with updated wrapper.");
+    } else {
+      await load_service();
+      console.log("LobsterFarm daemon started.");
+    }
 
-    // Load the service
-    await load_service();
-
-    console.log("LobsterFarm daemon started.");
-    console.log(`  Logs: ${log_path}`);
+    console.log(`  Logs: ${daemon_log_path()}`);
     console.log(`  PID file: ${pid_file_path()}`);
   });

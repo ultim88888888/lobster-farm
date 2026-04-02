@@ -139,7 +139,17 @@ describe("generate_wrapper_sh", () => {
   it("includes correct node and daemon paths in exec", () => {
     const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js");
 
-    expect(result).toContain('exec "/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"');
+    // Both the op-run path and the fallback should include the correct node/daemon paths
+    expect(result).toContain('"/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"');
+  });
+
+  it("uses op run to inject secrets from .env.op when available", () => {
+    const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
+
+    expect(result).toContain("op run --env-file");
+    expect(result).toContain(".env.op");
+    // Should have a fallback when op or .env.op is not available
+    expect(result).toContain("WARNING");
   });
 
   it("references env.sh in the standard location", () => {

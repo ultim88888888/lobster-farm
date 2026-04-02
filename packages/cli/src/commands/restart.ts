@@ -1,8 +1,25 @@
 import { Command } from "commander";
+import { writeFile, chmod } from "node:fs/promises";
+import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
+import { generate_wrapper_sh } from "../lib/launchd.js";
 import { is_service_loaded } from "../lib/launchd.js";
 import { read_pid_file, is_process_running } from "../lib/process.js";
 import { LAUNCHD_LABEL, pid_file_path } from "@lobster-farm/shared";
+import { resolve_daemon_path } from "./start.js";
+
+/** Resolve the absolute path to the node binary. */
+function resolve_node_path(): string {
+  try {
+    return execFileSync("which", ["node"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "/opt/homebrew/bin/node";
+  }
+}
 
 export const restart_command = new Command("restart")
   .description("Hot-restart the daemon (preserves tmux sessions)")
@@ -12,6 +29,15 @@ export const restart_command = new Command("restart")
       console.log("Daemon is not running. Use 'lf start' instead.");
       return;
     }
+
+    // Regenerate the wrapper script before restarting so the new process
+    // picks up any changes (heap size, op run integration, daemon path).
+    const home = homedir();
+    const wrapper_path = join(home, ".lobsterfarm", "bin", "start-daemon.sh");
+    const wrapper_content = generate_wrapper_sh(resolve_node_path(), resolve_daemon_path());
+    await writeFile(wrapper_path, wrapper_content, { encoding: "utf-8", mode: 0o755 });
+    await chmod(wrapper_path, 0o755);
+    console.log("Regenerated wrapper script.");
 
     // launchctl kickstart -k sends SIGTERM to the running process and
     // immediately starts a fresh one.  Because the daemon's shutdown handler
