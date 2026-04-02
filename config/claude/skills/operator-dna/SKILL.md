@@ -153,8 +153,8 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3    # pin to commit SHA in production (@v3 is mutable)
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5           # v4.3.1
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590        # v3.0.3
         id: filter
         with:
           filters: |
@@ -184,9 +184,10 @@ gh api repos/{owner}/{repo}/branches/main/protection \
   --field "required_status_checks[contexts][]=Lint / Type-check / Build" \
   --field "required_status_checks[contexts][]=Lint / Type-check" \
   --field "enforce_admins=false" \
-  --field "required_pull_request_reviews=null" \   # --field sends JSON null (disables review requirement)
-  --field "restrictions=null"                       # --field sends JSON null (no push restrictions)
-  # Note: --field "key=null" sends JSON null. Don't use --raw-field here — it would send the string "null" and break the API call.
+  --field "required_pull_request_reviews=null" \
+  --field "restrictions=null"
+# Note: --field sends JSON null for "null" values (not the string "null").
+# Don't use --raw-field here — it would send the string "null" and break the API call.
 ```
 
 ### Rules
@@ -248,7 +249,7 @@ gh secret set AWS_REGION --repo owner/repo
 For repos where avoiding manual GitHub Secrets sync is worth the added complexity, the `1password/load-secrets-action` lets workflows pull secrets directly from 1Password at runtime. This eliminates the dual-update problem on rotation — update the secret in 1Password and CI picks it up automatically.
 
 ```yaml
-- uses: 1password/load-secrets-action@v2
+- uses: 1password/load-secrets-action@581a835fb51b8e7ec56b71cf2ffddd7e68bb25e0  # v2.0.0
   with:
     export-env: true
   env:
