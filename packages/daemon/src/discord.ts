@@ -879,12 +879,23 @@ export class DiscordBot extends EventEmitter {
 
   // ── Webhook management ──
 
-  private webhook_cache = new Map<string, Webhook>();
+  private webhook_cache = new Map<string, { webhook: Webhook; cached_at: number }>();
+
+  private static WEBHOOK_TTL_MS = 60 * 60 * 1000;
+
+  invalidate_webhook(channel_id: string): void {
+    this.webhook_cache.delete(channel_id);
+  }
 
   private async get_or_create_webhook(channel_id: string): Promise<Webhook | null> {
-    // Check cache
+    // Check cache with TTL
     const cached = this.webhook_cache.get(channel_id);
-    if (cached) return cached;
+    if (cached && Date.now() - cached.cached_at < DiscordBot.WEBHOOK_TTL_MS) {
+      return cached.webhook;
+    }
+    if (cached) {
+      this.webhook_cache.delete(channel_id);
+    }
 
     try {
       const channel = await this.client.channels.fetch(channel_id);
@@ -905,7 +916,7 @@ export class DiscordBot extends EventEmitter {
         console.log(`[discord] Created webhook for channel ${channel_id}`);
       }
 
-      this.webhook_cache.set(channel_id, webhook);
+      this.webhook_cache.set(channel_id, { webhook, cached_at: Date.now() });
       return webhook;
     } catch (err) {
       console.log(`[discord] Failed to get/create webhook for ${channel_id}: ${String(err)}`);

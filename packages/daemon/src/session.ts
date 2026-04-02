@@ -279,12 +279,17 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
 
     this.emit("session:started", session);
 
-    // Capture stdout (stream-json)
+    // Capture stdout (stream-json), capped at 1000 lines per session
     proc.stdout?.on("data", (chunk: Buffer) => {
       const lines = chunk.toString("utf-8").split("\n").filter(Boolean);
       const buffer = this.output_buffers.get(session_id);
       for (const line of lines) {
-        buffer?.push(line);
+        if (buffer) {
+          buffer.push(line);
+          if (buffer.length > 1000) {
+            buffer.splice(0, buffer.length - 1000);
+          }
+        }
         this.emit("session:output", session_id, line);
       }
     });

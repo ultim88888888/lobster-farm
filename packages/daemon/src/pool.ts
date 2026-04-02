@@ -147,6 +147,7 @@ export class BotPool extends EventEmitter {
   /** Maps "{entity_id}:{channel_id}" → session_id. Preserves session context
    * across evictions so a channel can resume its old session when reassigned. */
   private session_history = new Map<string, string>();
+  private session_history_ts = new Map<string, number>();
   /** Entity registry reference — set during initialize(), used by start_tmux()
    * to look up per-entity config (e.g., github_token_ref). */
   private registry: EntityRegistry | null = null;
@@ -278,8 +279,10 @@ export class BotPool extends EventEmitter {
     this.resume_candidates = [];
 
     // Restore session history from persisted state
+    const now = Date.now();
     for (const [key, session_id] of Object.entries(saved_state.session_history)) {
       this.session_history.set(key, session_id);
+      this.session_history_ts.set(key, now);
     }
     if (this.session_history.size > 0) {
       console.log(`[pool] Restored ${String(this.session_history.size)} session history entries`);
@@ -697,6 +700,7 @@ export class BotPool extends EventEmitter {
       if (bot.channel_id && bot.entity_id && bot.session_id && bot.channel_id !== channel_id) {
         const evict_key = `${bot.entity_id}:${bot.channel_id}`;
         this.session_history.set(evict_key, bot.session_id);
+        this.session_history_ts.set(evict_key, Date.now());
         console.log(
           `[pool] Stashed session history for ${evict_key}: ${bot.session_id.slice(0, 8)}`,
         );
@@ -749,6 +753,7 @@ export class BotPool extends EventEmitter {
       const assign_key = `${entity_id}:${channel_id}`;
       if (this.session_history.has(assign_key)) {
         this.session_history.delete(assign_key);
+        this.session_history_ts.delete(assign_key);
         console.log(`[pool] Consumed session history for ${assign_key}`);
       }
 
@@ -850,6 +855,7 @@ export class BotPool extends EventEmitter {
   clear_session_history(entity_id: string, channel_id: string): void {
     const key = `${entity_id}:${channel_id}`;
     if (this.session_history.delete(key)) {
+      this.session_history_ts.delete(key);
       console.log(`[pool] Cleared session history for ${key}`);
     }
   }
@@ -909,6 +915,7 @@ export class BotPool extends EventEmitter {
     if (bot.session_id && bot.entity_id) {
       const key = `${bot.entity_id}:${bot.channel_id}`;
       this.session_history.set(key, bot.session_id);
+      this.session_history_ts.set(key, Date.now());
       console.log(
         `[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`,
       );
@@ -1063,6 +1070,7 @@ export class BotPool extends EventEmitter {
     try {
       // Clean up old crash history entries (>1 hour) to prevent memory growth
       this.cleanup_crash_history();
+      this.cleanup_session_history();
 
       for (const bot of this.bots) {
         if (bot.state !== "assigned") continue;
@@ -1137,6 +1145,7 @@ export class BotPool extends EventEmitter {
       if (session_id && channel_id && entity_id) {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, session_id);
+        this.session_history_ts.set(key, Date.now());
         console.log(
           `[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`,
         );
@@ -1204,6 +1213,7 @@ export class BotPool extends EventEmitter {
       if (session_id && channel_id && entity_id) {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, session_id);
+        this.session_history_ts.set(key, Date.now());
         console.log(
           `[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`,
         );
@@ -1278,6 +1288,7 @@ export class BotPool extends EventEmitter {
     if (bot.session_id && channel_id && entity_id) {
       const key = `${entity_id}:${channel_id}`;
       this.session_history.set(key, bot.session_id);
+      this.session_history_ts.set(key, Date.now());
     }
 
     // Release the bot — this kills tmux, frees the bot, clears access.json
@@ -1327,9 +1338,10 @@ export class BotPool extends EventEmitter {
     }
   }
 
-  /** Record a crash event for a bot. */
+  /** Record a crash event for a bot. Prunes entries older than 1 hour to stay bounded. */
   private record_crash(bot_id: number): void {
-    const timestamps = this.crash_history.get(bot_id) ?? [];
+    const one_hour_ago = Date.now() - 60 * 60 * 1000;
+    const timestamps = (this.crash_history.get(bot_id) ?? []).filter(t => t > one_hour_ago);
     timestamps.push(Date.now());
     this.crash_history.set(bot_id, timestamps);
   }
@@ -1352,6 +1364,17 @@ export class BotPool extends EventEmitter {
         this.crash_history.delete(bot_id);
       } else {
         this.crash_history.set(bot_id, recent);
+      }
+    }
+  }
+
+  /** Remove session history entries older than 1 hour to prevent memory growth. */
+  private cleanup_session_history(): void {
+    const one_hour_ago = Date.now() - 60 * 60 * 1000;
+    for (const [key, ts] of this.session_history_ts) {
+      if (ts < one_hour_ago) {
+        this.session_history.delete(key);
+        this.session_history_ts.delete(key);
       }
     }
   }

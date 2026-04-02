@@ -74,6 +74,7 @@ interface ActiveWebhookReview {
   pr_number: number;
   /** Set to true if a new event arrived while this review was in-flight. */
   needs_requeue: boolean;
+  created_at: number;
 }
 
 // ── Helpers ──
@@ -148,6 +149,18 @@ function review_key(entity_id: string, pr_number: number): string {
   return `${entity_id}:${String(pr_number)}`;
 }
 
+const REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
+
+function cleanup_stale_reviews(): void {
+  const now = Date.now();
+  for (const [key, review] of active_reviews) {
+    if (now - review.created_at > REVIEW_TIMEOUT_MS) {
+      console.log(`[webhook] Cleaning up stale review entry: ${key}`);
+      active_reviews.delete(key);
+    }
+  }
+}
+
 // ── Main handler ──
 
 /**
@@ -210,6 +223,8 @@ async function route_event(
   payload: WebhookPayload,
   ctx: WebhookContext,
 ): Promise<void> {
+  cleanup_stale_reviews();
+
   // Handle workflow_run events — deploy failure notifications (#189)
   if (event_type === "workflow_run") {
     await handle_workflow_run(payload, ctx);
@@ -301,6 +316,7 @@ async function spawn_review(
     entity_id,
     pr_number: pr.number,
     needs_requeue: false,
+    created_at: Date.now(),
   });
 
   // Get installation token for the reviewer subprocess
@@ -355,15 +371,17 @@ async function spawn_review(
       ctx.session_manager.removeListener("session:completed", on_complete);
       ctx.session_manager.removeListener("session:failed", on_fail);
 
-      void handle_review_completion(entity_id, repo_path, pr, ctx, installation_id).catch(
-        (err) => {
+      void handle_review_completion(entity_id, repo_path, pr, ctx, installation_id)
+        .catch((err) => {
           console.error(`[webhook] Post-review error: ${String(err)}`);
           sentry.captureException(err, {
             tags: { module: "webhook", entity: entity_id },
             contexts: { pr: { number: pr.number, title: pr.title } },
           });
-        },
-      );
+        })
+        .finally(() => {
+          cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx, installation_id);
+        });
     };
 
     const on_fail = (session_id: string, error: string) => {
@@ -404,8 +422,6 @@ async function handle_review_completion(
   ctx: WebhookContext,
   installation_id?: string,
 ): Promise<void> {
-  const key = review_key(entity_id, pr.number);
-
   // Resolve a token so detect_review_outcome and check_pr_merged can
   // authenticate against the correct GitHub account (cross-account repos).
   let gh_token: string | undefined;
@@ -491,8 +507,6 @@ async function handle_review_completion(
     );
   }
 
-  // Check if we need to re-review (new commits arrived during review)
-  cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx, installation_id);
 }
 
 /**

@@ -200,8 +200,6 @@ export class PRReviewCron {
       return;
     }
 
-    if (prs.length === 0) return;
-
     // Clean stale entries: remove processed PRs that are no longer open
     const open_keys = new Set(prs.map(pr => `${entity_id}:${String(pr.number)}`));
     let stale_cleaned = false;
@@ -214,6 +212,8 @@ export class PRReviewCron {
     if (stale_cleaned) {
       await save_pr_reviews(this.processed, this.config);
     }
+
+    if (prs.length === 0) return;
 
     for (const pr of prs) {
       const key = `${entity_id}:${String(pr.number)}`;
