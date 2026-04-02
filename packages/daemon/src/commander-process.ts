@@ -128,7 +128,7 @@ export class CommanderProcess extends EventEmitter {
       "new-session", "-d",
       "-s", TMUX_SESSION,
       "-x", "200", "-y", "50",
-      `DISCORD_STATE_DIR=${sq(this.state_dir())} GIT_AUTHOR_NAME=${sq("Pat")} GIT_AUTHOR_EMAIL=${sq("pat@lobsterfarm.dev")} GIT_COMMITTER_NAME=${sq("Pat")} GIT_COMMITTER_EMAIL=${sq("pat@lobsterfarm.dev")} ${claude_cmd}`,
+      `DISCORD_STATE_DIR=${sq(this.state_dir())} GIT_AUTHOR_NAME=${sq("Pat")} GIT_COMMITTER_NAME=${sq("Pat")} ${claude_cmd}`,
     ], {
       cwd: working_dir,
       stdio: "ignore",
@@ -136,9 +136,7 @@ export class CommanderProcess extends EventEmitter {
         ...process.env,
         DISCORD_STATE_DIR: this.state_dir(),
         GIT_AUTHOR_NAME: "Pat",
-        GIT_AUTHOR_EMAIL: "pat@lobsterfarm.dev",
         GIT_COMMITTER_NAME: "Pat",
-        GIT_COMMITTER_EMAIL: "pat@lobsterfarm.dev",
       },
     });
 

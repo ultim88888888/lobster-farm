@@ -1562,7 +1562,7 @@ export class BotPool extends EventEmitter {
     // naturally via CLAUDE.md, skills, and entity memory in the working directory.
 
     const display_name = resolve_agent_display_name(archetype, this.config);
-    const git_env = `GIT_AUTHOR_NAME=${sq(display_name)} GIT_AUTHOR_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)} GIT_COMMITTER_NAME=${sq(display_name)} GIT_COMMITTER_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)}`;
+    const git_env = `GIT_AUTHOR_NAME=${sq(display_name)} GIT_COMMITTER_NAME=${sq(display_name)}`;
 
     // Build extra env var prefix for the tmux command string (e.g., GH_TOKEN=...)
     const extra_env_str = Object.entries(extra_env)
@@ -1586,9 +1586,7 @@ export class BotPool extends EventEmitter {
           ...extra_env,
           DISCORD_STATE_DIR: bot.state_dir,
           GIT_AUTHOR_NAME: display_name,
-          GIT_AUTHOR_EMAIL: `${agent_name}@lobsterfarm.dev`,
           GIT_COMMITTER_NAME: display_name,
-          GIT_COMMITTER_EMAIL: `${agent_name}@lobsterfarm.dev`,
         },
       });
 
