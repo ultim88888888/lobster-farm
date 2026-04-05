@@ -9,7 +9,7 @@ import type { CommanderProcess } from "./commander-process.js";
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
-import type { ArchetypeRole } from "@lobster-farm/shared";
+import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
 import type { GitHubAppAuth } from "./github-app.js";
 import { handle_github_webhook, type WebhookContext } from "./webhook-handler.js";
@@ -277,7 +277,7 @@ const handle_submit_task: RouteHandler = async (req, res, ctx) => {
   if (!submission.worktree_path) {
     const entity = ctx.registry.get(submission.entity_id);
     if (entity) {
-      submission.worktree_path = entity.entity.repos[0]?.path;
+      submission.worktree_path = expand_home(entity.entity.repos[0]?.path ?? "");
     } else {
       json_response(res, 404, {
         error: `Entity "${submission.entity_id}" not found`,

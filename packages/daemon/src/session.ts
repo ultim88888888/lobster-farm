@@ -9,6 +9,7 @@ import type {
 import * as sentry from "./sentry.js";
 import { readdir } from "node:fs/promises";
 import {
+  expand_home,
   entity_memory_path,
   entity_daily_dir,
   entity_context_dir,
@@ -250,7 +251,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
 
     // Spawn the process — prompt is piped via stdin
     const proc = spawn(command, args, {
-      cwd: options.worktree_path,
+      cwd: expand_home(options.worktree_path),
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...options.env },
     });
