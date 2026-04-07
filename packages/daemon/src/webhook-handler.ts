@@ -479,11 +479,14 @@ async function handle_review_completion(
       `PR #${String(pr.number)}: ${pr.title} — changes requested, spawning builder to fix`,
       ctx,
     );
-    // Informational: let the watching bot know review feedback arrived
+    // Informational: let the watching bot know review feedback arrived.
+    // Not terminal — the fix loop will push new commits, triggering re-review.
+    // The watch stays alive so the bot gets the final merged/closed event.
     await notify_pr_watcher(
       repo_full_name, pr.number,
       `PR #${String(pr.number)} ("${pr.title}") received review feedback: changes requested. The fix loop is handling it.`,
       ctx,
+      false,
     );
   } else if (outcome === "approved") {
     // Check if reviewer already merged
@@ -1012,13 +1015,18 @@ async function notify_alerts(
 
 /**
  * Check if any bot is watching this PR and, if so, inject the event message
- * into that bot's tmux session. Removes the watch after delivery (or attempt).
+ * into that bot's tmux session.
+ *
+ * When `terminal` is true (default), the watch is removed after delivery.
+ * Non-terminal events (e.g. changes_requested) keep the watch alive so the
+ * bot still receives the final merged/closed notification.
  */
 async function notify_pr_watcher(
   repo_full_name: string,
   pr_number: number,
   message: string,
   ctx: WebhookContext,
+  terminal = true,
 ): Promise<void> {
   if (!ctx.pr_watches || !ctx.pool) return;
 
@@ -1030,7 +1038,7 @@ async function notify_pr_watcher(
     await ctx.pool.inject_message_to_bot(assignment.tmux_session, message);
     console.log(
       `[webhook] Notified watcher for ${repo_full_name}#${String(pr_number)} ` +
-      `via ${assignment.tmux_session}`,
+      `via ${assignment.tmux_session} (terminal=${String(terminal)})`,
     );
   } else {
     console.log(
@@ -1039,8 +1047,11 @@ async function notify_pr_watcher(
     );
   }
 
-  // Always remove the watch after the event fires
-  await ctx.pr_watches.remove(repo_full_name, pr_number);
+  // Only remove the watch on terminal events (merged, closed).
+  // Non-terminal events (changes_requested) keep it alive for the eventual outcome.
+  if (terminal || !assignment) {
+    await ctx.pr_watches.remove(repo_full_name, pr_number);
+  }
 }
 
 async function check_pr_merged(

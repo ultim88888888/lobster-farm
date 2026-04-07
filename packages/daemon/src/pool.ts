@@ -156,8 +156,8 @@ export class BotPool extends EventEmitter {
    * pruned on each health check to prevent unbounded growth. */
   private crash_history = new Map<number, number[]>();
   /** Queued messages for bots that weren't at the prompt when inject was attempted.
-   * tmux_session → message. Drained by the health check cycle (every 30s). */
-  private pending_injections = new Map<string, string>();
+   * tmux_session → messages[]. Drained by the health check cycle (every 30s). */
+  private pending_injections = new Map<string, string[]>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -1753,8 +1753,10 @@ export class BotPool extends EventEmitter {
     }
 
     // Bot is busy — queue for retry on next health check
-    this.pending_injections.set(tmux_session, message);
-    console.log(`[pool] Bot ${tmux_session} busy — queued message for retry`);
+    const queued = this.pending_injections.get(tmux_session) ?? [];
+    queued.push(message);
+    this.pending_injections.set(tmux_session, queued);
+    console.log(`[pool] Bot ${tmux_session} busy — queued message for retry (${String(queued.length)} pending)`);
     return false;
   }
 
@@ -1783,19 +1785,21 @@ export class BotPool extends EventEmitter {
 
   /** Drain queued messages for bots that are now at the prompt. Called from health check. */
   private drain_pending_injections(): void {
-    for (const [session, message] of this.pending_injections) {
+    for (const [session, messages] of this.pending_injections) {
       if (!this.is_tmux_alive(session)) {
         this.pending_injections.delete(session);
-        console.log(`[pool] Dropped queued message for dead session ${session}`);
+        console.log(`[pool] Dropped ${String(messages.length)} queued message(s) for dead session ${session}`);
         continue;
       }
       if (this.is_at_prompt(session)) {
         try {
-          this.send_via_tmux(session, message);
+          for (const message of messages) {
+            this.send_via_tmux(session, message);
+          }
           this.pending_injections.delete(session);
-          console.log(`[pool] Delivered queued message to ${session}`);
+          console.log(`[pool] Delivered ${String(messages.length)} queued message(s) to ${session}`);
         } catch (err) {
-          console.warn(`[pool] Failed to deliver queued message to ${session}: ${String(err)}`);
+          console.warn(`[pool] Failed to deliver queued messages to ${session}: ${String(err)}`);
         }
       }
       // Still busy — keep queued, will retry next cycle
