@@ -62,6 +62,17 @@ export const EntityConfigSchema = z.object({
         sentry: z
           .object({
             project: z.string().optional(),
+            // Array of Sentry projects mapped to this entity.
+            // Used by the triage module to route webhooks and build prompts.
+            projects: z
+              .array(
+                z.object({
+                  slug: z.string(),
+                  type: z.string().optional(), // e.g. "frontend" | "backend"
+                  repo: z.string().optional(), // which entity repo this maps to
+                }),
+              )
+              .optional(),
           })
           .optional(),
       })
