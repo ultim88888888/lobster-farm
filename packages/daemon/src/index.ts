@@ -189,9 +189,11 @@ async function main(): Promise<void> {
   // Must happen after Discord connects so we can send "back online" notifications.
   // Listen for bot:resumed events and notify each channel via the daemon bot.
   pool.on("bot:resumed", ({ channel_id }: { channel_id: string }) => {
-    if (discord_connected) {
-      void discord.send(channel_id, "Session restored after daemon restart.");
-    }
+    // Disabled: too noisy — every daemon restart floods all channels.
+    // if (discord_connected) {
+    //   void discord.send(channel_id, "Session restored after daemon restart.");
+    // }
+    void channel_id; // suppress unused warning
   });
 
   if (discord_connected) {
