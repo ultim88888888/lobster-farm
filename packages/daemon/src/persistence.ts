@@ -8,6 +8,7 @@ const STATE_DIR = "state";
 const PR_REVIEWS_FILE = "pr-reviews.json";
 const POOL_STATE_FILE = "pool-state.json";
 const PR_WATCHES_FILE = "pr-watches.json";
+const DEPLOY_TRIAGE_FILE = "deploy-triage.json";
 
 function state_dir(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), STATE_DIR);
@@ -23,6 +24,10 @@ function pool_state_path(config: LobsterFarmConfig): string {
 
 function pr_watches_path(config: LobsterFarmConfig): string {
   return join(state_dir(config), PR_WATCHES_FILE);
+}
+
+function deploy_triage_path(config: LobsterFarmConfig): string {
+  return join(state_dir(config), DEPLOY_TRIAGE_FILE);
 }
 
 // ── PR Review State ──
@@ -303,6 +308,50 @@ export async function load_pr_watches(config: LobsterFarmConfig): Promise<PRWatc
     const data: unknown = JSON.parse(content);
     if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
     return data as PRWatchState;
+  } catch {
+    return {};
+  }
+}
+
+// ── Deploy Triage State (#199) ──
+
+export interface DeployTriageEntry {
+  entity_id: string;
+  workflow_run_id: number;
+  workflow_name: string;
+  workflow_url: string;
+  head_sha: string;              // commit that triggered the deploy
+  first_seen_at: string;         // ISO timestamp
+  fix_attempts: number;          // incremented on each Gary spawn
+  last_attempt_at: string;       // ISO timestamp
+  resolved: boolean;
+}
+
+/** Keyed by "entity_id:workflow_run_id" */
+export type DeployTriageState = Record<string, DeployTriageEntry>;
+
+/** Save deploy triage state to disk. Uses atomic write-to-temp-then-rename. */
+export async function save_deploy_triage(
+  state: DeployTriageState,
+  config: LobsterFarmConfig,
+): Promise<void> {
+  const path = deploy_triage_path(config);
+  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
+  await rename(tmp_path, path);
+}
+
+/** Load deploy triage state from disk. Returns empty object if file doesn't exist. */
+export async function load_deploy_triage(
+  config: LobsterFarmConfig,
+): Promise<DeployTriageState> {
+  const path = deploy_triage_path(config);
+  try {
+    const content = await readFile(path, "utf-8");
+    const data: unknown = JSON.parse(content);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+    return data as DeployTriageState;
   } catch {
     return {};
   }
