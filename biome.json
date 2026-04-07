@@ -29,6 +29,18 @@
       }
     }
   },
+  "overrides": [
+    {
+      "include": ["**/__tests__/**", "**/*.test.ts", "**/*.spec.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    }
+  ],
   "files": {
     "ignore": ["dist/", "node_modules/", ".claude/", "worktrees/", "coverage/"]
   }
