@@ -11,6 +11,7 @@ import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
+import { PRWatchStore } from "./pr-watches.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { append_session_log } from "./persistence.js";
@@ -225,8 +226,12 @@ async function main(): Promise<void> {
     console.log("[github-app] Not configured — webhook endpoint will accept but not process events");
   }
 
+  // Initialize PR watch store (persisted across restarts)
+  const pr_watches = new PRWatchStore(config);
+  await pr_watches.initialize();
+
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, commander, discord_connected ? discord : null, pool, github_app);
+  const server = start_server(registry, config, session_manager, queue, commander, discord_connected ? discord : null, pool, github_app, pr_watches);
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
   const pr_cron = new PRReviewCron(
@@ -235,6 +240,7 @@ async function main(): Promise<void> {
     config,
     discord_connected ? discord : null,
     github_app,
+    pr_watches,
   );
   const pr_cron_enabled = config.pr_cron?.enabled !== false; // default true for backward compat
   if (pr_cron_enabled) {

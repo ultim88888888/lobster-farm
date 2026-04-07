@@ -30,6 +30,8 @@ import {
   nwo_from_url,
 } from "./issue-utils.js";
 import { cleanup_after_merge } from "./worktree-cleanup.js";
+import type { BotPool } from "./pool.js";
+import type { PRWatchStore } from "./pr-watches.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -42,6 +44,8 @@ export interface WebhookContext {
   registry: EntityRegistry;
   discord: DiscordBot | null;
   config: LobsterFarmConfig;
+  pool: BotPool | null;
+  pr_watches: PRWatchStore | null;
 }
 
 /** Minimal PR shape from webhook payload. */
@@ -261,13 +265,32 @@ async function route_event(
     return;
   }
 
-  // Handle merged PRs — close linked issues
+  // Handle merged PRs — close linked issues and notify watching bots
   if (action === "closed" && pr.merged === true) {
     console.log(
       `[webhook] pull_request.closed (merged) for #${String(pr.number)} ` +
       `in ${match.entity_id} (${repo_full_name})`,
     );
     await handle_pr_merged(pr, repo_full_name, match.repo_path, ctx, installation_id);
+    await notify_pr_watcher(
+      repo_full_name, pr.number,
+      `PR #${String(pr.number)} ("${pr.title}") has been merged to main. Continue your work.`,
+      ctx,
+    );
+    return;
+  }
+
+  // Handle closed-without-merge — notify watching bots
+  if (action === "closed" && pr.merged !== true) {
+    console.log(
+      `[webhook] pull_request.closed (not merged) for #${String(pr.number)} ` +
+      `in ${match.entity_id} (${repo_full_name})`,
+    );
+    await notify_pr_watcher(
+      repo_full_name, pr.number,
+      `PR #${String(pr.number)} ("${pr.title}") was closed without merging.`,
+      ctx,
+    );
     return;
   }
 
@@ -300,7 +323,7 @@ async function route_event(
     return;
   }
 
-  await spawn_review(match.entity_id, match.repo_path, pr, ctx, installation_id);
+  await spawn_review(match.entity_id, match.repo_path, repo_full_name, pr, ctx, installation_id);
 }
 
 // ── Reviewer spawning ──
@@ -308,6 +331,7 @@ async function route_event(
 async function spawn_review(
   entity_id: string,
   repo_path: string,
+  repo_full_name: string,
   pr: WebhookPR,
   ctx: WebhookContext,
   installation_id?: string,
@@ -374,7 +398,7 @@ async function spawn_review(
       ctx.session_manager.removeListener("session:completed", on_complete);
       ctx.session_manager.removeListener("session:failed", on_fail);
 
-      void handle_review_completion(entity_id, repo_path, pr, ctx, installation_id)
+      void handle_review_completion(entity_id, repo_path, repo_full_name, pr, ctx, installation_id)
         .catch((err) => {
           console.error(`[webhook] Post-review error: ${String(err)}`);
           sentry.captureException(err, {
@@ -383,7 +407,7 @@ async function spawn_review(
           });
         })
         .finally(() => {
-          cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx, installation_id);
+          cleanup_and_maybe_requeue(key, entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
         });
     };
 
@@ -399,7 +423,7 @@ async function spawn_review(
         tags: { module: "webhook", entity: entity_id },
         contexts: { pr: { number: pr.number, title: pr.title } },
       });
-      cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx, installation_id);
+      cleanup_and_maybe_requeue(key, entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
     };
 
     ctx.session_manager.on("session:completed", on_complete);
@@ -421,6 +445,7 @@ async function spawn_review(
 async function handle_review_completion(
   entity_id: string,
   repo_path: string,
+  repo_full_name: string,
   pr: WebhookPR,
   ctx: WebhookContext,
   installation_id?: string,
@@ -454,6 +479,12 @@ async function handle_review_completion(
       `PR #${String(pr.number)}: ${pr.title} — changes requested, spawning builder to fix`,
       ctx,
     );
+    // Informational: let the watching bot know review feedback arrived
+    await notify_pr_watcher(
+      repo_full_name, pr.number,
+      `PR #${String(pr.number)} ("${pr.title}") received review feedback: changes requested. The fix loop is handling it.`,
+      ctx,
+    );
   } else if (outcome === "approved") {
     // Check if reviewer already merged
     const is_merged = await check_pr_merged(repo_path, pr.number, gh_token);
@@ -484,6 +515,12 @@ async function handle_review_completion(
             `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged`,
             ctx,
           );
+          // Auto-merged — notify watching bot
+          await notify_pr_watcher(
+            repo_full_name, pr.number,
+            `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
+            ctx,
+          );
         } else {
           await notify_alerts(
             entity_id,
@@ -496,6 +533,12 @@ async function handle_review_completion(
       await notify_alerts(
         entity_id,
         `PR #${String(pr.number)}: ${pr.title} — approved and merged`,
+        ctx,
+      );
+      // Reviewer already merged — notify watching bot
+      await notify_pr_watcher(
+        repo_full_name, pr.number,
+        `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
         ctx,
       );
     }
@@ -517,6 +560,7 @@ function cleanup_and_maybe_requeue(
   key: string,
   entity_id: string,
   repo_path: string,
+  repo_full_name: string,
   pr: WebhookPR,
   ctx: WebhookContext,
   installation_id?: string,
@@ -528,7 +572,7 @@ function cleanup_and_maybe_requeue(
     console.log(
       `[webhook] Re-reviewing PR #${String(pr.number)} — new commits arrived during previous review`,
     );
-    void spawn_review(entity_id, repo_path, pr, ctx, installation_id).catch((err) => {
+    void spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id).catch((err) => {
       console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`);
       sentry.captureException(err, {
         tags: { module: "webhook", entity: entity_id, action: "requeue" },
@@ -964,6 +1008,39 @@ async function notify_alerts(
       "reviewer" as ArchetypeRole,
     );
   }
+}
+
+/**
+ * Check if any bot is watching this PR and, if so, inject the event message
+ * into that bot's tmux session. Removes the watch after delivery (or attempt).
+ */
+async function notify_pr_watcher(
+  repo_full_name: string,
+  pr_number: number,
+  message: string,
+  ctx: WebhookContext,
+): Promise<void> {
+  if (!ctx.pr_watches || !ctx.pool) return;
+
+  const watch = ctx.pr_watches.get(repo_full_name, pr_number);
+  if (!watch) return;
+
+  const assignment = ctx.pool.get_assignment(watch.channel_id);
+  if (assignment) {
+    await ctx.pool.inject_message_to_bot(assignment.tmux_session, message);
+    console.log(
+      `[webhook] Notified watcher for ${repo_full_name}#${String(pr_number)} ` +
+      `via ${assignment.tmux_session}`,
+    );
+  } else {
+    console.log(
+      `[webhook] Watch exists for ${repo_full_name}#${String(pr_number)} ` +
+      `but no active assignment for channel ${watch.channel_id} — cleaning up`,
+    );
+  }
+
+  // Always remove the watch after the event fires
+  await ctx.pr_watches.remove(repo_full_name, pr_number);
 }
 
 async function check_pr_merged(

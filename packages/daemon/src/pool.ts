@@ -155,6 +155,9 @@ export class BotPool extends EventEmitter {
    * bot_id → array of crash timestamps (epoch ms). Old entries (>1 hour) are
    * pruned on each health check to prevent unbounded growth. */
   private crash_history = new Map<number, number[]>();
+  /** Queued messages for bots that weren't at the prompt when inject was attempted.
+   * tmux_session → message. Drained by the health check cycle (every 30s). */
+  private pending_injections = new Map<string, string>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -1072,6 +1075,9 @@ export class BotPool extends EventEmitter {
       this.cleanup_crash_history();
       this.cleanup_session_history();
 
+      // Deliver any queued messages to bots that are now at the prompt
+      this.drain_pending_injections();
+
       for (const bot of this.bots) {
         if (bot.state !== "assigned") continue;
         if (this.is_tmux_alive(bot.tmux_session)) continue;
@@ -1721,6 +1727,78 @@ export class BotPool extends EventEmitter {
       sentry.captureException(err, {
         tags: { module: "pool", bot_id: String(bot.id), action: "set_avatar" },
       });
+    }
+  }
+
+  /**
+   * Inject a message into a bot's Claude Code session via tmux send-keys.
+   *
+   * If the bot is at the prompt (❯ visible in tmux pane), the message is
+   * sent immediately. Otherwise, it's queued and the next health check cycle
+   * (~30s) will retry delivery.
+   *
+   * Used by the PR watch system to notify bots when their PRs reach
+   * a terminal state (merged, closed, review feedback).
+   */
+  async inject_message_to_bot(tmux_session: string, message: string): Promise<boolean> {
+    if (!this.is_tmux_alive(tmux_session)) {
+      console.log(`[pool] Cannot inject message — tmux session ${tmux_session} is not alive`);
+      return false;
+    }
+
+    if (this.is_at_prompt(tmux_session)) {
+      this.send_via_tmux(tmux_session, message);
+      console.log(`[pool] Injected message into ${tmux_session}`);
+      return true;
+    }
+
+    // Bot is busy — queue for retry on next health check
+    this.pending_injections.set(tmux_session, message);
+    console.log(`[pool] Bot ${tmux_session} busy — queued message for retry`);
+    return false;
+  }
+
+  /** Check if a bot's tmux pane shows the Claude prompt indicator (❯). */
+  private is_at_prompt(session_name: string): boolean {
+    try {
+      const output = execFileSync(
+        "tmux", ["capture-pane", "-t", session_name, "-p"],
+        { encoding: "utf-8", timeout: 2000 },
+      );
+      const lines = output.trim().split("\n");
+      const last_line = lines[lines.length - 1] ?? "";
+      return last_line.includes("❯");
+    } catch {
+      return false;
+    }
+  }
+
+  /** Send a message to a tmux session via send-keys. */
+  private send_via_tmux(session_name: string, message: string): void {
+    execFileSync("tmux", ["send-keys", "-t", session_name, message, "Enter"], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+  }
+
+  /** Drain queued messages for bots that are now at the prompt. Called from health check. */
+  private drain_pending_injections(): void {
+    for (const [session, message] of this.pending_injections) {
+      if (!this.is_tmux_alive(session)) {
+        this.pending_injections.delete(session);
+        console.log(`[pool] Dropped queued message for dead session ${session}`);
+        continue;
+      }
+      if (this.is_at_prompt(session)) {
+        try {
+          this.send_via_tmux(session, message);
+          this.pending_injections.delete(session);
+          console.log(`[pool] Delivered queued message to ${session}`);
+        } catch (err) {
+          console.warn(`[pool] Failed to deliver queued message to ${session}: ${String(err)}`);
+        }
+      }
+      // Still busy — keep queued, will retry next cycle
     }
   }
 

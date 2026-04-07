@@ -179,6 +179,8 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     registry: make_registry(),
     discord: null,
     config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
+    pool: null,
+    pr_watches: null,
     ...overrides,
   };
 }

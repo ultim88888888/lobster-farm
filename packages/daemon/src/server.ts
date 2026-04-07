@@ -13,6 +13,7 @@ import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
 import type { GitHubAppAuth } from "./github-app.js";
 import { handle_github_webhook, type WebhookContext } from "./webhook-handler.js";
+import type { PRWatchStore } from "./pr-watches.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import * as sentry from "./sentry.js";
 
@@ -25,6 +26,7 @@ interface ServerContext {
   discord: DiscordBot | null;
   pool: BotPool | null;
   github_app: GitHubAppAuth | null;
+  pr_watches: PRWatchStore | null;
 }
 
 type RouteHandler = (
@@ -131,6 +133,8 @@ const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
     registry: ctx.registry,
     discord: ctx.discord,
     config: ctx.config,
+    pool: ctx.pool,
+    pr_watches: ctx.pr_watches,
   };
 
   await handle_github_webhook(req, res, webhook_ctx);
@@ -454,6 +458,37 @@ const handle_pool_release: RouteHandler = async (req, res, ctx) => {
   json_response(res, 200, { ok: true });
 };
 
+// ── PR Watch routes ──
+
+const handle_pr_watch: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.pr_watches) {
+    json_response(res, 503, { error: "PR watch store not initialized" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { repo?: string; pr_number?: number; channel_id?: string };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!params.repo || !params.pr_number || !params.channel_id) {
+    json_response(res, 400, { error: "Missing required fields: repo, pr_number, channel_id" });
+    return;
+  }
+
+  if (typeof params.pr_number !== "number" || params.pr_number <= 0) {
+    json_response(res, 400, { error: "pr_number must be a positive integer" });
+    return;
+  }
+
+  await ctx.pr_watches.add(params.repo, params.pr_number, params.channel_id);
+  json_response(res, 201, { ok: true, watch_key: `${params.repo}#${String(params.pr_number)}` });
+};
+
 // ── Channel routes ──
 
 const PROTECTED_CHANNEL_TYPES = ["general", "alerts"];
@@ -538,6 +573,7 @@ const routes: Route[] = [
   { method: "GET", pattern: /^\/pool$/, handler: handle_pool_status },
   { method: "POST", pattern: /^\/pool\/assign$/, handler: handle_pool_assign },
   { method: "POST", pattern: /^\/pool\/release$/, handler: handle_pool_release },
+  { method: "POST", pattern: /^\/pr\/watch$/, handler: handle_pr_watch },
   { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
   { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
   { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
@@ -582,9 +618,10 @@ export function start_server(
   discord: DiscordBot | null = null,
   pool: BotPool | null = null,
   github_app: GitHubAppAuth | null = null,
+  pr_watches: PRWatchStore | null = null,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue, commander, discord, pool, github_app };
+  const ctx: ServerContext = { registry, config, session_manager, queue, commander, discord, pool, github_app, pr_watches };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);

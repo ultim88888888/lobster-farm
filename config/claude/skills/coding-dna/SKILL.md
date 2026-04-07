@@ -619,6 +619,18 @@ Before opening a PR, check the GitHub issue spec for the `## Verification` secti
 
 The PR gate is about product correctness, not code quality. Code quality is the AutoReviewer's job. The user gate catches "it compiles but does the wrong thing."
 
+### PR Watch Registration
+
+After opening a PR, register it with the daemon so you'll be notified when it merges:
+
+```bash
+curl -s -X POST http://localhost:7749/pr/watch \
+  -H 'Content-Type: application/json' \
+  -d '{"repo":"owner/repo","pr_number":N,"channel_id":"CHANNEL_ID"}'
+```
+
+The daemon will inject a message into your session when the PR reaches a terminal state (merged, closed, or review feedback). You don't need to poll — just continue with other work or wait.
+
 ---
 
 ## Frontend Standards

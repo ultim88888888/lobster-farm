@@ -7,6 +7,7 @@ import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 const STATE_DIR = "state";
 const PR_REVIEWS_FILE = "pr-reviews.json";
 const POOL_STATE_FILE = "pool-state.json";
+const PR_WATCHES_FILE = "pr-watches.json";
 
 function state_dir(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), STATE_DIR);
@@ -18,6 +19,10 @@ function pr_reviews_path(config: LobsterFarmConfig): string {
 
 function pool_state_path(config: LobsterFarmConfig): string {
   return join(state_dir(config), POOL_STATE_FILE);
+}
+
+function pr_watches_path(config: LobsterFarmConfig): string {
+  return join(state_dir(config), PR_WATCHES_FILE);
 }
 
 // ── PR Review State ──
@@ -258,4 +263,44 @@ export async function read_session_log(
   }
 
   return entries;
+}
+
+// ── PR Watches ──
+
+/** A single PR watch: a bot is interested in this PR's terminal state. */
+export interface PersistedPRWatch {
+  repo: string;        // "owner/repo"
+  pr_number: number;
+  channel_id: string;  // Discord channel that registered the watch
+  created_at: string;  // ISO timestamp
+}
+
+/** Keyed by "owner/repo#pr_number" */
+export type PRWatchState = Record<string, PersistedPRWatch>;
+
+/** Save PR watches to disk. Uses atomic write-to-temp-then-rename. */
+export async function save_pr_watches(
+  state: PRWatchState,
+  config: LobsterFarmConfig,
+): Promise<void> {
+  const path = pr_watches_path(config);
+  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
+  await rename(tmp_path, path);
+}
+
+/** Load PR watches from disk. Returns empty object if file doesn't exist. */
+export async function load_pr_watches(
+  config: LobsterFarmConfig,
+): Promise<PRWatchState> {
+  const path = pr_watches_path(config);
+  try {
+    const content = await readFile(path, "utf-8");
+    const data: unknown = JSON.parse(content);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+    return data as PRWatchState;
+  } catch {
+    return {};
+  }
 }

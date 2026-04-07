@@ -18,6 +18,7 @@ import {
   nwo_from_url,
 } from "./issue-utils.js";
 import { resolve_binary } from "./env.js";
+import type { PRWatchStore } from "./pr-watches.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -86,6 +87,7 @@ export class PRReviewCron {
     private config: LobsterFarmConfig,
     private discord: DiscordBot | null = null,
     private github_app: GitHubAppAuth | null = null,
+    private pr_watches: PRWatchStore | null = null,
   ) {}
 
   /** Start the polling cron. Loads persisted review state before first poll. */
@@ -146,6 +148,11 @@ export class PRReviewCron {
     });
 
     try {
+      // Expire stale PR watches (24h TTL)
+      if (this.pr_watches) {
+        await this.pr_watches.cleanup_expired();
+      }
+
       const entities = this.registry.get_active();
 
       for (const entity_config of entities) {
