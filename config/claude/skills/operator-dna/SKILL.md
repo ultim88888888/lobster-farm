@@ -34,7 +34,7 @@ Every repo with production code must have CI workflows. No exceptions.
 
 | Language | Checks | Tools |
 |----------|--------|-------|
-| TypeScript / JavaScript | Lint, Type-check, Build | ESLint, `tsc --noEmit`, `next build` or `vite build` |
+| TypeScript / JavaScript | Lint, Type-check, Build | Biome, `tsc --noEmit`, `next build` or `vite build` |
 | Python | Lint, Type-check | Ruff, mypy |
 
 ### Workflow Structure
