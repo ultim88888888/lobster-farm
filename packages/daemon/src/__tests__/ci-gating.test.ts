@@ -87,10 +87,12 @@ vi.mock("../issue-utils.js", () => ({
   nwo_from_url: vi.fn(() => "test-org/lobster-farm"),
 }));
 
-// Mock persistence — the CI fix loop uses load/save_pr_reviews (#196)
+// Mock persistence — CI fix loop uses pr_reviews, deploy triage uses deploy_triage (#196, #199)
 vi.mock("../persistence.js", () => ({
   load_pr_reviews: vi.fn(async () => ({})),
   save_pr_reviews: vi.fn(async () => {}),
+  load_deploy_triage: vi.fn(async () => ({})),
+  save_deploy_triage: vi.fn(async () => {}),
 }));
 
 import type { DiscordBot } from "../discord.js";
@@ -352,16 +354,29 @@ describe("webhook handler — workflow_run events", () => {
   });
 
   it("sends alert when workflow_run fails on main from a push event", async () => {
+    // Route commands needed by spawn_deploy_triage (log fetching)
+    route_exec({
+      "gh run list": () => ({
+        stdout: JSON.stringify([{ databaseId: 123, name: "Deploy Backend" }]),
+      }),
+      "gh run view": () => ({
+        stdout: "Error: deploy failed\n",
+      }),
+    });
+
     const payload = JSON.stringify({
       action: "completed",
       workflow_run: {
+        id: 123,
         name: "Deploy Backend",
         conclusion: "failure",
         event: "push",
         head_branch: "main",
+        head_sha: "abc123",
         html_url: "https://github.com/test-org/lobster-farm/actions/runs/123",
       },
       repository: { full_name: "test-org/lobster-farm" },
+      installation: { id: 12345 },
     });
 
     const ctx = make_context();
@@ -374,20 +389,21 @@ describe("webhook handler — workflow_run events", () => {
     await handle_github_webhook(req, res, ctx);
 
     // Wait for async route_event to process
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 150));
 
     expect(res._status).toBe(200);
     const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
+    // Updated in #199: alert now mentions Gary triaging instead of a raw failure message
     expect(discord.send_to_entity).toHaveBeenCalledWith(
       "test-entity",
       "alerts",
-      expect.stringContaining("Deploy Backend"),
+      expect.stringContaining("Deploy failed on main"),
       "reviewer",
     );
     expect(discord.send_to_entity).toHaveBeenCalledWith(
       "test-entity",
       "alerts",
-      expect.stringContaining("failed on main"),
+      expect.stringContaining("Gary triaging"),
       "reviewer",
     );
   });

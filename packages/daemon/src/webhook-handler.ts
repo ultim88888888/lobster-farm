@@ -25,14 +25,17 @@ import {
   fetch_issue_context,
   nwo_from_url,
 } from "./issue-utils.js";
-import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
+import { load_pr_reviews, save_pr_reviews, load_deploy_triage, save_deploy_triage } from "./persistence.js";
+import type { DeployTriageEntry } from "./persistence.js";
 import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import type { EntityRegistry } from "./registry.js";
 import {
   MAX_CI_FIX_ATTEMPTS,
+  MAX_DEPLOY_FIX_ATTEMPTS,
   attempt_auto_merge,
   build_ci_fix_prompt,
+  build_deploy_triage_prompt,
   build_review_fix_prompt,
   check_ci_status,
   fetch_ci_failure_logs,
@@ -68,10 +71,12 @@ interface WebhookPR {
 
 /** Minimal workflow_run shape from webhook payload. */
 interface WebhookWorkflowRun {
+  id: number;
   name: string;
   conclusion: string | null;
   event: string;
   head_branch: string;
+  head_sha: string;
   html_url: string;
 }
 
@@ -771,6 +776,155 @@ async function spawn_ci_fixer(
   }
 }
 
+// ── Deploy triage spawning (#199) ──
+
+/** Safety valve: max total deploy fix attempts across all runs for one entity in 24h. */
+const DEPLOY_SAFETY_VALVE = 4;
+
+/**
+ * Spawn a Gary (planner) session to triage a deploy failure on main.
+ *
+ * Modeled on spawn_ci_fixer() but routes through the planner archetype
+ * since deploy failures span a wider problem space (code, infra, config).
+ *
+ * Dedup: keyed by "entity_id:workflow_run_id". Same run ID won't spawn twice.
+ * Retry cap: MAX_DEPLOY_FIX_ATTEMPTS (2) per workflow run.
+ * Safety valve: 4+ total attempts for one entity in 24h pauses auto-triage.
+ * Token failure: does NOT consume a retry slot (same pattern as CI fix loop).
+ */
+async function spawn_deploy_triage(
+  entity_id: string,
+  repo_path: string,
+  workflow: WebhookWorkflowRun,
+  ctx: WebhookContext,
+  installation_id?: string,
+): Promise<void> {
+  const triage_key = `${entity_id}:${String(workflow.id)}`;
+  const state = await load_deploy_triage(ctx.config);
+
+  // Dedup + retry cap: if we already have an entry at or above the cap, stop.
+  const existing = state[triage_key];
+  if (existing && existing.fix_attempts >= MAX_DEPLOY_FIX_ATTEMPTS) {
+    console.log(
+      `[webhook] Deploy triage exhausted for ${triage_key} ` +
+      `(${String(existing.fix_attempts)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}) — skipping`,
+    );
+    await notify_alerts(
+      entity_id,
+      `Deploy fix loop exhausted for workflow "${workflow.name}" ` +
+      `(${String(MAX_DEPLOY_FIX_ATTEMPTS)} attempts). Manual intervention needed. ${workflow.html_url}`,
+      ctx,
+    );
+    return;
+  }
+
+  // Safety valve: count total deploy fix attempts for this entity in the last 24h.
+  const twenty_four_hours_ago = Date.now() - 24 * 60 * 60 * 1000;
+  let entity_attempts_24h = 0;
+  for (const entry of Object.values(state)) {
+    if (
+      entry.entity_id === entity_id &&
+      new Date(entry.last_attempt_at).getTime() > twenty_four_hours_ago
+    ) {
+      entity_attempts_24h += entry.fix_attempts;
+    }
+  }
+  if (entity_attempts_24h >= DEPLOY_SAFETY_VALVE) {
+    console.log(
+      `[webhook] Deploy safety valve triggered for ${entity_id} ` +
+      `(${String(entity_attempts_24h)} attempts in 24h) — skipping`,
+    );
+    await notify_alerts(
+      entity_id,
+      `Deploy auto-triage paused for ${entity_id}: ${String(entity_attempts_24h)} fix attempts ` +
+      `in 24h (safety valve = ${String(DEPLOY_SAFETY_VALVE)}). Manual intervention needed.`,
+      ctx,
+    );
+    return;
+  }
+
+  // Resolve token BEFORE incrementing attempt counter — transient token
+  // errors (cert issues, rate limits) shouldn't consume retry slots.
+  let gh_token: string;
+  try {
+    gh_token = await resolve_token(ctx.github_app, installation_id);
+  } catch (err) {
+    console.error(`[webhook] Failed to get token for deploy triage: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "deploy_triage_token" },
+      contexts: { workflow: { name: workflow.name, run_id: workflow.id } },
+    });
+    return;
+  }
+
+  // Increment attempt counter and save state
+  const now = new Date().toISOString();
+  const attempt = (existing?.fix_attempts ?? 0) + 1;
+  const entry: DeployTriageEntry = {
+    entity_id,
+    workflow_run_id: workflow.id,
+    workflow_name: workflow.name,
+    workflow_url: workflow.html_url,
+    head_sha: workflow.head_sha,
+    first_seen_at: existing?.first_seen_at ?? now,
+    fix_attempts: attempt,
+    last_attempt_at: now,
+    resolved: false,
+  };
+  state[triage_key] = entry;
+  await save_deploy_triage(state, ctx.config);
+
+  // Fetch failure logs from GitHub Actions
+  const failure_logs = await fetch_ci_failure_logs(
+    "main", repo_path, gh_token,
+  );
+
+  // Build prompt for Gary
+  const prompt = build_deploy_triage_prompt(
+    workflow.name,
+    workflow.html_url,
+    workflow.id,
+    repo_path,
+    failure_logs,
+    attempt,
+    MAX_DEPLOY_FIX_ATTEMPTS,
+  );
+
+  console.log(
+    `[webhook] Spawning Gary for deploy triage in ${entity_id} ` +
+    `(run ${String(workflow.id)}, attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)})`,
+  );
+
+  await notify_alerts(
+    entity_id,
+    `\u26a0\ufe0f Deploy failed on main — Gary triaging ` +
+    `(attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}). ${workflow.html_url}`,
+    ctx,
+  );
+
+  try {
+    await ctx.session_manager.spawn({
+      entity_id,
+      feature_id: `deploy-triage-${String(workflow.id)}`,
+      archetype: "planner" as ArchetypeRole,
+      dna: ["planning-dna"],
+      model: { model: "opus", think: "high" },
+      worktree_path: repo_path,
+      prompt,
+      interactive: false,
+      env: { GH_TOKEN: gh_token },
+    });
+  } catch (err) {
+    console.error(
+      `[webhook] Failed to spawn deploy triage for run ${String(workflow.id)}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "spawn_deploy_triage" },
+      contexts: { workflow: { name: workflow.name, run_id: workflow.id } },
+    });
+  }
+}
+
 // ── Prompt building ──
 
 function build_reviewer_prompt(pr: WebhookPR, repo_path: string, issue_context: string): string {
@@ -1000,14 +1154,16 @@ async function handle_workflow_run(payload: WebhookPayload, ctx: WebhookContext)
     return;
   }
 
+  const installation_id = payload.installation?.id != null
+    ? String(payload.installation.id)
+    : undefined;
+
   console.log(
     `[webhook] Workflow "${workflow.name}" failed on main in ${match.entity_id} (${repo_full_name})`,
   );
 
-  await notify_alerts(
-    match.entity_id,
-    `\u26a0\ufe0f Workflow "${workflow.name}" failed on main (${workflow.html_url})`,
-    ctx,
+  await spawn_deploy_triage(
+    match.entity_id, match.repo_path, workflow, ctx, installation_id,
   );
 }
 
