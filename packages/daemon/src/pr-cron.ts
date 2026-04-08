@@ -28,6 +28,7 @@ import {
 } from "./review-utils.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
+import { cleanup_after_merge } from "./worktree-cleanup.js";
 
 const exec = promisify(execFile);
 
@@ -597,6 +598,19 @@ export class PRReviewCron {
             `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved and merged to main`,
           );
         }
+
+        // Clean up local worktrees for the merged branch
+        try {
+          await cleanup_after_merge(repo_path, pr.headRefName);
+        } catch (err) {
+          console.error(
+            `[pr-cron] Worktree cleanup failed after merge for branch ${pr.headRefName}: ${String(err)}`,
+          );
+          sentry.captureException(err, {
+            tags: { module: "pr-cron", action: "worktree_cleanup" },
+            contexts: { pr: { number: pr.number, branch: pr.headRefName } },
+          });
+        }
       } else if (is_internal) {
         // Check CI status before attempting merge (#189)
         const ci = await check_ci_status(pr.number, repo_path, gh_token, this.gh_bin);
@@ -625,6 +639,19 @@ export class PRReviewCron {
               entity_id,
               `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged to main`,
             );
+
+            // Clean up local worktrees for the merged branch
+            try {
+              await cleanup_after_merge(repo_path, pr.headRefName);
+            } catch (err) {
+              console.error(
+                `[pr-cron] Worktree cleanup failed after merge for branch ${pr.headRefName}: ${String(err)}`,
+              );
+              sentry.captureException(err, {
+                tags: { module: "pr-cron", action: "worktree_cleanup" },
+                contexts: { pr: { number: pr.number, branch: pr.headRefName } },
+              });
+            }
           } else {
             await this.notify_alerts(
               entity_id,
@@ -784,6 +811,19 @@ export class PRReviewCron {
           entity_id,
           `PR #${String(pr.number)}: ${pr.title} — CI passed, auto-merged (${result.method})`,
         );
+
+        // Clean up local worktrees for the merged branch
+        try {
+          await cleanup_after_merge(repo_path, pr.headRefName);
+        } catch (err) {
+          console.error(
+            `[pr-cron] Worktree cleanup failed after merge for branch ${pr.headRefName}: ${String(err)}`,
+          );
+          sentry.captureException(err, {
+            tags: { module: "pr-cron", action: "worktree_cleanup" },
+            contexts: { pr: { number: pr.number, branch: pr.headRefName } },
+          });
+        }
       } else {
         await this.notify_alerts(
           entity_id,
