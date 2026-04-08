@@ -561,6 +561,22 @@ export class DiscordBot extends EventEmitter {
     return this.connected;
   }
 
+  /** Find the #system-status channel by name under the GLOBAL category. */
+  async find_system_status_channel(): Promise<string | null> {
+    const guild = await this.get_guild();
+    if (!guild) return null;
+
+    const category = guild.channels.cache.find(
+      (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+    );
+    if (!category) return null;
+
+    const channel = guild.channels.cache.find(
+      (c) => c.name === "system-status" && c.parentId === category.id,
+    );
+    return channel?.id ?? null;
+  }
+
   /** Send a plain message to a channel (from the bot itself). */
   async send(channel_id: string, content: string): Promise<void> {
     if (!this.connected) {

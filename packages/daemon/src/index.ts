@@ -322,6 +322,24 @@ async function main(): Promise<void> {
     },
   });
 
+  // Notify #system-status that the daemon has started
+  if (discord_connected) {
+    try {
+      const status_channel = await discord.find_system_status_channel();
+      if (status_channel) {
+        const active = registry.get_active().length;
+        const total = registry.count();
+        const pool_status = pool.get_status();
+        await discord.send(
+          status_channel,
+          `☑ Daemon started (pid ${String(process.pid)}) — ${String(active)}/${String(total)} entities, ${String(pool_status.total)} pool bots, GitHub App ${github_app ? "active" : "inactive"}`,
+        );
+      }
+    } catch (err) {
+      console.error(`[startup] Failed to notify system-status: ${String(err)}`);
+    }
+  }
+
   // Graceful shutdown handler
   let shutting_down = false;
 
