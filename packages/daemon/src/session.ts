@@ -248,8 +248,12 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       env: { ...process.env, ...options.env },
     });
 
-    // Write prompt to stdin and close it
+    // Write prompt to stdin and close it.
+    // Guard against EPIPE if the process exits before stdin is consumed.
     if (proc.stdin) {
+      proc.stdin.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code !== "EPIPE") throw err;
+      });
       proc.stdin.write(options.prompt);
       proc.stdin.end();
     }
