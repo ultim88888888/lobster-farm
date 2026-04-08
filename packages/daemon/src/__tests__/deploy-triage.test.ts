@@ -11,10 +11,10 @@
  * Uses the same command-routing mock pattern as ci-fix-loop.test.ts.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Command routing ──
 
@@ -104,31 +104,33 @@ vi.mock("../persistence.js", () => ({
   }),
 }));
 
-// Import after mocks are registered
-import {
-  build_deploy_triage_prompt,
-  MAX_DEPLOY_FIX_ATTEMPTS,
-  type CIFailureLog,
-} from "../review-utils.js";
-import {
-  handle_github_webhook,
-  type WebhookContext,
-} from "../webhook-handler.js";
+import type { DiscordBot } from "../discord.js";
 import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
+// Import after mocks are registered
+import {
+  type CIFailureLog,
+  MAX_DEPLOY_FIX_ATTEMPTS,
+  build_deploy_triage_prompt,
+} from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
-import type { DiscordBot } from "../discord.js";
+import { type WebhookContext, handle_github_webhook } from "../webhook-handler.js";
 
 // ── build_deploy_triage_prompt tests ──
 
 describe("build_deploy_triage_prompt", () => {
   it("includes workflow name, URL, run ID, and repo path", () => {
     const prompt = build_deploy_triage_prompt(
-      "Deploy", "https://github.com/org/repo/actions/runs/123",
-      123, "/tmp/repo", [], 1, 2,
+      "Deploy",
+      "https://github.com/org/repo/actions/runs/123",
+      123,
+      "/tmp/repo",
+      [],
+      1,
+      2,
     );
 
-    expect(prompt).toContain('Deploy');
+    expect(prompt).toContain("Deploy");
     expect(prompt).toContain("https://github.com/org/repo/actions/runs/123");
     expect(prompt).toContain("123");
     expect(prompt).toContain("/tmp/repo");
@@ -136,7 +138,13 @@ describe("build_deploy_triage_prompt", () => {
 
   it("includes attempt counter", () => {
     const prompt = build_deploy_triage_prompt(
-      "Deploy", "https://example.com", 1, "/tmp/repo", [], 2, 2,
+      "Deploy",
+      "https://example.com",
+      1,
+      "/tmp/repo",
+      [],
+      2,
+      2,
     );
 
     expect(prompt).toContain("Attempt: 2/2");
@@ -147,7 +155,13 @@ describe("build_deploy_triage_prompt", () => {
       { check_name: "deploy", log_output: "ResourceInitializationError: missing key" },
     ];
     const prompt = build_deploy_triage_prompt(
-      "Deploy", "https://example.com", 1, "/tmp/repo", logs, 1, 2,
+      "Deploy",
+      "https://example.com",
+      1,
+      "/tmp/repo",
+      logs,
+      1,
+      2,
     );
 
     expect(prompt).toContain("## Failure Logs");
@@ -157,7 +171,13 @@ describe("build_deploy_triage_prompt", () => {
 
   it("shows fallback message when no logs available", () => {
     const prompt = build_deploy_triage_prompt(
-      "Deploy", "https://example.com", 42, "/tmp/repo", [], 1, 2,
+      "Deploy",
+      "https://example.com",
+      42,
+      "/tmp/repo",
+      [],
+      1,
+      2,
     );
 
     expect(prompt).toContain("No failure logs could be fetched");
@@ -166,7 +186,13 @@ describe("build_deploy_triage_prompt", () => {
 
   it("includes triage instructions", () => {
     const prompt = build_deploy_triage_prompt(
-      "Deploy", "https://example.com", 1, "/tmp/repo", [], 1, 2,
+      "Deploy",
+      "https://example.com",
+      1,
+      "/tmp/repo",
+      [],
+      1,
+      2,
     );
 
     expect(prompt).toContain("Diagnose");
@@ -184,10 +210,7 @@ function sign_payload(payload: string): string {
   return `sha256=${hmac}`;
 }
 
-function make_request(
-  body: string,
-  headers: Record<string, string> = {},
-): IncomingMessage {
+function make_request(body: string, headers: Record<string, string> = {}): IncomingMessage {
   const emitter = new EventEmitter();
   const req = emitter as unknown as IncomingMessage;
   req.headers = { ...headers };
@@ -222,9 +245,9 @@ function make_github_app(): GitHubAppAuth {
       return sig === `sha256=${expected}`;
     }),
     get_token: vi.fn().mockResolvedValue("ghs_mock_token"),
-    get_token_for_installation: vi.fn().mockImplementation(
-      (id: string) => Promise.resolve(`ghs_install_${id}`),
-    ),
+    get_token_for_installation: vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(`ghs_install_${id}`)),
   } as unknown as GitHubAppAuth;
 }
 
@@ -275,14 +298,16 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: make_discord(),
-    config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
+    config: {
+      paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
+    } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
     ...overrides,
   };
 }
 
-function make_workflow_run_payload(run_id: number = 99999): string {
+function make_workflow_run_payload(run_id = 99999): string {
   return JSON.stringify({
     action: "completed",
     workflow_run: {
@@ -299,15 +324,10 @@ function make_workflow_run_payload(run_id: number = 99999): string {
   });
 }
 
-async function send_workflow_run_webhook(
-  ctx: WebhookContext,
-  run_id: number = 99999,
-): Promise<void> {
+async function send_workflow_run_webhook(ctx: WebhookContext, run_id = 99999): Promise<void> {
   route_exec({
     "gh run list": () => ({
-      stdout: JSON.stringify([
-        { databaseId: run_id, name: "Deploy" },
-      ]),
+      stdout: JSON.stringify([{ databaseId: run_id, name: "Deploy" }]),
     }),
     "gh run view": () => ({
       stdout: "Error: ResourceInitializationError\n  task definition revision mismatch\n",
@@ -378,11 +398,13 @@ describe("webhook handler — deploy triage", () => {
     const ctx = make_context();
     await send_workflow_run_webhook(ctx);
 
-    const entry = mock_deploy_state["test-entity:99999"] as {
-      fix_attempts?: number;
-      entity_id?: string;
-      workflow_run_id?: number;
-    } | undefined;
+    const entry = mock_deploy_state["test-entity:99999"] as
+      | {
+          fix_attempts?: number;
+          entity_id?: string;
+          workflow_run_id?: number;
+        }
+      | undefined;
     expect(entry).toBeDefined();
     expect(entry!.fix_attempts).toBe(1);
     expect(entry!.entity_id).toBe("test-entity");
@@ -520,9 +542,9 @@ describe("webhook handler — deploy triage", () => {
     const github_app = ctx.github_app as unknown as {
       get_token_for_installation: ReturnType<typeof vi.fn>;
     };
-    github_app.get_token_for_installation = vi.fn().mockRejectedValue(
-      new Error("Certificate expired"),
-    );
+    github_app.get_token_for_installation = vi
+      .fn()
+      .mockRejectedValue(new Error("Certificate expired"));
 
     route_exec({
       "gh run list": () => ({
@@ -544,9 +566,11 @@ describe("webhook handler — deploy triage", () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
 
     // fix_attempts should NOT have been incremented
-    const entry = mock_deploy_state["test-entity:99999"] as {
-      fix_attempts?: number;
-    } | undefined;
+    const entry = mock_deploy_state["test-entity:99999"] as
+      | {
+          fix_attempts?: number;
+        }
+      | undefined;
     // Entry should not exist or have 0 attempts
     expect(entry?.fix_attempts ?? 0).toBe(0);
 

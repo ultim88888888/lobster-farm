@@ -606,53 +606,46 @@ export function build_deploy_triage_prompt(
   max_attempts: number,
 ): string {
   const lines = [
-    `## Deploy Failure Triage`,
-    ``,
+    "## Deploy Failure Triage",
+    "",
     `Workflow "${workflow_name}" failed on main.`,
     `Run: ${workflow_url}`,
     `Run ID: ${String(run_id)}`,
     `Repository: ${repo_path}`,
     `Attempt: ${String(attempt)}/${String(max_attempts)}`,
-    ``,
+    "",
   ];
 
   if (failure_logs.length > 0) {
-    lines.push(`## Failure Logs`, ``);
+    lines.push("## Failure Logs", "");
 
     for (const log of failure_logs) {
-      lines.push(
-        `### ${log.check_name}`,
-        ``,
-        "```",
-        log.log_output,
-        "```",
-        ``,
-      );
+      lines.push(`### ${log.check_name}`, "", "```", log.log_output, "```", "");
     }
   } else {
     lines.push(
-      `(No failure logs could be fetched from GitHub Actions.`,
+      "(No failure logs could be fetched from GitHub Actions.",
       `Run \`gh run view ${String(run_id)} --log-failed\` manually, or check CloudWatch.)`,
-      ``,
+      "",
     );
   }
 
   lines.push(
-    `## Instructions`,
-    ``,
-    `1. **Diagnose** — read the failure logs above. Identify the failing step and root cause.`,
-    `2. **Classify** — is this a code issue, infra/config issue, or external dependency failure?`,
-    `3. **Decide** — fix forward (hotfix branch + PR), recommend rollback, or escalate to human.`,
-    `4. **Act**:`,
-    `   - For code fixes: create a hotfix branch, fix the issue, open a PR with \`Closes\` link if applicable.`,
-    `   - For infra/config: post diagnosis and recommended fix to #alerts and escalate.`,
-    `   - If unclear: post full diagnosis to #alerts and escalate.`,
-    ``,
-    `Rules:`,
-    `- Do NOT push directly to main. All fixes go through PRs.`,
-    `- Do NOT attempt rollbacks (git revert on main) without human approval.`,
-    `- If GitHub Actions logs are insufficient, note this and recommend checking CloudWatch.`,
-    `- Keep fixes minimal and targeted.`,
+    "## Instructions",
+    "",
+    "1. **Diagnose** — read the failure logs above. Identify the failing step and root cause.",
+    "2. **Classify** — is this a code issue, infra/config issue, or external dependency failure?",
+    "3. **Decide** — fix forward (hotfix branch + PR), recommend rollback, or escalate to human.",
+    "4. **Act**:",
+    "   - For code fixes: create a hotfix branch, fix the issue, open a PR with `Closes` link if applicable.",
+    "   - For infra/config: post diagnosis and recommended fix to #alerts and escalate.",
+    "   - If unclear: post full diagnosis to #alerts and escalate.",
+    "",
+    "Rules:",
+    "- Do NOT push directly to main. All fixes go through PRs.",
+    "- Do NOT attempt rollbacks (git revert on main) without human approval.",
+    "- If GitHub Actions logs are insufficient, note this and recommend checking CloudWatch.",
+    "- Keep fixes minimal and targeted.",
   );
 
   return lines.join("\n");

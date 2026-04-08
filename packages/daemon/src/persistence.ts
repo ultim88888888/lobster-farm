@@ -320,10 +320,10 @@ export interface DeployTriageEntry {
   workflow_run_id: number;
   workflow_name: string;
   workflow_url: string;
-  head_sha: string;              // commit that triggered the deploy
-  first_seen_at: string;         // ISO timestamp
-  fix_attempts: number;          // incremented on each Gary spawn
-  last_attempt_at: string;       // ISO timestamp
+  head_sha: string; // commit that triggered the deploy
+  first_seen_at: string; // ISO timestamp
+  fix_attempts: number; // incremented on each Gary spawn
+  last_attempt_at: string; // ISO timestamp
   resolved: boolean;
 }
 
@@ -343,9 +343,7 @@ export async function save_deploy_triage(
 }
 
 /** Load deploy triage state from disk. Returns empty object if file doesn't exist. */
-export async function load_deploy_triage(
-  config: LobsterFarmConfig,
-): Promise<DeployTriageState> {
+export async function load_deploy_triage(config: LobsterFarmConfig): Promise<DeployTriageState> {
   const path = deploy_triage_path(config);
   try {
     const content = await readFile(path, "utf-8");

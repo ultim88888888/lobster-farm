@@ -25,7 +25,12 @@ import {
   fetch_issue_context,
   nwo_from_url,
 } from "./issue-utils.js";
-import { load_pr_reviews, save_pr_reviews, load_deploy_triage, save_deploy_triage } from "./persistence.js";
+import {
+  load_deploy_triage,
+  load_pr_reviews,
+  save_deploy_triage,
+  save_pr_reviews,
+} from "./persistence.js";
 import type { DeployTriageEntry } from "./persistence.js";
 import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
@@ -807,12 +812,12 @@ async function spawn_deploy_triage(
   if (existing && existing.fix_attempts >= MAX_DEPLOY_FIX_ATTEMPTS) {
     console.log(
       `[webhook] Deploy triage exhausted for ${triage_key} ` +
-      `(${String(existing.fix_attempts)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}) — skipping`,
+        `(${String(existing.fix_attempts)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}) — skipping`,
     );
     await notify_alerts(
       entity_id,
       `Deploy fix loop exhausted for workflow "${workflow.name}" ` +
-      `(${String(MAX_DEPLOY_FIX_ATTEMPTS)} attempts). Manual intervention needed. ${workflow.html_url}`,
+        `(${String(MAX_DEPLOY_FIX_ATTEMPTS)} attempts). Manual intervention needed. ${workflow.html_url}`,
       ctx,
     );
     return;
@@ -832,12 +837,12 @@ async function spawn_deploy_triage(
   if (entity_attempts_24h >= DEPLOY_SAFETY_VALVE) {
     console.log(
       `[webhook] Deploy safety valve triggered for ${entity_id} ` +
-      `(${String(entity_attempts_24h)} attempts in 24h) — skipping`,
+        `(${String(entity_attempts_24h)} attempts in 24h) — skipping`,
     );
     await notify_alerts(
       entity_id,
       `Deploy auto-triage paused for ${entity_id}: ${String(entity_attempts_24h)} fix attempts ` +
-      `in 24h (safety valve = ${String(DEPLOY_SAFETY_VALVE)}). Manual intervention needed.`,
+        `in 24h (safety valve = ${String(DEPLOY_SAFETY_VALVE)}). Manual intervention needed.`,
       ctx,
     );
     return;
@@ -875,9 +880,7 @@ async function spawn_deploy_triage(
   await save_deploy_triage(state, ctx.config);
 
   // Fetch failure logs from GitHub Actions
-  const failure_logs = await fetch_ci_failure_logs(
-    "main", repo_path, gh_token,
-  );
+  const failure_logs = await fetch_ci_failure_logs("main", repo_path, gh_token);
 
   // Build prompt for Gary
   const prompt = build_deploy_triage_prompt(
@@ -892,13 +895,12 @@ async function spawn_deploy_triage(
 
   console.log(
     `[webhook] Spawning Gary for deploy triage in ${entity_id} ` +
-    `(run ${String(workflow.id)}, attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)})`,
+      `(run ${String(workflow.id)}, attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)})`,
   );
 
   await notify_alerts(
     entity_id,
-    `\u26a0\ufe0f Deploy failed on main — Gary triaging ` +
-    `(attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}). ${workflow.html_url}`,
+    `\u26a0\ufe0f Deploy failed on main — Gary triaging (attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}). ${workflow.html_url}`,
     ctx,
   );
 
@@ -1154,17 +1156,14 @@ async function handle_workflow_run(payload: WebhookPayload, ctx: WebhookContext)
     return;
   }
 
-  const installation_id = payload.installation?.id != null
-    ? String(payload.installation.id)
-    : undefined;
+  const installation_id =
+    payload.installation?.id != null ? String(payload.installation.id) : undefined;
 
   console.log(
     `[webhook] Workflow "${workflow.name}" failed on main in ${match.entity_id} (${repo_full_name})`,
   );
 
-  await spawn_deploy_triage(
-    match.entity_id, match.repo_path, workflow, ctx, installation_id,
-  );
+  await spawn_deploy_triage(match.entity_id, match.repo_path, workflow, ctx, installation_id);
 }
 
 // ── Utility helpers ──
