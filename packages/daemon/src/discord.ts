@@ -1137,7 +1137,8 @@ export class DiscordBot extends EventEmitter {
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- placeholder for future queue-based command handling
   set_managers(_queue: TaskQueue): void {
-    // Reserved: queue reference will be used for slash-command task submission
+    // Queue wiring deferred — will be used for slash-command task submission
+    console.debug("[discord] set_managers called — queue wiring not yet implemented");
   }
 
   set_pool(pool: BotPool): void {
