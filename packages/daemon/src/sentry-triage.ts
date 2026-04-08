@@ -14,23 +14,23 @@
  * receive event → enrich with API → spawn session → track → handle completion.
  */
 
-import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { lobsterfarm_dir, expand_home } from "@lobster-farm/shared";
+import { expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import type { ClaudeSessionManager, SessionResult } from "./session.js";
-import type { EntityRegistry } from "./registry.js";
 import type { DiscordBot } from "./discord.js";
-import { fetch_sentry_issue_details, type SentryIssueDetails } from "./sentry-api.js";
+import type { EntityRegistry } from "./registry.js";
+import { type SentryIssueDetails, fetch_sentry_issue_details } from "./sentry-api.js";
 import * as sentry from "./sentry.js";
+import type { ClaudeSessionManager, SessionResult } from "./session.js";
 
 // ── Constants ──
 
 const MAX_CONCURRENT_TRIAGES = 2;
 const MAX_QUEUE_DEPTH = 5;
-const TRIAGE_TIMEOUT_MS = 30 * 60 * 1000;   // 30 minutes
-const TRIAGE_COOLDOWN_MS = 24 * 60 * 60 * 1000;  // 24 hours
+const TRIAGE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const TRIAGE_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // ── Public context type ──
 
@@ -74,8 +74,8 @@ export interface SentryWebhookPayload {
 
 export interface SentryProjectConfig {
   slug: string;
-  type?: string;  // e.g. "frontend" | "backend"
-  repo?: string;  // which entity repo this maps to
+  type?: string; // e.g. "frontend" | "backend"
+  repo?: string; // which entity repo this maps to
 }
 
 // ── Active triage tracking ──
@@ -123,7 +123,7 @@ export interface SentryTriageRecord {
   error_title: string;
   level?: string;
   github_issue?: number;
-  triaged_at: string;       // ISO timestamp
+  triaged_at: string; // ISO timestamp
   status: "investigating" | "tracked" | "dismissed" | "auto-resolved";
   sentry_url: string;
 }
@@ -183,12 +183,17 @@ async function update_triage_state(
   // .catch(() => {}) absorbs any prior rejection so a single transient disk error
   // (full disk, interrupted write) does not permanently poison the chain.
   // Same pattern as webhook-handler.ts.
-  state_write_lock = state_write_lock.catch(() => {}).then(async () => {
-    const state = await load_triage_state(config);
-    state.triages[sentry_issue_id] = { ...state.triages[sentry_issue_id], ...update } as SentryTriageRecord;
-    state.stats.last_triage_at = new Date().toISOString();
-    await save_triage_state(state, config);
-  });
+  state_write_lock = state_write_lock
+    .catch(() => {})
+    .then(async () => {
+      const state = await load_triage_state(config);
+      state.triages[sentry_issue_id] = {
+        ...state.triages[sentry_issue_id],
+        ...update,
+      } as SentryTriageRecord;
+      state.stats.last_triage_at = new Date().toISOString();
+      await save_triage_state(state, config);
+    });
   await state_write_lock;
 }
 
@@ -249,8 +254,8 @@ function find_entity_for_sentry_project(
 ): { entity_id: string; project_info: SentryProjectConfig; repo_path: string } | null {
   for (const entry of registry.get_active()) {
     const accounts = entry.entity.accounts as Record<string, unknown> | undefined;
-    const sentry_config = accounts?.["sentry"] as Record<string, unknown> | undefined;
-    const projects = sentry_config?.["projects"] as SentryProjectConfig[] | undefined;
+    const sentry_config = accounts?.sentry as Record<string, unknown> | undefined;
+    const projects = sentry_config?.projects as SentryProjectConfig[] | undefined;
 
     if (!projects?.length) continue;
 
@@ -261,7 +266,7 @@ function find_entity_for_sentry_project(
     const target_repo_name = project_info.repo;
     const repos = entry.entity.repos;
     const repo = target_repo_name
-      ? repos.find((r) => r.name === target_repo_name) ?? repos[0]
+      ? (repos.find((r) => r.name === target_repo_name) ?? repos[0])
       : repos[0];
 
     if (!repo) return null;
@@ -282,20 +287,24 @@ function build_triage_prompt(
   issue_details: SentryIssueDetails,
   action: string,
 ): string {
-  const contexts_text = Object.keys(issue_details.contexts).length > 0
-    ? JSON.stringify(issue_details.contexts, null, 2)
-    : "(none)";
+  const contexts_text =
+    Object.keys(issue_details.contexts).length > 0
+      ? JSON.stringify(issue_details.contexts, null, 2)
+      : "(none)";
 
   const request_text = issue_details.request
     ? [
         issue_details.request.method && `Method: ${issue_details.request.method}`,
         issue_details.request.url && `URL: ${issue_details.request.url}`,
-      ].filter(Boolean).join("\n") || "(request info available but empty)"
+      ]
+        .filter(Boolean)
+        .join("\n") || "(request info available but empty)"
     : "(no request context)";
 
-  const tags_text = issue_details.tags.length > 0
-    ? issue_details.tags.map((t) => `${t.key}: ${t.value}`).join("\n")
-    : "(no tags)";
+  const tags_text =
+    issue_details.tags.length > 0
+      ? issue_details.tags.map((t) => `${t.key}: ${t.value}`).join("\n")
+      : "(no tags)";
 
   return `You are triaging a Sentry error for the ${entity_name} project.
 
@@ -370,7 +379,7 @@ async function process_queue(ctx: SentryTriageContext): Promise<void> {
 
     console.log(
       `[sentry-triage] Processing queued triage for issue ${item.sentry_issue_id} ` +
-      `(${String(triage_queue.length)} remaining in queue)`,
+        `(${String(triage_queue.length)} remaining in queue)`,
     );
 
     await spawn_triage_session(
@@ -417,7 +426,7 @@ async function spawn_triage_session(
 
   const prompt = build_triage_prompt(entity_name, project_info, issue_details, action);
 
-  let session;
+  let session: Awaited<ReturnType<typeof ctx.session_manager.spawn>> | undefined;
   try {
     session = await ctx.session_manager.spawn({
       entity_id,
@@ -444,7 +453,7 @@ async function spawn_triage_session(
 
   console.log(
     `[sentry-triage] Spawned Ray session ${session.session_id.slice(0, 8)} ` +
-    `for Sentry issue ${sentry_issue_id}`,
+      `for Sentry issue ${sentry_issue_id}`,
   );
 
   // Track in-memory
@@ -464,18 +473,12 @@ async function spawn_triage_session(
     ctx.session_manager.removeListener("session:completed", on_complete);
     ctx.session_manager.removeListener("session:failed", on_fail);
 
-    console.log(
-      `[sentry-triage] Triage session completed for ${sentry_issue_id}`,
-    );
+    console.log(`[sentry-triage] Triage session completed for ${sentry_issue_id}`);
 
     active_triages.delete(sentry_issue_id);
 
     // Update state: mark completed (Ray will have posted its own diagnosis/issue)
-    void update_triage_state(
-      sentry_issue_id,
-      { status: "tracked" },
-      ctx.config,
-    ).catch((err) => {
+    void update_triage_state(sentry_issue_id, { status: "tracked" }, ctx.config).catch((err) => {
       console.error(`[sentry-triage] Failed to update state after completion: ${String(err)}`);
     });
 
@@ -490,9 +493,7 @@ async function spawn_triage_session(
     ctx.session_manager.removeListener("session:completed", on_complete);
     ctx.session_manager.removeListener("session:failed", on_fail);
 
-    console.error(
-      `[sentry-triage] Ray session failed for ${sentry_issue_id}: ${error}`,
-    );
+    console.error(`[sentry-triage] Ray session failed for ${sentry_issue_id}: ${error}`);
     sentry.captureException(new Error(error), {
       tags: { module: "sentry-triage", entity: entity_id },
       contexts: { issue: { id: sentry_issue_id } },
@@ -500,11 +501,7 @@ async function spawn_triage_session(
 
     active_triages.delete(sentry_issue_id);
 
-    void update_triage_state(
-      sentry_issue_id,
-      { status: "dismissed" },
-      ctx.config,
-    ).catch((e) => {
+    void update_triage_state(sentry_issue_id, { status: "dismissed" }, ctx.config).catch((e) => {
       console.error(`[sentry-triage] Failed to update state after failure: ${String(e)}`);
     });
 
@@ -545,20 +542,18 @@ export async function handle_sentry_triage_event(
   // Dedup + cooldown check
   const { proceed, reason } = await should_triage(sentry_issue_id, action, ctx.config);
   if (!proceed) {
-    console.log(
-      `[sentry-triage] Skipping triage for ${sentry_issue_id}: ${reason}`,
-    );
+    console.log(`[sentry-triage] Skipping triage for ${sentry_issue_id}: ${reason}`);
     return;
   }
 
   // Fetch full issue details before spawning (keeps Sentry creds out of agent)
-  const auth_token = process.env["SENTRY_AUTH_TOKEN"];
-  const org_slug = process.env["SENTRY_ORG"];
+  const auth_token = process.env.SENTRY_AUTH_TOKEN;
+  const org_slug = process.env.SENTRY_ORG;
 
   if (!auth_token || !org_slug) {
     console.warn(
       "[sentry-triage] SENTRY_AUTH_TOKEN or SENTRY_ORG not configured — " +
-      "cannot fetch issue details, skipping triage",
+        "cannot fetch issue details, skipping triage",
     );
     return;
   }
@@ -579,7 +574,7 @@ export async function handle_sentry_triage_event(
 
   console.log(
     `[sentry-triage] Triage event: ${action} for issue ${sentry_issue_id} ` +
-    `(${project_slug} → entity "${entity_id}")`,
+      `(${project_slug} → entity "${entity_id}")`,
   );
 
   // Rate limit: check concurrent capacity
@@ -589,7 +584,7 @@ export async function handle_sentry_triage_event(
       // Queue is full — something is very wrong. Alert but don't burn sessions.
       console.warn(
         `[sentry-triage] Queue full (${String(MAX_QUEUE_DEPTH)} items) — ` +
-        `dropping triage for ${sentry_issue_id}. Too many errors arriving simultaneously.`,
+          `dropping triage for ${sentry_issue_id}. Too many errors arriving simultaneously.`,
       );
       if (ctx.discord) {
         await ctx.discord
@@ -597,7 +592,7 @@ export async function handle_sentry_triage_event(
             entity_id,
             "alerts",
             `Sentry triage queue full (${String(MAX_QUEUE_DEPTH)} items). ` +
-            `Dropping triage for: ${issue_details.title}\n${issue_details.web_url}`,
+              `Dropping triage for: ${issue_details.title}\n${issue_details.web_url}`,
             "system",
           )
           .catch((e) => console.error(`[sentry-triage] Discord alert error: ${String(e)}`));
@@ -607,7 +602,7 @@ export async function handle_sentry_triage_event(
 
     console.log(
       `[sentry-triage] At capacity (${String(MAX_CONCURRENT_TRIAGES)} concurrent) — ` +
-      `queuing issue ${sentry_issue_id}`,
+        `queuing issue ${sentry_issue_id}`,
     );
     triage_queue.push({
       sentry_issue_id,

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * Tests for resolve_daemon_path() priority logic.
@@ -45,6 +45,10 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+beforeEach(() => {
+  vi.resetModules();
+});
+
 afterEach(() => {
   existing_paths.clear();
   vi.restoreAllMocks();
@@ -55,7 +59,7 @@ describe("resolve_daemon_path", () => {
     existing_paths.add(install_path);
     existing_paths.add(legacy_path);
 
-    const { resolve_daemon_path } = await import("../commands/start.js?t=1");
+    const { resolve_daemon_path } = await import("../commands/start.js");
     const result = resolve_daemon_path();
     expect(result).toBe(install_path);
   });
@@ -63,7 +67,7 @@ describe("resolve_daemon_path", () => {
   it("falls back to legacy path when install and walk-up paths do not exist", async () => {
     existing_paths.add(legacy_path);
 
-    const { resolve_daemon_path } = await import("../commands/start.js?t=2");
+    const { resolve_daemon_path } = await import("../commands/start.js");
     const result = resolve_daemon_path();
     expect(result).toBe(legacy_path);
   });
@@ -71,7 +75,7 @@ describe("resolve_daemon_path", () => {
   it("returns install path as default when nothing exists on disk", async () => {
     // All paths missing — function returns install_path so the error
     // message points the user to where the daemon should be installed.
-    const { resolve_daemon_path } = await import("../commands/start.js?t=3");
+    const { resolve_daemon_path } = await import("../commands/start.js");
     const result = resolve_daemon_path();
     expect(result).toBe(install_path);
   });

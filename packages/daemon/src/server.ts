@@ -13,12 +13,12 @@ import type { PRWatchStore } from "./pr-watches.js";
 import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
-import * as sentry from "./sentry.js";
 import {
+  type SentryTriageContext,
   handle_sentry_resolved,
   handle_sentry_triage_event,
-  type SentryTriageContext,
 } from "./sentry-triage.js";
+import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import { type WebhookContext, handle_github_webhook } from "./webhook-handler.js";
 
@@ -210,40 +210,44 @@ async function process_sentry_webhook(
   const data = payload.data as Record<string, unknown> | undefined;
   if (!data) return;
 
-  const issue = data["issue"] as Record<string, unknown> | undefined;
-  const error_title = (issue?.["title"] as string) ?? "Unknown error";
-  const issue_url = (issue?.["web_url"] as string) ?? (issue?.["permalink"] as string) ?? (issue?.["shortId"] as string) ?? "";
-  const action = payload["action"] as string | undefined;
+  const issue = data.issue as Record<string, unknown> | undefined;
+  const error_title = (issue?.title as string) ?? "Unknown error";
+  const issue_url =
+    (issue?.web_url as string) ?? (issue?.permalink as string) ?? (issue?.shortId as string) ?? "";
+  const action = payload.action as string | undefined;
 
   // Extract project slug for entity routing and triage.
   // Sentry sends the project inside data.issue.project.slug or data.project.
-  const issue_project = issue?.["project"] as Record<string, unknown> | undefined;
-  const data_project = data["project"] as Record<string, unknown> | undefined;
-  const project_slug = (issue_project?.["slug"] as string)
-    ?? (data_project?.["slug"] as string)
-    ?? (data["project_name"] as string)
-    ?? "unknown";
+  const issue_project = issue?.project as Record<string, unknown> | undefined;
+  const data_project = data.project as Record<string, unknown> | undefined;
+  const project_slug =
+    (issue_project?.slug as string) ??
+    (data_project?.slug as string) ??
+    (data.project_name as string) ??
+    "unknown";
 
   // Extract the Sentry issue ID for dedup/triage tracking
-  const sentry_issue_id = (issue?.["id"] as string) ?? "";
+  const sentry_issue_id = (issue?.id as string) ?? "";
 
   // Try to map Sentry project to an entity for targeted Discord routing.
   // First checks projects[] array (new config), then falls back to legacy
   // accounts.sentry.project field.
   let target_entity_id: string | null = null;
   for (const entity of ctx.registry.get_active()) {
-    const sentry_config = (entity.entity.accounts as Record<string, unknown>)?.["sentry"] as Record<string, unknown> | undefined;
+    const sentry_config = (entity.entity.accounts as Record<string, unknown>)?.sentry as
+      | Record<string, unknown>
+      | undefined;
     if (!sentry_config) continue;
 
     // New: projects[] array
-    const projects = sentry_config["projects"] as Array<Record<string, unknown>> | undefined;
-    if (projects?.some((p) => p["slug"] === project_slug)) {
+    const projects = sentry_config.projects as Array<Record<string, unknown>> | undefined;
+    if (projects?.some((p) => p.slug === project_slug)) {
       target_entity_id = entity.entity.id;
       break;
     }
 
     // Legacy: single project string (project_name match)
-    if (sentry_config["project"] === project_slug) {
+    if (sentry_config.project === project_slug) {
       target_entity_id = entity.entity.id;
       break;
     }
@@ -280,33 +284,32 @@ async function process_sentry_webhook(
     };
 
     // Fire-and-forget: triage runs async; failure is caught inside
-    void handle_sentry_triage_event(sentry_issue_id, project_slug, action, triage_ctx)
-      .catch((err) => {
+    void handle_sentry_triage_event(sentry_issue_id, project_slug, action, triage_ctx).catch(
+      (err) => {
         console.error(`[sentry-webhook] Triage error for ${sentry_issue_id}: ${String(err)}`);
         sentry.captureException(err, {
           tags: { module: "sentry-triage", project: project_slug },
           contexts: { issue: { id: sentry_issue_id, title: error_title } },
         });
-      });
+      },
+    );
   }
 
   // ── Resolved state update ──
   if (resource === "issue" && action === "resolved" && sentry_issue_id) {
-    void handle_sentry_resolved(sentry_issue_id, ctx.config)
-      .catch((err) => {
-        console.error(`[sentry-webhook] Failed to update resolved state: ${String(err)}`);
-      });
+    void handle_sentry_resolved(sentry_issue_id, ctx.config).catch((err) => {
+      console.error(`[sentry-webhook] Failed to update resolved state: ${String(err)}`);
+    });
   }
 
   // ── Alert forwarding ──
   // Always post an alert to Discord for issue events (except ignored ones).
   // Triage-worthy events get both an alert AND a Ray session.
-  const env = (issue?.["environment"] as string) ?? "";
+  const env = (issue?.environment as string) ?? "";
   const prefix = action === "resolved" ? "Resolved" : "Sentry";
   const env_part = env ? ` | Env: ${env}` : "";
-  const action_label = action && !alert_only_actions.includes(action) && action !== "created"
-    ? ` [${action}]`
-    : "";
+  const action_label =
+    action && !alert_only_actions.includes(action) && action !== "created" ? ` [${action}]` : "";
   const alert_message = `${prefix}${action_label}: ${error_title}\nProject: ${project_slug}${env_part}\n${issue_url}`;
 
   if (ctx.discord) {

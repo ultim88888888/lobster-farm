@@ -12,11 +12,11 @@
  * - Mutex resilience: write failure doesn't permanently break state chain
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EventEmitter } from "node:events";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ──
 
@@ -32,7 +32,7 @@ vi.mock("../sentry.js", () => ({
 }));
 
 vi.mock("../sentry-api.js", async (importOriginal) => {
-  const actual = await importOriginal() as Record<string, unknown>;
+  const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
     fetch_sentry_issue_details: mock_fetch_details,
@@ -41,21 +41,21 @@ vi.mock("../sentry-api.js", async (importOriginal) => {
 
 // ── Imports (after mocks) ──
 
+import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import type { DiscordBot } from "../discord.js";
+import type { EntityRegistry } from "../registry.js";
 import { format_stack_trace } from "../sentry-api.js";
+import type { SentryIssueDetails } from "../sentry-api.js";
 import {
-  handle_sentry_triage_event,
-  handle_sentry_resolved,
-  load_triage_state,
-  save_triage_state,
-  _reset_for_test,
   type SentryTriageContext,
   type SentryTriageState,
+  _reset_for_test,
+  handle_sentry_resolved,
+  handle_sentry_triage_event,
+  load_triage_state,
+  save_triage_state,
 } from "../sentry-triage.js";
 import type { ClaudeSessionManager } from "../session.js";
-import type { EntityRegistry } from "../registry.js";
-import type { DiscordBot } from "../discord.js";
-import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import type { SentryIssueDetails } from "../sentry-api.js";
 
 // ── Test helpers ──
 
@@ -79,7 +79,8 @@ function make_issue_details(overrides: Partial<SentryIssueDetails> = {}): Sentry
     platform: "node",
     web_url: "https://sentry.io/issues/12345/",
     tags: [{ key: "environment", value: "production" }],
-    stack_trace: "TypeError: Cannot read property 'foo' of undefined\n  at process_request (src/handler.ts:42:5)",
+    stack_trace:
+      "TypeError: Cannot read property 'foo' of undefined\n  at process_request (src/handler.ts:42:5)",
     contexts: { runtime: { name: "node", version: "20.0.0" } },
     ...overrides,
   };
@@ -162,8 +163,8 @@ beforeEach(async () => {
   temp_dir = await mkdtemp(join(tmpdir(), "sentry-triage-test-"));
 
   // Set up required env vars
-  process.env["SENTRY_AUTH_TOKEN"] = "test-token";
-  process.env["SENTRY_ORG"] = "test-org";
+  process.env.SENTRY_AUTH_TOKEN = "test-token";
+  process.env.SENTRY_ORG = "test-org";
 
   // Default mock: fetch_sentry_issue_details returns a valid issue
   mock_fetch_details.mockResolvedValue(make_issue_details());
@@ -174,8 +175,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(temp_dir, { recursive: true, force: true });
-  delete process.env["SENTRY_AUTH_TOKEN"];
-  delete process.env["SENTRY_ORG"];
+  delete process.env.SENTRY_AUTH_TOKEN;
+  delete process.env.SENTRY_ORG;
 
   vi.restoreAllMocks();
 });
@@ -192,8 +193,19 @@ describe("format_stack_trace", () => {
             value: "Cannot read property 'foo' of undefined",
             stacktrace: {
               frames: [
-                { filename: "node_modules/express/lib/router.js", function: "handle", lineNo: 100, inApp: false },
-                { filename: "src/handler.ts", function: "process_request", lineNo: 42, colNo: 5, inApp: true },
+                {
+                  filename: "node_modules/express/lib/router.js",
+                  function: "handle",
+                  lineNo: 100,
+                  inApp: false,
+                },
+                {
+                  filename: "src/handler.ts",
+                  function: "process_request",
+                  lineNo: 42,
+                  colNo: 5,
+                  inApp: true,
+                },
                 { filename: "src/middleware.ts", function: "auth_check", lineNo: 15, inApp: true },
               ],
             },
@@ -283,18 +295,14 @@ describe("format_stack_trace", () => {
             type: "TypeError",
             value: "inner error",
             stacktrace: {
-              frames: [
-                { filename: "src/a.ts", function: "fn_a", lineNo: 10, inApp: true },
-              ],
+              frames: [{ filename: "src/a.ts", function: "fn_a", lineNo: 10, inApp: true }],
             },
           },
           {
             type: "Error",
             value: "outer error",
             stacktrace: {
-              frames: [
-                { filename: "src/b.ts", function: "fn_b", lineNo: 20, inApp: true },
-              ],
+              frames: [{ filename: "src/b.ts", function: "fn_b", lineNo: 20, inApp: true }],
             },
           },
         ],
@@ -385,7 +393,12 @@ describe("cooldown — 24h persistent", () => {
           sentry_url: "https://sentry.io/issues/ISSUE-COOL/",
         },
       },
-      stats: { total_triaged: 1, issues_created: 0, dismissed: 0, last_triage_at: new Date().toISOString() },
+      stats: {
+        total_triaged: 1,
+        issues_created: 0,
+        dismissed: 0,
+        last_triage_at: new Date().toISOString(),
+      },
     };
     await save_triage_state(state, config);
 
@@ -413,7 +426,12 @@ describe("cooldown — 24h persistent", () => {
           sentry_url: "https://sentry.io/issues/ISSUE-REG/",
         },
       },
-      stats: { total_triaged: 1, issues_created: 0, dismissed: 0, last_triage_at: new Date().toISOString() },
+      stats: {
+        total_triaged: 1,
+        issues_created: 0,
+        dismissed: 0,
+        last_triage_at: new Date().toISOString(),
+      },
     };
     await save_triage_state(state, config);
 
@@ -516,9 +534,11 @@ describe("rate limiting", () => {
 
     // Fill capacity (2 active) + queue (5 queued) = 7 events
     for (let i = 0; i < 7; i++) {
-      mock_fetch_details.mockResolvedValueOnce(make_issue_details({
-        title: `Error ${String(i)}`,
-      }));
+      mock_fetch_details.mockResolvedValueOnce(
+        make_issue_details({
+          title: `Error ${String(i)}`,
+        }),
+      );
       await handle_sentry_triage_event(`ISSUE-${String(i)}`, "test-backend", "created", ctx);
     }
 
@@ -526,9 +546,11 @@ describe("rate limiting", () => {
     expect(sm.spawn).toHaveBeenCalledTimes(2);
 
     // 8th event: queue is full — should be dropped
-    mock_fetch_details.mockResolvedValueOnce(make_issue_details({
-      title: "Error overflow",
-    }));
+    mock_fetch_details.mockResolvedValueOnce(
+      make_issue_details({
+        title: "Error overflow",
+      }),
+    );
     await handle_sentry_triage_event("ISSUE-OVERFLOW", "test-backend", "created", ctx);
 
     // Still 2 spawned (no new spawn)
@@ -584,7 +606,12 @@ describe("handle_sentry_resolved", () => {
           sentry_url: "https://sentry.io/issues/ISSUE-RES/",
         },
       },
-      stats: { total_triaged: 1, issues_created: 0, dismissed: 0, last_triage_at: new Date().toISOString() },
+      stats: {
+        total_triaged: 1,
+        issues_created: 0,
+        dismissed: 0,
+        last_triage_at: new Date().toISOString(),
+      },
     };
     await save_triage_state(state, config);
 
@@ -600,10 +627,13 @@ describe("handle_sentry_resolved", () => {
     const config = make_config();
 
     // Empty state
-    await save_triage_state({
-      triages: {},
-      stats: { total_triaged: 0, issues_created: 0, dismissed: 0, last_triage_at: "" },
-    }, config);
+    await save_triage_state(
+      {
+        triages: {},
+        stats: { total_triaged: 0, issues_created: 0, dismissed: 0, last_triage_at: "" },
+      },
+      config,
+    );
 
     // Should not throw
     await handle_sentry_resolved("ISSUE-UNKNOWN", config);
@@ -654,7 +684,7 @@ describe("entity resolution", () => {
   });
 
   it("skips triage when SENTRY_AUTH_TOKEN is not set", async () => {
-    delete process.env["SENTRY_AUTH_TOKEN"];
+    delete process.env.SENTRY_AUTH_TOKEN;
 
     const ctx = make_context();
     const sm = ctx.session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
@@ -672,10 +702,13 @@ describe("state write mutex resilience", () => {
     const config = make_config();
 
     // First write succeeds: set up initial state
-    await save_triage_state({
-      triages: {},
-      stats: { total_triaged: 0, issues_created: 0, dismissed: 0, last_triage_at: "" },
-    }, config);
+    await save_triage_state(
+      {
+        triages: {},
+        stats: { total_triaged: 0, issues_created: 0, dismissed: 0, last_triage_at: "" },
+      },
+      config,
+    );
 
     // Spawn a session that will fail, triggering update_triage_state
     const session_manager = make_session_manager();
@@ -721,7 +754,12 @@ describe("state persistence", () => {
           sentry_url: "https://sentry.io/issues/1/",
         },
       },
-      stats: { total_triaged: 1, issues_created: 0, dismissed: 0, last_triage_at: new Date().toISOString() },
+      stats: {
+        total_triaged: 1,
+        issues_created: 0,
+        dismissed: 0,
+        last_triage_at: new Date().toISOString(),
+      },
     };
 
     await save_triage_state(state, config);

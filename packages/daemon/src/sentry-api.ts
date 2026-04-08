@@ -59,12 +59,12 @@ export interface SentryIssueDetails {
  * frames when possible, and render them as a readable text block.
  */
 export function format_stack_trace(event: Record<string, unknown>): string {
-  const exception_entry = event["exception"] as Record<string, unknown> | undefined;
-  const exception_values = exception_entry?.["values"] as SentryException[] | undefined;
+  const exception_entry = event.exception as Record<string, unknown> | undefined;
+  const exception_values = exception_entry?.values as SentryException[] | undefined;
 
   if (!exception_values?.length) {
     // Fall back to message-only events (e.g. console.error captures)
-    const message = event["message"] as string | undefined;
+    const message = event.message as string | undefined;
     return message ? `(no stack trace — message event)\n${message}` : "(no stack trace)";
   }
 
@@ -138,10 +138,10 @@ export async function fetch_sentry_issue_details(
   const issue_timeout = setTimeout(() => issue_controller.abort(), 10_000);
   let issue_res: Response;
   try {
-    issue_res = await fetch(
-      `${base_url}/organizations/${org_slug}/issues/${issue_id}/`,
-      { headers, signal: issue_controller.signal },
-    );
+    issue_res = await fetch(`${base_url}/organizations/${org_slug}/issues/${issue_id}/`, {
+      headers,
+      signal: issue_controller.signal,
+    });
   } finally {
     clearTimeout(issue_timeout);
   }
@@ -152,7 +152,7 @@ export async function fetch_sentry_issue_details(
     );
   }
 
-  const issue = await issue_res.json() as Record<string, unknown>;
+  const issue = (await issue_res.json()) as Record<string, unknown>;
 
   // Fetch latest event for the stack trace (10s timeout)
   const event_controller = new AbortController();
@@ -169,50 +169,50 @@ export async function fetch_sentry_issue_details(
 
   let latest_event: Record<string, unknown> = {};
   if (event_res.ok) {
-    latest_event = await event_res.json() as Record<string, unknown>;
+    latest_event = (await event_res.json()) as Record<string, unknown>;
   } else {
     console.warn(
       `[sentry-api] Could not fetch latest event for issue ${issue_id}: ` +
-      `${String(event_res.status)} — proceeding without stack trace`,
+        `${String(event_res.status)} — proceeding without stack trace`,
     );
   }
 
   // Extract tags as a flat array (Sentry returns [{key, value}] already)
-  const raw_tags = issue["tags"] as Array<Record<string, string>> | undefined;
-  const tags = raw_tags?.map((t) => ({ key: t["key"] ?? "", value: t["value"] ?? "" })) ?? [];
+  const raw_tags = issue.tags as Array<Record<string, string>> | undefined;
+  const tags = raw_tags?.map((t) => ({ key: t.key ?? "", value: t.value ?? "" })) ?? [];
 
   // Safely pull request context (could be null or absent)
-  const raw_request = latest_event["request"] as Record<string, unknown> | null | undefined;
+  const raw_request = latest_event.request as Record<string, unknown> | null | undefined;
   const request = raw_request
     ? {
-        method: raw_request["method"] as string | undefined,
-        url: raw_request["url"] as string | undefined,
-        headers: raw_request["headers"] as Record<string, string> | undefined,
+        method: raw_request.method as string | undefined,
+        url: raw_request.url as string | undefined,
+        headers: raw_request.headers as Record<string, string> | undefined,
       }
     : undefined;
 
   // User context included for completeness; not forwarded to agent sessions
-  const raw_user = latest_event["user"] as Record<string, unknown> | null | undefined;
+  const raw_user = latest_event.user as Record<string, unknown> | null | undefined;
   const user = raw_user
     ? {
-        id: raw_user["id"] as string | undefined,
-        email: raw_user["email"] as string | undefined,
-        ip_address: raw_user["ip_address"] as string | undefined,
+        id: raw_user.id as string | undefined,
+        email: raw_user.email as string | undefined,
+        ip_address: raw_user.ip_address as string | undefined,
       }
     : undefined;
 
   return {
-    title: (issue["title"] as string) ?? "Unknown error",
-    culprit: (issue["culprit"] as string) ?? "",
-    level: (issue["level"] as string) ?? "error",
-    count: String(issue["count"] ?? 0),
-    first_seen: (issue["firstSeen"] as string) ?? "",
-    last_seen: (issue["lastSeen"] as string) ?? "",
-    platform: (issue["platform"] as string) ?? "",
-    web_url: (issue["permalink"] as string) ?? (issue["web_url"] as string) ?? "",
+    title: (issue.title as string) ?? "Unknown error",
+    culprit: (issue.culprit as string) ?? "",
+    level: (issue.level as string) ?? "error",
+    count: String(issue.count ?? 0),
+    first_seen: (issue.firstSeen as string) ?? "",
+    last_seen: (issue.lastSeen as string) ?? "",
+    platform: (issue.platform as string) ?? "",
+    web_url: (issue.permalink as string) ?? (issue.web_url as string) ?? "",
     tags,
     stack_trace: format_stack_trace(latest_event),
-    contexts: (latest_event["contexts"] as Record<string, unknown>) ?? {},
+    contexts: (latest_event.contexts as Record<string, unknown>) ?? {},
     request,
     user,
   };

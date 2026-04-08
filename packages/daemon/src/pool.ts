@@ -1556,7 +1556,7 @@ export class BotPool extends EventEmitter {
   private async start_tmux(
     bot: PoolBot,
     archetype: ArchetypeRole,
-    entity_id: string,
+    _entity_id: string,
     working_dir: string,
     session_id: string,
     is_resume = false,

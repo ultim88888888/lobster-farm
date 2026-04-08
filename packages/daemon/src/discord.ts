@@ -158,6 +158,10 @@ export function format_relative_time(iso: string): string {
 interface ChannelEntry {
   entity_id: string;
   channel_type: ChannelType;
+  /** Feature ID assigned to this work room (set by /open, cleared by /close). */
+  assigned_feature?: string | null;
+  /** Human-readable purpose from entity config (e.g., "aws", "io-site"). */
+  purpose?: string;
 }
 
 // ── Command target abstraction ──
@@ -532,7 +536,7 @@ export class DiscordBot extends EventEmitter {
       console.error(`[discord] Failed to register slash commands: ${String(err)}`);
       sentry.captureException(err, {
         tags: { component: "discord", operation: "register_slash_commands" },
-        extra: { hint: "Most likely missing applications.commands OAuth2 scope" },
+        contexts: { error: { hint: "Most likely missing applications.commands OAuth2 scope" } },
       });
     }
   }
@@ -1129,12 +1133,11 @@ export class DiscordBot extends EventEmitter {
     );
   }
 
-  /** Set reference to queue for command handling. */
-  private _queue: TaskQueue | null = null;
   private _pool: BotPool | null = null;
 
-  set_managers(queue: TaskQueue): void {
-    this._queue = queue;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- placeholder for future queue-based command handling
+  set_managers(_queue: TaskQueue): void {
+    // Reserved: queue reference will be used for slash-command task submission
   }
 
   set_pool(pool: BotPool): void {
@@ -1871,7 +1874,7 @@ export class DiscordBot extends EventEmitter {
    * and requires --force to proceed.
    */
   private async handle_close_command(
-    args: string[],
+    _args: string[],
     routed: RoutedMessage,
     target: CommandTarget,
   ): Promise<void> {
@@ -1896,21 +1899,8 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // Guard: warn if there's an active feature lifecycle in this room
-    if (this._features) {
-      const active_features = this._features
-        .get_features_by_entity(routed.entity_id)
-        .filter(
-          (f) => f.discordWorkRoom === channel_id && !["done", "cancelled"].includes(f.phase),
-        );
-      if (active_features.length > 0 && !args.includes("--force")) {
-        const title = active_features[0]!.title ?? active_features[0]!.id;
-        await target.reply(
-          `This room has an active feature (**${title}**). Close anyway? Use \`/close\` with the \`force\` option.`,
-        );
-        return;
-      }
-    }
+    // TODO: Guard against closing rooms with active feature lifecycles once
+    // feature lifecycle tracking is implemented.
 
     // Determine the room name from the purpose field or the channel name
     const room_name = channel_entry.purpose ?? `room-${channel_id}`;
