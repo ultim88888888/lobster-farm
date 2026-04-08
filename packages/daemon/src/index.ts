@@ -337,6 +337,9 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       console.error(`[startup] Failed to notify system-status: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "startup_notification" },
+      });
     }
   }
 
