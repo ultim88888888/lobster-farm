@@ -1030,6 +1030,12 @@ Loggers are configurable per-environment. In prod you want structured logs. In d
 - **Pin major versions, allow minor**: `aiohttp = "^3.9"`
 - **Dev dependencies separate**: `[project.optional-dependencies]` or poetry groups
 
+### Pre-commit Hooks
+
+All LobsterFarm repos use husky + lint-staged. Every commit automatically runs Biome lint+format on staged files. **Never skip hooks** (`--no-verify` is banned). If the hook fails, fix the issue — don't bypass it.
+
+As a belt-and-suspenders habit: run `pnpm lint` before committing to catch issues early. But the hook is the real safety net.
+
 ---
 
 ## Anti-Patterns — Things We Don't Do
