@@ -32,6 +32,26 @@ import { cleanup_after_merge } from "./worktree-cleanup.js";
 
 const exec = promisify(execFile);
 
+// ── Helpers ──
+
+async function try_cleanup_worktree(
+  repo_path: string,
+  branch: string,
+  pr_number: number,
+): Promise<void> {
+  try {
+    await cleanup_after_merge(repo_path, branch);
+  } catch (err) {
+    console.error(
+      `[pr-cron] Worktree cleanup failed after merge for branch ${branch}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "pr-cron", action: "worktree_cleanup" },
+      contexts: { pr: { number: pr_number, branch } },
+    });
+  }
+}
+
 // ── Types ──
 
 interface OpenPR {
@@ -600,17 +620,7 @@ export class PRReviewCron {
         }
 
         // Clean up local worktrees for the merged branch
-        try {
-          await cleanup_after_merge(repo_path, pr.headRefName);
-        } catch (err) {
-          console.error(
-            `[pr-cron] Worktree cleanup failed after merge for branch ${pr.headRefName}: ${String(err)}`,
-          );
-          sentry.captureException(err, {
-            tags: { module: "pr-cron", action: "worktree_cleanup" },
-            contexts: { pr: { number: pr.number, branch: pr.headRefName } },
-          });
-        }
+        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
       } else if (is_internal) {
         // Check CI status before attempting merge (#189)
         const ci = await check_ci_status(pr.number, repo_path, gh_token, this.gh_bin);
@@ -641,17 +651,7 @@ export class PRReviewCron {
             );
 
             // Clean up local worktrees for the merged branch
-            try {
-              await cleanup_after_merge(repo_path, pr.headRefName);
-            } catch (err) {
-              console.error(
-                `[pr-cron] Worktree cleanup failed after merge for branch ${pr.headRefName}: ${String(err)}`,
-              );
-              sentry.captureException(err, {
-                tags: { module: "pr-cron", action: "worktree_cleanup" },
-                contexts: { pr: { number: pr.number, branch: pr.headRefName } },
-              });
-            }
+            await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
           } else {
             await this.notify_alerts(
               entity_id,
@@ -813,17 +813,7 @@ export class PRReviewCron {
         );
 
         // Clean up local worktrees for the merged branch
-        try {
-          await cleanup_after_merge(repo_path, pr.headRefName);
-        } catch (err) {
-          console.error(
-            `[pr-cron] Worktree cleanup failed after merge for branch ${pr.headRefName}: ${String(err)}`,
-          );
-          sentry.captureException(err, {
-            tags: { module: "pr-cron", action: "worktree_cleanup" },
-            contexts: { pr: { number: pr.number, branch: pr.headRefName } },
-          });
-        }
+        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
       } else {
         await this.notify_alerts(
           entity_id,
