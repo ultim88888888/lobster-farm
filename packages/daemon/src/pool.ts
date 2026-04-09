@@ -1028,8 +1028,15 @@ export class BotPool extends EventEmitter {
       });
       const lines = output.trim().split("\n");
       const last_line = lines[lines.length - 1] ?? "";
-      // "bypass permissions" matches the Claude Code workspace trust dialog text.
-      // This is UI-text dependent and may break if Claude Code changes the dialog wording.
+
+      // Claude Code's status bar always shows "bypass permissions on (shift+tab to cycle)"
+      // at the bottom of the pane. When actively processing, it ALSO shows
+      // "esc to interrupt" — that's the reliable indicator the bot is working.
+      if (last_line.includes("esc to interrupt")) return false;
+
+      // If no "esc to interrupt", check for idle indicators:
+      // - ❯ prompt visible (waiting for input)
+      // - "bypass permissions" in status bar without "esc to interrupt" (idle at prompt)
       return last_line.includes("❯") || last_line.includes("bypass permissions");
     } catch {
       return true; // Can't check — assume idle (fail-open for eviction)

@@ -639,6 +639,12 @@ export class DiscordBot extends EventEmitter {
     // Fire immediately, then repeat
     void this.send_typing(channel_id);
 
+    // Track consecutive idle checks to avoid premature finalization.
+    // The MCP plugin needs time to deliver the message to the bot — if we
+    // check idle on the very first tick the bot may not have started yet.
+    let consecutive_idle = 0;
+    const IDLE_THRESHOLD = 2; // require 2 consecutive idle checks (~8s) before finalizing
+
     // NOTE: is_bot_idle() calls execFileSync("tmux", ...) — synchronous and blocking.
     // Fine at current scale (sub-ms per call), but if pool utilization grows this
     // should be replaced with an async tmux check or a dedicated idle-state event.
@@ -650,17 +656,28 @@ export class DiscordBot extends EventEmitter {
       }
 
       const bot = this._pool.get_assignment(channel_id);
-      if (!bot || this._pool.is_bot_idle(bot)) {
+      if (!bot) {
         this.stop_typing_loop(channel_id);
         void this.finalize_status_embed(channel_id);
         return;
+      }
+
+      if (this._pool.is_bot_idle(bot)) {
+        consecutive_idle++;
+        if (consecutive_idle >= IDLE_THRESHOLD) {
+          this.stop_typing_loop(channel_id);
+          void this.finalize_status_embed(channel_id);
+          return;
+        }
+      } else {
+        consecutive_idle = 0;
       }
 
       void this.send_typing(channel_id);
 
       // Parse tmux output and update the status embed if activity changed
       void this.update_status_embed_from_tmux(channel_id, bot);
-    }, 8000);
+    }, 4000);
 
     this.typing_loops.set(channel_id, interval);
   }
