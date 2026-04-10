@@ -646,36 +646,22 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  /** Send a typing indicator to a channel. Lasts ~10 seconds in Discord UI. */
-  async send_typing(channel_id: string): Promise<void> {
-    if (!this.connected) return;
-
-    try {
-      const channel = await this.client.channels.fetch(channel_id);
-      if (channel?.isTextBased()) {
-        await (channel as TextChannel).sendTyping();
-      }
-    } catch {
-      // Silently ignore — typing indicators are best-effort
-    }
-  }
-
   /**
-   * Start a typing indicator loop for a channel. Sends typing every 8 seconds
-   * while the assigned pool bot is actively processing (not idle at prompt).
-   * Auto-stops when the bot returns to idle or the bot is released.
+   * Start a status monitoring loop for a channel. Polls the assigned pool bot's
+   * tmux session every 4 seconds to update the status embed and detect idle/stale states.
+   * Auto-stops when the bot returns to idle, the bot is released, or stale OAuth is detected.
    */
   start_typing_loop(channel_id: string): void {
     // Don't stack loops for the same channel
     if (this.typing_loops.has(channel_id)) return;
     if (!this._pool) return;
 
-    // Fire immediately, then repeat
-    void this.send_typing(channel_id);
+    // Track consecutive idle checks to avoid premature finalization.
+    // The MCP plugin needs time to deliver the message — checking idle
+    // on the very first tick may fire before the bot starts processing.
+    let consecutive_idle = 0;
+    const IDLE_THRESHOLD = 2; // require 2 consecutive idle checks (~8s) before finalizing
 
-    // NOTE: is_bot_idle() calls execFileSync("tmux", ...) — synchronous and blocking.
-    // Fine at current scale (sub-ms per call), but if pool utilization grows this
-    // should be replaced with an async tmux check or a dedicated idle-state event.
     const interval = setInterval(() => {
       if (!this._pool) {
         this.stop_typing_loop(channel_id);
@@ -684,17 +670,46 @@ export class DiscordBot extends EventEmitter {
       }
 
       const bot = this._pool.get_assignment(channel_id);
-      if (!bot || this._pool.is_bot_idle(bot)) {
+      if (!bot) {
         this.stop_typing_loop(channel_id);
         void this.finalize_status_embed(channel_id);
         return;
       }
 
-      void this.send_typing(channel_id);
+      // Detect stale OAuth mid-session. The initial check in handle_message()
+      // can miss this due to a race: the CLI hasn't tried the token yet when
+      // the daemon first checks. By checking here every tick, we catch it
+      // within 4 seconds and recycle the bot.
+      if (this._pool.has_stale_oauth(bot.id)) {
+        console.warn(
+          `[discord] Stale OAuth detected for pool-${String(bot.id)} during status loop — recycling`,
+        );
+        this.stop_typing_loop(channel_id);
+        void this.finalize_status_embed(channel_id);
+        this._pool.kill_stale_session(bot.id);
+        void this._pool.release_with_history(bot.id).then(() => {
+          void this.send(
+            channel_id,
+            "Session expired — send your message again and a fresh bot will pick it up.",
+          );
+        });
+        return;
+      }
+
+      if (this._pool.is_bot_idle(bot)) {
+        consecutive_idle++;
+        if (consecutive_idle >= IDLE_THRESHOLD) {
+          this.stop_typing_loop(channel_id);
+          void this.finalize_status_embed(channel_id);
+          return;
+        }
+      } else {
+        consecutive_idle = 0;
+      }
 
       // Parse tmux output and update the status embed if activity changed
       void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
-    }, 8000);
+    }, 4000);
 
     this.typing_loops.set(channel_id, interval);
   }
@@ -720,7 +735,7 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * Start a typing indicator loop for the Commander (Pat) in #command-center.
+   * Start a status monitoring loop for the Commander (Pat) in #command-center.
    * Uses Pat's fixed tmux session ("pat") for idle detection and activity parsing,
    * independent of the bot pool.
    */
@@ -729,9 +744,6 @@ export class DiscordBot extends EventEmitter {
     if (this.typing_loops.has(channel_id)) return;
 
     const TMUX_SESSION = PAT_TMUX_SESSION;
-
-    // Fire immediately, then repeat
-    void this.send_typing(channel_id);
 
     // Track consecutive idle checks to avoid premature finalization.
     // Pat's channel plugin needs time to deliver the message — if we
@@ -750,8 +762,6 @@ export class DiscordBot extends EventEmitter {
       } else {
         consecutive_idle = 0;
       }
-
-      void this.send_typing(channel_id);
 
       // Parse tmux output and update the status embed if activity changed
       void this.update_status_embed_from_tmux(channel_id, TMUX_SESSION);
@@ -803,13 +813,15 @@ export class DiscordBot extends EventEmitter {
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = (lines[i] ?? "").trim();
         if (!line.includes("⏺")) continue;
-        // Match "⏺ Agent(name)" to extract the spawned agent name
-        const agent_spawn_match = line.match(/⏺\s+Agent\((\w+)/);
-        if (agent_spawn_match?.[1]) {
-          subagent_name = agent_spawn_match[1];
+        // Match "⏺ bob(description)" — direct agent name calls (lowercase = subagent name)
+        const direct_match = line.match(/⏺\s+([a-z]\w*)\(/);
+        if (direct_match?.[1]) {
+          subagent_name = direct_match[1];
           break;
         }
-        if (line.includes("Agent")) {
+        // Match "⏺ Agent(name)" — explicit Agent tool calls
+        const agent_match2 = line.match(/⏺\s+Agent\(/);
+        if (agent_match2) {
           subagent_name = "subagent";
           break;
         }
