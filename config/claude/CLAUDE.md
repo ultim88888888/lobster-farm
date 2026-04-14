@@ -110,6 +110,13 @@ Everything not listed above: use your judgment and move fast.
 - Update READMEs when you modify what they describe
 - Comment the WHY, not the WHAT
 
+### Observability
+- **Sentry**: enabled. Projects: `lobsterfarm-daemon`
+- DSN: `op://command-center/sentry/dsn`
+- Load `sentry-guideline` skill when adding error tracking to any new service
+- All deployable services must have Sentry integrated before first production deploy
+- Background async work must use monitored wrappers — never fire-and-forget Promises without error handling
+
 ---
 
 ## Repo Locations

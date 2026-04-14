@@ -419,6 +419,181 @@ process.on('uncaughtException', async (err) => {
 
 ---
 
+## Background Task Safety Nets
+
+Errors inside fire-and-forget background tasks silently vanish unless explicitly handled. This is the #1 source of invisible production failures. **Every project needs both layers.**
+
+### Python (asyncio)
+
+**Layer 1: Global safety net** — catches ANY unhandled exception from ANY `create_task()` call. Set once at startup:
+
+```python
+import sentry_sdk
+
+def handle_task_exception(loop, context):
+    exception = context.get("exception")
+    if exception:
+        logger.error("unhandled_task_exception", error=str(exception), exc_info=exception)
+        sentry_sdk.capture_exception(exception)
+
+loop = asyncio.get_event_loop()
+loop.set_exception_handler(handle_task_exception)
+```
+
+**Layer 2: Per-task wrapper** — for tasks you want structured logging and error handling on:
+
+```python
+def create_monitored_task(coro, *, name=None):
+    async def _wrapper():
+        try:
+            return await coro
+        except Exception:
+            logger.error("background_task_failed", task=name, exc_info=True)
+            sentry_sdk.capture_exception()
+    return asyncio.create_task(_wrapper(), name=name)
+```
+
+Replace all bare `asyncio.create_task()` calls with `create_monitored_task()`. The global handler is the fallback for anything you miss.
+
+### Node.js / TypeScript
+
+**Layer 1: Global safety net** — unhandled promise rejections:
+
+```typescript
+process.on('unhandledRejection', (reason) => {
+  Sentry.captureException(reason, { tags: { source: 'unhandledRejection' } });
+  console.error('[sentry] Unhandled rejection:', reason);
+});
+```
+
+**Layer 2: Per-task wrapper** — for fire-and-forget async work:
+
+```typescript
+function monitoredTask(fn: () => Promise<void>, name: string): void {
+  fn().catch((err) => {
+    Sentry.captureException(err, { tags: { task: name } });
+    console.error(`[${name}] Background task failed:`, err);
+  });
+}
+```
+
+### The rule
+
+**Never use bare `create_task()` or fire-and-forget `Promise` in production code.** Every background task must have an error path that reports to Sentry. The global handler is the safety net, not the primary mechanism.
+
+---
+
+## Deployment Verification
+
+SDK integration in code is not enough. Every deployment target must have Sentry enabled and configured at the environment level. Sonar had the SDK wired in but `SENTRY_ENABLED` missing from ECS service definitions — resulting in months of silent failures.
+
+### Required environment variables per deployment target
+
+Every service, scheduled task, Lambda, or worker that runs in production:
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `SENTRY_DSN` | From 1Password | Per-project DSN |
+| `SENTRY_ENABLED` | `true` | Explicitly enable — don't rely on DSN presence alone |
+| `SENTRY_ENVIRONMENT` | `production` / `staging` | Filters in Sentry UI |
+
+### Verification checklist
+
+After enabling Sentry on any deployment target:
+
+1. **Trigger a test error** — throw an intentional exception in each service
+2. **Confirm it appears in Sentry** — check the project dashboard within 60 seconds
+3. **Confirm daemon webhook fires** — check the entity's #alerts channel for the triage alert
+4. **Audit all deployment targets** — list every ECS service, task definition, Lambda, cron job. Each one must have the three env vars above. If any are missing, fix immediately.
+
+### Common gaps
+
+- ECS **task definitions** vs **services** — a task def can have Sentry, but if the service uses an older revision, it's not active. Always verify the running revision.
+- **Scheduled tasks** (EventBridge rules) — these often use separate task definitions from the main service. Check each one.
+- **Frontend SSR** — Next.js server-side rendering runs in a different context than the client. Both need Sentry configs (`sentry.server.config.ts` + `sentry.client.config.ts`).
+
+---
+
+## Adding Sentry to an Existing Entity
+
+Step-by-step checklist for wiring Sentry into an entity that was created without it.
+
+### 1. Create Sentry project(s)
+
+One project per deployable service (e.g., `canal-street-backend`, `canal-street-frontend`). Create in the Sentry dashboard or via API.
+
+### 2. Store credentials in 1Password
+
+In the entity's vault (`entity-{id}`):
+
+```
+sentry/dsn          → the project DSN
+sentry/token        → auth token (for source maps, if needed)
+sentry/org          → org slug
+sentry/project      → project slug
+```
+
+### 3. Update entity config
+
+Add to `~/.lobsterfarm/entities/{id}/config.yaml`:
+
+```yaml
+accounts:
+  sentry:
+    projects:
+      - slug: {entity}-backend
+        type: backend
+        repo: {repo-name}
+      - slug: {entity}-frontend
+        type: frontend
+        repo: {repo-name}
+```
+
+### 4. Update entity CLAUDE.md
+
+Add an Observability section so every agent session knows Sentry is required:
+
+```markdown
+## Observability
+- **Sentry**: enabled. Projects: `{entity}-backend`, `{entity}-frontend`
+- DSN: `op://entity-{id}/sentry/dsn`
+- Load `sentry-guideline` skill when adding error tracking to any new service
+- All deployable services must have Sentry integrated before first production deploy
+```
+
+### 5. Wire SDK into each service
+
+Follow the SDK Init Pattern section above. Key points:
+- Dedicated `instrument.ts` (Node) or `sentry.py` (Python) loaded before all other imports
+- DSN from environment, never hardcoded
+- Add `.env.op` entries for `SENTRY_DSN`
+
+### 6. Add background task safety nets
+
+Follow the Background Task Safety Nets section above. Both layers:
+- Global exception handler (asyncio / unhandledRejection)
+- Per-task monitored wrapper for all `create_task()` / fire-and-forget calls
+
+### 7. Enable in ALL deployment targets
+
+Every ECS service, task definition, scheduled task, Lambda — set `SENTRY_ENABLED=true`, `SENTRY_DSN`, `SENTRY_ENVIRONMENT` in each one. See Deployment Verification section.
+
+### 8. Set up daemon webhook
+
+If not already done for this entity:
+- Ensure the Sentry Internal Integration webhook points at the daemon (`POST /webhooks/sentry`)
+- Webhook secret stored in 1Password
+- Entity config has `accounts.sentry.projects` mapping so the daemon routes events correctly
+
+### 9. Verify end-to-end
+
+- [ ] Trigger a test error in each service
+- [ ] Error appears in Sentry dashboard
+- [ ] Daemon webhook fires and posts to entity's #alerts
+- [ ] Ray triage spawns (if auto-triage is configured)
+
+---
+
 ## Anti-Patterns
 
 | Anti-pattern | Why it's bad | Fix |
@@ -430,6 +605,8 @@ process.on('uncaughtException', async (err) => {
 | Never resolving issues | Kills regression detection -- new occurrences blend in | Resolve issues when fixed; Sentry reopens on regression |
 | Capturing AND re-throwing | Duplicates every error | Capture at the boundary only |
 | Hardcoded DSN in source | Credential leak, can't rotate | Use env var via 1Password |
+| Bare `create_task()` / fire-and-forget Promise | Errors silently vanish | Use `create_monitored_task()` + global exception handler |
+| `SENTRY_ENABLED` missing from deployment target | Code has SDK but runtime never initializes | Audit every ECS service, task def, Lambda — all need the env var |
 
 ---
 
