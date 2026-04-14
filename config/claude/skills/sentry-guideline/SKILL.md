@@ -497,9 +497,11 @@ Every service, scheduled task, Lambda, or worker that runs in production:
 
 | Variable | Value | Notes |
 |----------|-------|-------|
-| `SENTRY_DSN` | From 1Password | Per-project DSN |
-| `SENTRY_ENABLED` | `true` | Explicitly enable — don't rely on DSN presence alone |
+| `SENTRY_DSN` | From 1Password | Per-project DSN — SDK is inert without it |
+| `SENTRY_ENABLED` | `true` | Infrastructure-level gate (see below) |
 | `SENTRY_ENVIRONMENT` | `production` / `staging` | Filters in Sentry UI |
+
+**How SENTRY_ENABLED and SENTRY_DSN relate:** `SENTRY_ENABLED` is an infrastructure-level gate, not a code-level guard. You do **not** need an `if (SENTRY_ENABLED)` check before `Sentry.init()` — the SDK is inert when `dsn` is undefined/empty. The purpose of `SENTRY_ENABLED` is to ensure that deployment tooling (Terraform, ECS task definitions, CI pipelines) explicitly includes the DSN in each target's environment. Without it, a deployment target can silently omit `SENTRY_DSN` and nobody notices until months later. Think of it as a deployment checklist flag: if `SENTRY_ENABLED=true` is set but `SENTRY_DSN` is missing, your deployment config has a bug.
 
 ### Verification checklist
 
@@ -586,7 +588,7 @@ Every ECS service, task definition, scheduled task, Lambda — set `SENTRY_ENABL
 
 If not already done for this entity:
 - Ensure the Sentry Internal Integration webhook points at the daemon (`POST /webhooks/sentry`)
-- Webhook secret stored in 1Password
+- Webhook secret stored in 1Password: `op://entity-{id}/sentry/webhook-secret`
 - Entity config has `accounts.sentry.projects` mapping so the daemon routes events correctly
 
 ### 9. Verify end-to-end
