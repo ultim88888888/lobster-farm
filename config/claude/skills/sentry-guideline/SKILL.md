@@ -425,7 +425,7 @@ Errors inside fire-and-forget background tasks silently vanish unless explicitly
 
 ### Python (asyncio)
 
-**Layer 1: Global safety net** — catches ANY unhandled exception from ANY `create_task()` call. Set once at startup:
+**Layer 1: Global safety net** — catches ANY unhandled exception from ANY `create_task()` call. Set once at startup, inside your async entry point (where a loop is guaranteed to be running):
 
 ```python
 import sentry_sdk
@@ -436,9 +436,13 @@ def handle_task_exception(loop, context):
         logger.error("unhandled_task_exception", error=str(exception), exc_info=exception)
         sentry_sdk.capture_exception(exception)
 
-loop = asyncio.get_event_loop()
-loop.set_exception_handler(handle_task_exception)
+async def main():
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(handle_task_exception)
+    # ... rest of startup
 ```
+
+> **Note:** Use `asyncio.get_running_loop()` inside an `async def`, not `asyncio.get_event_loop()` at module level. The latter is deprecated in Python 3.10+ and can raise `RuntimeError` in 3.12+ outside the main thread.
 
 **Layer 2: Per-task wrapper** — for tasks you want structured logging and error handling on:
 
