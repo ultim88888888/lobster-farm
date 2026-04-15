@@ -896,7 +896,7 @@ Always clean up after yourself:
 
       const discord_setup = non_interactive
         ? undefined
-        : await prompt_discord(has_existing_discord_token);
+        : await prompt_discord(has_existing_discord_token, agent_names.commander);
       const github = non_interactive ? { username: "" } : await prompt_github();
 
       // ── Build TemplateVariables ──
@@ -1068,7 +1068,10 @@ Always clean up after yourself:
 
         bot_entries.push({ name: "Daemon", token: discord_setup.daemon_bot_token });
         if (discord_setup.commander_bot_token) {
-          bot_entries.push({ name: "Pat (Commander)", token: discord_setup.commander_bot_token });
+          bot_entries.push({
+            name: `${agent_names.commander} (Commander)`,
+            token: discord_setup.commander_bot_token,
+          });
         }
         for (let i = 0; i < pool_bot_tokens.length; i++) {
           bot_entries.push({ name: `LF-${String(i)}`, token: pool_bot_tokens[i]! });

@@ -63,7 +63,10 @@ export interface DiscordSetup {
 }
 
 /** Prompt for Discord setup (optional). Returns server ID + bot tokens or undefined. */
-export async function prompt_discord(existing_token?: boolean): Promise<DiscordSetup | undefined> {
+export async function prompt_discord(
+  existing_token?: boolean,
+  commander_name = "Pat",
+): Promise<DiscordSetup | undefined> {
   if (existing_token) {
     const overwrite = await p.confirm({
       message: "Discord bot tokens already configured. Update them?",
@@ -132,19 +135,12 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
   }
 
   p.note(
-    "Step 1: Go to https://discord.com/developers/applications\n" +
-      'Step 2: Click "New Application" → name it "Pat"\n' +
-      'Step 3: In the Installation tab → set Install Link to "None"\n' +
-      "Step 4: In the Bot tab:\n" +
-      '  - Uncheck "Public Bot"\n' +
-      "  - Enable all 3 Privileged Gateway Intents:\n" +
-      "    Presence Intent, Server Members Intent, Message Content Intent\n" +
-      '  - Click "Reset Token" → copy the token',
-    "Create Commander Bot (Pat)",
+    `Step 1: Go to https://discord.com/developers/applications\nStep 2: Click "New Application" → name it "${commander_name}"\nStep 3: In the Installation tab → set Install Link to "None"\nStep 4: In the Bot tab:\n  - Uncheck "Public Bot"\n  - Enable all 3 Privileged Gateway Intents:\n    Presence Intent, Server Members Intent, Message Content Intent\n  - Click "Reset Token" → copy the token`,
+    `Create Commander Bot (${commander_name})`,
   );
 
   const commander_token = await p.password({
-    message: "Commander bot token (Pat — press Enter to skip):",
+    message: `Commander bot token (${commander_name} — press Enter to skip):`,
   });
   if (p.isCancel(commander_token)) {
     p.cancel("Setup cancelled.");
