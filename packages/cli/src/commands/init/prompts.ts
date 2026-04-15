@@ -135,7 +135,14 @@ export async function prompt_discord(
   }
 
   p.note(
-    `Step 1: Go to https://discord.com/developers/applications\nStep 2: Click "New Application" → name it "${commander_name}"\nStep 3: In the Installation tab → set Install Link to "None"\nStep 4: In the Bot tab:\n  - Uncheck "Public Bot"\n  - Enable all 3 Privileged Gateway Intents:\n    Presence Intent, Server Members Intent, Message Content Intent\n  - Click "Reset Token" → copy the token`,
+    `Step 1: Go to https://discord.com/developers/applications
+Step 2: Click "New Application" → name it "${commander_name}"
+Step 3: In the Installation tab → set Install Link to "None"
+Step 4: In the Bot tab:
+  - Uncheck "Public Bot"
+  - Enable all 3 Privileged Gateway Intents:
+    Presence Intent, Server Members Intent, Message Content Intent
+  - Click "Reset Token" → copy the token`,
     `Create Commander Bot (${commander_name})`,
   );
 
