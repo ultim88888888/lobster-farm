@@ -175,8 +175,9 @@ describe("drain_pending_files (issue #278)", () => {
       "pool-1",
       expect.stringContaining(pending_file_path("pool-1")),
     );
-    // Note: unlink is now delayed (setTimeout 5s) to give Claude time to read
-    // the file — not called synchronously after send_via_tmux
+    // unlink is delayed (setTimeout 5s) to give Claude time to read the file —
+    // verify it's not called synchronously after send_via_tmux
+    expect(unlink).not.toHaveBeenCalled();
   });
 
   it("does not deliver when bot is not assigned", async () => {

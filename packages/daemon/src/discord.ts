@@ -2317,7 +2317,11 @@ export class DiscordBot extends EventEmitter {
     channel_id?: string,
   ): Promise<void> {
     const { execFileSync } = await import("node:child_process");
-    const { writeFile: writeFileAsync, unlink } = await import("node:fs/promises");
+    const {
+      access: accessAsync,
+      writeFile: writeFileAsync,
+      unlink,
+    } = await import("node:fs/promises");
     const pending_path = pending_file_path(tmux_session);
 
     try {
@@ -2346,6 +2350,18 @@ export class DiscordBot extends EventEmitter {
             /* best effort */
           }
         }
+        return;
+      }
+
+      // Guard against drain having already delivered while we were polling.
+      // drain_pending_files runs on the 30s health-check timer and may have
+      // claimed and sent the file during the ~90s readiness wait.
+      try {
+        await accessAsync(pending_path);
+      } catch {
+        console.log(
+          `[discord] Pending file already claimed by drain for ${tmux_session} — skipping bridge send`,
+        );
         return;
       }
 

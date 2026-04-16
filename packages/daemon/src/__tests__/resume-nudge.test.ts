@@ -14,6 +14,7 @@ vi.mock("node:fs/promises", async () => {
   const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
   return {
     ...actual,
+    access: vi.fn().mockResolvedValue(undefined),
     writeFile: vi.fn().mockResolvedValue(undefined),
     readFile: vi.fn().mockResolvedValue("{}"),
     readdir: vi.fn().mockResolvedValue([]),
@@ -34,7 +35,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { execFileSync } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { access, writeFile } from "node:fs/promises";
 
 // ── Test helpers ──
 
@@ -384,6 +385,66 @@ describe("resume nudge (issue #156)", () => {
         c[0] === "tmux" &&
         (c[1] as string[])[0] === "send-keys" &&
         (c[1] as string[])[2] === "pool-4",
+    );
+    expect(send_calls).toHaveLength(0);
+  });
+
+  it("skips send-keys when drain already claimed the pending file", async () => {
+    // Scenario: bridge writes the pending file, starts readiness polling.
+    // Meanwhile, drain_pending_files (health-check timer) claims and delivers
+    // the file. When bridge's readiness wait succeeds, the file is gone.
+    // Bridge should bail silently — no double-delivery.
+    const bot = make_bot({
+      id: 5,
+      state: "parked",
+      channel_id: "ch-5",
+      entity_id: "e1",
+      archetype: "planner",
+      session_id: "sess-drained",
+    });
+    pool.inject_bots([bot]);
+    pool.inject_resume_candidates([
+      {
+        id: 5,
+        state: "assigned",
+        channel_id: "ch-5",
+        entity_id: "e1",
+        archetype: "planner",
+        channel_type: null,
+        session_id: "sess-drained",
+        last_active: new Date().toISOString(),
+      },
+    ]);
+
+    // Bot becomes ready — wait_for_bot_ready_with_retries will return true
+    (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "capture-pane") {
+        return "Listening for channel messages\n❯ ";
+      }
+      return "";
+    });
+
+    // Simulate drain having already deleted the pending file:
+    // writeFile succeeds (bridge writes it), but access() fails (file gone by
+    // the time bridge checks after readiness wait completes).
+    (access as Mock).mockRejectedValue(new Error("ENOENT"));
+
+    await pool.resume_parked_bots();
+    await vi.advanceTimersByTimeAsync(25_000);
+
+    // Pending file was written (before readiness check)
+    const write_calls = (writeFile as Mock).mock.calls;
+    const nudge_call = write_calls.find((c: unknown[]) =>
+      (c[0] as string).includes("lf-pending-pool-5"),
+    );
+    expect(nudge_call).toBeDefined();
+
+    // send-keys should NOT have been called — drain already delivered
+    const send_calls = (execFileSync as Mock).mock.calls.filter(
+      (c: unknown[]) =>
+        c[0] === "tmux" &&
+        (c[1] as string[])[0] === "send-keys" &&
+        (c[1] as string[])[2] === "pool-5",
     );
     expect(send_calls).toHaveLength(0);
   });

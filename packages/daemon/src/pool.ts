@@ -2360,7 +2360,13 @@ export class BotPool extends EventEmitter {
     return false;
   }
 
-  /** Check if a bot's tmux pane shows the Claude prompt indicator (❯). */
+  /** Check if a bot's tmux pane shows the Claude prompt indicator (❯).
+   *
+   * Note: This uses a simpler check than wait_for_bot_ready (which also
+   * requires "Listening for channel messages"). The ❯ prompt is sufficient
+   * for drain — if the bot is at the prompt, it can read a file regardless
+   * of MCP plugin state. wait_for_bot_ready's stricter check is for the
+   * initial bridge path where we need the plugin connected for Discord I/O. */
   private is_at_prompt(session_name: string): boolean {
     try {
       const output = execFileSync("tmux", ["capture-pane", "-t", session_name, "-p"], {
@@ -2478,6 +2484,18 @@ export class BotPool extends EventEmitter {
         `[pool] Bot ${bot.tmux_session} not ready after all retries — resume nudge not sent`,
       );
       // pending_path stays in place for drain_pending_files to recover
+      return;
+    }
+
+    // Guard against drain having already delivered while we were polling.
+    // drain_pending_files runs on the 30s health-check timer and may have
+    // claimed and sent the file during the ~90s readiness wait.
+    try {
+      await access(pending_path);
+    } catch {
+      console.log(
+        `[pool] Pending file already claimed by drain for ${bot.tmux_session} — skipping nudge send`,
+      );
       return;
     }
 
