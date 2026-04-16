@@ -370,11 +370,13 @@ describe("resume nudge (issue #156)", () => {
     // With has-session throwing, it bails after the first 30s attempt.
     await vi.advanceTimersByTimeAsync(35_000);
 
+    // Pending file IS written (before readiness check) so drain_pending_files
+    // can recover it later if the bot becomes ready on a subsequent health tick
     const write_calls = (writeFile as Mock).mock.calls;
     const nudge_call = write_calls.find((c: unknown[]) =>
       (c[0] as string).includes("lf-pending-pool-4"),
     );
-    expect(nudge_call).toBeUndefined();
+    expect(nudge_call).toBeDefined();
 
     // send-keys should NOT have been called for this bot
     const send_calls = (execFileSync as Mock).mock.calls.filter(

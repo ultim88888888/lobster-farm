@@ -2412,8 +2412,11 @@ export class BotPool extends EventEmitter {
       try {
         const prompt = `A user messaged you earlier but the message wasn't delivered. Read ${pending_path} for their message and respond to them.`;
         this.send_via_tmux(bot.tmux_session, prompt);
-        await unlink(pending_path);
         console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+        // Delay cleanup to give Claude time to read the file after tmux send-keys
+        setTimeout(() => {
+          void unlink(pending_path).catch(() => {});
+        }, 30_000);
       } catch (err) {
         console.warn(`[pool] Failed to drain pending file for ${bot.tmux_session}: ${String(err)}`);
       }
@@ -2434,19 +2437,21 @@ export class BotPool extends EventEmitter {
       "The daemon restarted and your session was resumed. " +
       "Check where you left off and continue any in-progress work.";
 
+    // Write file first so drain_pending_files can recover it if readiness times out
+    await writeFile(pending_path, nudge, "utf-8");
+
     const ready = await wait_for_bot_ready_with_retries(bot.tmux_session);
 
     if (!ready) {
       console.log(
         `[pool] Bot ${bot.tmux_session} not ready after all retries — resume nudge not sent`,
       );
+      // pending_path stays in place for drain_pending_files to recover
       return;
     }
 
     // Small extra delay for the MCP plugin to fully connect
     await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    await writeFile(pending_path, nudge, "utf-8");
 
     // Deliver the nudge via tmux send-keys — the file alone is not enough.
     // The send-keys call injects a prompt into Claude's stdin telling it
