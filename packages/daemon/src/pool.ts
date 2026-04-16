@@ -345,6 +345,9 @@ export class BotPool extends EventEmitter {
   private assigning_channels = new Set<string>();
   /** In-flight lock: channels currently being released. Prevents double-release races. */
   private releasing_channels = new Set<string>();
+  /** In-flight lock: tmux sessions with a pending file delivery in progress.
+   * Prevents drain_pending_files from re-delivering during the 5s cleanup window. */
+  private draining_sessions = new Set<string>();
   private bot_user_ids = new Map<number, string>();
   private nickname_handler: NicknameHandler | null = null;
   private avatar_handler: AvatarHandler | null = null;
@@ -1128,6 +1131,10 @@ export class BotPool extends EventEmitter {
       this.kill_tmux(bot.tmux_session);
       this.cancel_session_watcher(bot_id);
 
+      // Clear any orphaned pending file when releasing a bot — prevents stale
+      // message content from a previous assignment leaking into a future one.
+      void unlink(pending_file_path(bot.tmux_session)).catch(() => {});
+
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
@@ -1187,6 +1194,17 @@ export class BotPool extends EventEmitter {
       this.session_history_ts.delete(key);
       console.log(`[pool] Cleared session history for ${key}`);
     }
+  }
+
+  /** Mark a tmux session as having an in-flight pending file delivery.
+   * Prevents drain_pending_files from re-delivering during the cleanup window.
+   * Returns a cleanup function that unmarks the session and deletes the file. */
+  mark_draining(tmux_session: string, pending_path: string): () => void {
+    this.draining_sessions.add(tmux_session);
+    return () => {
+      void unlink(pending_path).catch(() => {});
+      this.draining_sessions.delete(tmux_session);
+    };
   }
 
   /** Check if an assigned bot's tmux session is still alive.
@@ -1742,6 +1760,7 @@ export class BotPool extends EventEmitter {
         `[pool] Crash loop for pool-${String(bot.id)} with no channel_id — force-freeing`,
       );
       this.kill_tmux(bot.tmux_session);
+      void unlink(pending_file_path(bot.tmux_session)).catch(() => {});
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
@@ -2411,6 +2430,10 @@ export class BotPool extends EventEmitter {
         continue; // No pending file — normal case
       }
 
+      // Skip if a bridge or previous drain is already handling this session's
+      // pending file — prevents double-delivery during the 5s cleanup window.
+      if (this.draining_sessions.has(bot.tmux_session)) continue;
+
       // File exists — check if the bot is alive and ready
       if (!this.is_tmux_alive(bot.tmux_session)) continue;
       if (!this.is_at_prompt(bot.tmux_session)) continue;
@@ -2423,9 +2446,8 @@ export class BotPool extends EventEmitter {
         // Clean up shortly after — Claude has the prompt and will read it within seconds.
         // Keep this well under the 30s health-check interval to prevent self-re-delivery
         // on the next tick.
-        setTimeout(() => {
-          void unlink(pending_path).catch(() => {});
-        }, 5_000);
+        const cleanup = this.mark_draining(bot.tmux_session, pending_path);
+        setTimeout(cleanup, 5_000);
       } catch (err) {
         console.warn(`[pool] Failed to drain pending file for ${bot.tmux_session}: ${String(err)}`);
       }
@@ -2482,9 +2504,8 @@ export class BotPool extends EventEmitter {
     // Clean up shortly after — Claude has the prompt and will read it within seconds.
     // Keep this well under the 30s health-check interval to prevent drain_pending_files
     // from re-delivering the same message after Claude finishes processing.
-    setTimeout(() => {
-      void unlink(pending_path).catch(() => {});
-    }, 5_000);
+    const cleanup = this.mark_draining(bot.tmux_session, pending_path);
+    setTimeout(cleanup, 5_000);
   }
 
   /**

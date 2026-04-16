@@ -2362,11 +2362,16 @@ export class DiscordBot extends EventEmitter {
       console.log(`[discord] Bridged first message to ${tmux_session}`);
 
       // Clean up shortly after — Claude has the prompt and will read it within seconds.
-      // Keep this well under the 30s health-check interval to prevent drain_pending_files
-      // from re-delivering the same message after Claude finishes processing.
-      setTimeout(() => {
-        void unlink(pending_path).catch(() => {});
-      }, 5_000);
+      // Mark as draining to prevent drain_pending_files from re-delivering during
+      // the cleanup window.
+      if (this._pool) {
+        const cleanup = this._pool.mark_draining(tmux_session, pending_path);
+        setTimeout(cleanup, 5_000);
+      } else {
+        setTimeout(() => {
+          void unlink(pending_path).catch(() => {});
+        }, 5_000);
+      }
     } catch (err) {
       console.error(`[discord] Bridge failed: ${String(err)}`);
       sentry.captureException(err, {
