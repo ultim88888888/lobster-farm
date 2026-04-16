@@ -2413,10 +2413,12 @@ export class BotPool extends EventEmitter {
         const prompt = `A user messaged you earlier but the message wasn't delivered. Read ${pending_path} for their message and respond to them.`;
         this.send_via_tmux(bot.tmux_session, prompt);
         console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
-        // Delay cleanup to give Claude time to read the file after tmux send-keys
+        // Clean up shortly after — Claude has the prompt and will read it within seconds.
+        // Keep this well under the 30s health-check interval to prevent self-re-delivery
+        // on the next tick.
         setTimeout(() => {
           void unlink(pending_path).catch(() => {});
-        }, 30_000);
+        }, 5_000);
       } catch (err) {
         console.warn(`[pool] Failed to drain pending file for ${bot.tmux_session}: ${String(err)}`);
       }
@@ -2470,10 +2472,12 @@ export class BotPool extends EventEmitter {
 
     console.log(`[pool] Bridged resume nudge to ${bot.tmux_session}`);
 
-    // Clean up the pending file after a delay
+    // Clean up shortly after — Claude has the prompt and will read it within seconds.
+    // Keep this well under the 30s health-check interval to prevent drain_pending_files
+    // from re-delivering the same message after Claude finishes processing.
     setTimeout(() => {
       void unlink(pending_path).catch(() => {});
-    }, 30_000);
+    }, 5_000);
   }
 
   /**

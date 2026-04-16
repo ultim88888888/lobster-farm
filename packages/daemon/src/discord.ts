@@ -2336,7 +2336,7 @@ export class DiscordBot extends EventEmitter {
           try {
             await this.send(
               channel_id,
-              "Your message may not have been delivered — the bot is still starting up. Please wait a moment and resend if needed.",
+              "Your message will be delivered once the bot finishes starting up. If you don't get a response within a few minutes, please resend.",
             );
           } catch {
             /* best effort */
