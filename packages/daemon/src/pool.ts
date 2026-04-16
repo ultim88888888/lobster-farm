@@ -115,6 +115,13 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
   }
 }
 
+// ── Pending file path ──
+
+/** Canonical path for the pending-message file used by bridge and drain. */
+export function pending_file_path(tmux_session: string): string {
+  return `/tmp/lf-pending-${tmux_session}.txt`;
+}
+
 // ── Bot readiness polling ──
 
 /**
@@ -2397,7 +2404,7 @@ export class BotPool extends EventEmitter {
     for (const bot of this.bots) {
       if (bot.state !== "assigned") continue;
 
-      const pending_path = `/tmp/lf-pending-${bot.tmux_session}.txt`;
+      const pending_path = pending_file_path(bot.tmux_session);
       try {
         await access(pending_path);
       } catch {
@@ -2434,7 +2441,7 @@ export class BotPool extends EventEmitter {
    * with up to 3 attempts (~90s total coverage).
    */
   private async bridge_resume_nudge(bot: PoolBot): Promise<void> {
-    const pending_path = `/tmp/lf-pending-${bot.tmux_session}.txt`;
+    const pending_path = pending_file_path(bot.tmux_session);
     const nudge =
       "The daemon restarted and your session was resumed. " +
       "Check where you left off and continue any in-progress work.";

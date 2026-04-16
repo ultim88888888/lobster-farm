@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PoolBot } from "../pool.js";
+import { type PoolBot, pending_file_path } from "../pool.js";
 import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Mocks ──
@@ -164,7 +164,7 @@ describe("drain_pending_files (issue #278)", () => {
 
     // Pending file exists for this bot
     (access as Mock).mockImplementation(async (path: unknown) => {
-      if (path === "/tmp/lf-pending-pool-1.txt") return;
+      if (path === pending_file_path("pool-1")) return;
       throw new Error("ENOENT");
     });
 
@@ -173,9 +173,9 @@ describe("drain_pending_files (issue #278)", () => {
     // Verify delivery via tmux
     expect(mock_send_via_tmux).toHaveBeenCalledWith(
       "pool-1",
-      expect.stringContaining("/tmp/lf-pending-pool-1.txt"),
+      expect.stringContaining(pending_file_path("pool-1")),
     );
-    // Note: unlink is now delayed (setTimeout 30s) to give Claude time to read
+    // Note: unlink is now delayed (setTimeout 5s) to give Claude time to read
     // the file — not called synchronously after send_via_tmux
   });
 
@@ -206,7 +206,7 @@ describe("drain_pending_files (issue #278)", () => {
     pool.inject_bots([bot]);
 
     (access as Mock).mockImplementation(async (path: unknown) => {
-      if (path === "/tmp/lf-pending-pool-3.txt") return;
+      if (path === pending_file_path("pool-3")) return;
       throw new Error("ENOENT");
     });
     mock_is_at_prompt.mockReturnValue(false);
@@ -221,7 +221,7 @@ describe("drain_pending_files (issue #278)", () => {
         (c[1] as string).includes("lf-pending"),
     );
     expect(drain_calls).toHaveLength(0);
-    expect(unlink).not.toHaveBeenCalledWith("/tmp/lf-pending-pool-3.txt");
+    expect(unlink).not.toHaveBeenCalledWith(pending_file_path("pool-3"));
   });
 
   it("does not deliver when tmux session is dead", async () => {
@@ -236,7 +236,7 @@ describe("drain_pending_files (issue #278)", () => {
     pool.inject_bots([bot]);
 
     (access as Mock).mockImplementation(async (path: unknown) => {
-      if (path === "/tmp/lf-pending-pool-4.txt") return;
+      if (path === pending_file_path("pool-4")) return;
       throw new Error("ENOENT");
     });
     // Session dead — regular health check will try to restart, but drain won't fire
@@ -281,7 +281,7 @@ describe("drain_pending_files (issue #278)", () => {
       (c: unknown[]) => typeof c[1] === "string" && (c[1] as string).includes("lf-pending"),
     );
     expect(drain_calls).toHaveLength(0);
-    expect(unlink).not.toHaveBeenCalledWith("/tmp/lf-pending-pool-5.txt");
+    expect(unlink).not.toHaveBeenCalledWith(pending_file_path("pool-5"));
   });
 
   it("handles send_via_tmux failure gracefully", async () => {
@@ -296,7 +296,7 @@ describe("drain_pending_files (issue #278)", () => {
     pool.inject_bots([bot]);
 
     (access as Mock).mockImplementation(async (path: unknown) => {
-      if (path === "/tmp/lf-pending-pool-6.txt") return;
+      if (path === pending_file_path("pool-6")) return;
       throw new Error("ENOENT");
     });
     mock_send_via_tmux.mockImplementation(() => {

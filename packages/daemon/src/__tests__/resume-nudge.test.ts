@@ -4,7 +4,7 @@ import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PersistedPoolBot } from "../persistence.js";
-import type { PoolBot } from "../pool.js";
+import { type PoolBot, pending_file_path } from "../pool.js";
 import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Mocks ──
@@ -180,7 +180,7 @@ describe("resume nudge (issue #156)", () => {
     await vi.advanceTimersByTimeAsync(25_000);
 
     expect(writeFile).toHaveBeenCalledWith(
-      "/tmp/lf-pending-pool-3.txt",
+      pending_file_path("pool-3"),
       expect.stringContaining("daemon restarted"),
       "utf-8",
     );
@@ -188,7 +188,7 @@ describe("resume nudge (issue #156)", () => {
     // The actual delivery mechanism: tmux send-keys injects the prompt
     expect(execFileSync).toHaveBeenCalledWith(
       "tmux",
-      ["send-keys", "-t", "pool-3", expect.stringContaining("/tmp/lf-pending-pool-3.txt"), "Enter"],
+      ["send-keys", "-t", "pool-3", expect.stringContaining(pending_file_path("pool-3")), "Enter"],
       expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
     );
   });
@@ -235,7 +235,7 @@ describe("resume nudge (issue #156)", () => {
         "send-keys",
         "-t",
         "pool-0",
-        expect.stringContaining("Read /tmp/lf-pending-pool-0.txt"),
+        expect.stringContaining(`Read ${pending_file_path("pool-0")}`),
         "Enter",
       ],
       expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
@@ -269,7 +269,7 @@ describe("resume nudge (issue #156)", () => {
     await vi.advanceTimersByTimeAsync(25_000);
 
     expect(writeFile).toHaveBeenCalledWith(
-      "/tmp/lf-pending-pool-7.txt",
+      pending_file_path("pool-7"),
       expect.any(String),
       "utf-8",
     );
@@ -277,7 +277,7 @@ describe("resume nudge (issue #156)", () => {
     // send-keys targets the correct tmux session
     expect(execFileSync).toHaveBeenCalledWith(
       "tmux",
-      ["send-keys", "-t", "pool-7", expect.stringContaining("/tmp/lf-pending-pool-7.txt"), "Enter"],
+      ["send-keys", "-t", "pool-7", expect.stringContaining(pending_file_path("pool-7")), "Enter"],
       expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
     );
   });

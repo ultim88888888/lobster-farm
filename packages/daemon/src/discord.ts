@@ -33,7 +33,11 @@ import {
   type Webhook,
 } from "discord.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
-import { is_tmux_session_idle, wait_for_bot_ready_with_retries } from "./pool.js";
+import {
+  is_tmux_session_idle,
+  pending_file_path,
+  wait_for_bot_ready_with_retries,
+} from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
@@ -2314,7 +2318,7 @@ export class DiscordBot extends EventEmitter {
   ): Promise<void> {
     const { execFileSync } = await import("node:child_process");
     const { writeFile: writeFileAsync, unlink } = await import("node:fs/promises");
-    const pending_path = `/tmp/lf-pending-${tmux_session}.txt`;
+    const pending_path = pending_file_path(tmux_session);
 
     try {
       // Write the message to a file (avoids tmux escaping issues)
