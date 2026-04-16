@@ -353,7 +353,8 @@ describe("resume nudge (issue #156)", () => {
       },
     ]);
 
-    // tmux capture-pane never returns the ready indicator
+    // tmux capture-pane never returns the ready indicator.
+    // has-session throws — simulates dead session, causing early bail after first attempt.
     (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
       if (cmd === "tmux" && args[0] === "capture-pane") {
         return "Loading conversation history...";
@@ -365,7 +366,9 @@ describe("resume nudge (issue #156)", () => {
     });
 
     await pool.resume_parked_bots();
-    await vi.advanceTimersByTimeAsync(25_000);
+    // wait_for_bot_ready_with_retries uses 30s timeout per attempt (3 attempts max).
+    // With has-session throwing, it bails after the first 30s attempt.
+    await vi.advanceTimersByTimeAsync(35_000);
 
     const write_calls = (writeFile as Mock).mock.calls;
     const nudge_call = write_calls.find((c: unknown[]) =>

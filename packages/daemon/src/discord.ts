@@ -33,7 +33,7 @@ import {
   type Webhook,
 } from "discord.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
-import { is_tmux_session_idle } from "./pool.js";
+import { is_tmux_session_idle, wait_for_bot_ready_with_retries } from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
@@ -1903,6 +1903,7 @@ export class DiscordBot extends EventEmitter {
             result.tmux_session,
             message.content,
             message.author.displayName,
+            message.channelId,
           );
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
@@ -2297,11 +2298,19 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  /** Bridge a message to a freshly spawned pool bot via tmux send-keys. */
+  /**
+   * Bridge a message to a freshly spawned pool bot via tmux send-keys.
+   *
+   * Uses wait_for_bot_ready_with_retries for robust readiness detection
+   * (3 attempts, 30s each = ~90s total). If all retries fail, the pending
+   * file is left in place for the health-check drain to recover, and a
+   * fallback message is posted to the Discord channel so the user knows.
+   */
   private async bridge_first_message(
     tmux_session: string,
     content: string,
     author_name: string,
+    channel_id?: string,
   ): Promise<void> {
     const { execFileSync } = await import("node:child_process");
     const { writeFile: writeFileAsync, unlink } = await import("node:fs/promises");
@@ -2311,30 +2320,28 @@ export class DiscordBot extends EventEmitter {
       // Write the message to a file (avoids tmux escaping issues)
       await writeFileAsync(pending_path, `${author_name}: ${content}`, "utf-8");
 
-      // Wait for the bot to be ready (polling for the ❯ prompt + Listening)
-      const start = Date.now();
-      const timeout = 20000;
-      let ready = false;
-      while (Date.now() - start < timeout) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        try {
-          const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
-            encoding: "utf-8",
-            timeout: 2000,
-          });
-          if (output.includes("Listening for channel messages") && output.includes("❯")) {
-            ready = true;
-            break;
-          }
-        } catch {
-          /* ignore */
-        }
-      }
+      // Wait for the bot to be ready with retries (~90s total coverage)
+      const ready = await wait_for_bot_ready_with_retries(tmux_session);
 
       if (!ready) {
         console.log(
-          `[discord] Bot ${tmux_session} not ready after ${String(timeout)}ms — message not bridged`,
+          `[discord] Bot ${tmux_session} not ready after all retries — message not bridged`,
         );
+
+        // Pending file stays in place — health check drain_pending_files()
+        // will deliver it if the bot becomes ready later.
+
+        // Post a fallback message so the user knows something went wrong
+        if (channel_id) {
+          try {
+            await this.send(
+              channel_id,
+              "Your message may not have been delivered — the bot is still starting up. Please wait a moment and resend if needed.",
+            );
+          } catch {
+            /* best effort */
+          }
+        }
         return;
       }
 
@@ -2513,7 +2520,12 @@ export class DiscordBot extends EventEmitter {
 
       // Bridge initial context if provided
       if (context) {
-        await this.bridge_first_message(assignment.tmux_session, context, target.author_name);
+        await this.bridge_first_message(
+          assignment.tmux_session,
+          context,
+          target.author_name,
+          channel_id,
+        );
       }
     }
   }

@@ -115,6 +115,84 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
   }
 }
 
+// ── Bot readiness polling ──
+
+/**
+ * Poll a tmux pane until the Claude Code bot is ready (prompt + plugin indicators).
+ *
+ * Ready when the pane output contains "❯" OR "bypass permissions" — these indicate
+ * the Claude process is at the prompt and the MCP plugin is connected.
+ *
+ * Returns true if the bot became ready within the timeout, false otherwise.
+ */
+export async function wait_for_bot_ready(
+  tmux_session: string,
+  opts?: { timeout_ms?: number; poll_ms?: number },
+): Promise<boolean> {
+  const timeout = opts?.timeout_ms ?? 30_000;
+  const poll = opts?.poll_ms ?? 500;
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    await new Promise((resolve) => setTimeout(resolve, poll));
+    try {
+      const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+        encoding: "utf-8",
+        timeout: 2000,
+      });
+      if (
+        output.includes("Listening for channel messages") &&
+        (output.includes("❯") || output.includes("bypass permissions"))
+      ) {
+        return true;
+      }
+    } catch {
+      /* tmux pane not ready yet */
+    }
+  }
+  return false;
+}
+
+/**
+ * Wait for a bot to be ready with retries and tmux liveness checks.
+ *
+ * Calls wait_for_bot_ready up to `max_attempts` times. Between attempts,
+ * checks if the tmux session is still alive — bails early if it died.
+ *
+ * Returns true if the bot became ready, false if all attempts were exhausted
+ * or the tmux session died.
+ */
+export async function wait_for_bot_ready_with_retries(
+  tmux_session: string,
+  opts?: { timeout_ms?: number; poll_ms?: number; max_attempts?: number },
+): Promise<boolean> {
+  const max_attempts = opts?.max_attempts ?? 3;
+
+  for (let attempt = 1; attempt <= max_attempts; attempt++) {
+    const ready = await wait_for_bot_ready(tmux_session, {
+      timeout_ms: opts?.timeout_ms,
+      poll_ms: opts?.poll_ms,
+    });
+    if (ready) return true;
+
+    // Between retries, check if the tmux session is still alive
+    if (attempt < max_attempts) {
+      try {
+        execFileSync("tmux", ["has-session", "-t", tmux_session], { stdio: "ignore" });
+      } catch {
+        // Session died — no point retrying
+        console.log(`[pool] Tmux session ${tmux_session} died during readiness wait — bailing`);
+        return false;
+      }
+      console.log(
+        `[pool] Bot ${tmux_session} not ready after attempt ${String(attempt)}/${String(max_attempts)} — retrying`,
+      );
+    }
+  }
+
+  return false;
+}
+
 // ── Claude Code JSONL session tracking ──
 
 /**
@@ -1366,6 +1444,11 @@ export class BotPool extends EventEmitter {
       // Deliver any queued messages to bots that are now at the prompt
       this.drain_pending_injections();
 
+      // Safety net: recover undelivered pending files left by failed bridge attempts.
+      // If bridge_first_message or bridge_resume_nudge timed out but the bot later
+      // became ready, deliver the pending file content via tmux send-keys.
+      await this.drain_pending_files();
+
       for (const bot of this.bots) {
         if (bot.state !== "assigned") continue;
 
@@ -2302,12 +2385,48 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Safety net for failed bridge attempts.
+   *
+   * Scans assigned bots for orphaned /tmp/lf-pending-{session}.txt files.
+   * If the bot is alive and at the prompt, delivers the message via tmux
+   * send-keys and removes the file. This catches the case where
+   * bridge_first_message or bridge_resume_nudge timed out but the bot
+   * became ready later.
+   */
+  private async drain_pending_files(): Promise<void> {
+    for (const bot of this.bots) {
+      if (bot.state !== "assigned") continue;
+
+      const pending_path = `/tmp/lf-pending-${bot.tmux_session}.txt`;
+      try {
+        await access(pending_path);
+      } catch {
+        continue; // No pending file — normal case
+      }
+
+      // File exists — check if the bot is alive and ready
+      if (!this.is_tmux_alive(bot.tmux_session)) continue;
+      if (!this.is_at_prompt(bot.tmux_session)) continue;
+
+      // Bot is ready with an undelivered pending file — deliver it
+      try {
+        const prompt = `A user messaged you earlier but the message wasn't delivered. Read ${pending_path} for their message and respond to them.`;
+        this.send_via_tmux(bot.tmux_session, prompt);
+        await unlink(pending_path);
+        console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+      } catch (err) {
+        console.warn(`[pool] Failed to drain pending file for ${bot.tmux_session}: ${String(err)}`);
+      }
+    }
+  }
+
+  /**
    * Bridge a continuation nudge to a resumed bot's Claude Code process.
    * Writes a pending message file that the MCP Discord plugin picks up,
    * using the same mechanism as bridge_first_message in discord.ts.
    *
-   * Waits for the Claude process to be ready (prompt indicator visible in
-   * the tmux pane) before writing the file, so the plugin is listening.
+   * Uses wait_for_bot_ready_with_retries for robust readiness detection
+   * with up to 3 attempts (~90s total coverage).
    */
   private async bridge_resume_nudge(bot: PoolBot): Promise<void> {
     const pending_path = `/tmp/lf-pending-${bot.tmux_session}.txt`;
@@ -2315,32 +2434,11 @@ export class BotPool extends EventEmitter {
       "The daemon restarted and your session was resumed. " +
       "Check where you left off and continue any in-progress work.";
 
-    // Poll the tmux pane for the ready indicator — same pattern as
-    // bridge_first_message in discord.ts. The Claude process needs time
-    // to load history via --resume before it starts the MCP plugin.
-    const start = Date.now();
-    const timeout = 20_000;
-    let ready = false;
-
-    while (Date.now() - start < timeout) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      try {
-        const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
-          encoding: "utf-8",
-          timeout: 2000,
-        });
-        if (output.includes("Listening for channel messages") && output.includes("❯")) {
-          ready = true;
-          break;
-        }
-      } catch {
-        /* tmux pane not ready yet */
-      }
-    }
+    const ready = await wait_for_bot_ready_with_retries(bot.tmux_session);
 
     if (!ready) {
       console.log(
-        `[pool] Bot ${bot.tmux_session} not ready after ${String(timeout)}ms — resume nudge not sent`,
+        `[pool] Bot ${bot.tmux_session} not ready after all retries — resume nudge not sent`,
       );
       return;
     }
