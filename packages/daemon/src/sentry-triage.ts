@@ -25,6 +25,7 @@ import { dirname, join } from "node:path";
 import { expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
+import type { GitHubAppAuth } from "./github-app.js";
 import type { EntityRegistry } from "./registry.js";
 import { MAX_SENTRY_FIX_ATTEMPTS, build_sentry_fix_prompt } from "./review-utils.js";
 import { get_cached_issue_details } from "./sentry-alert-format.js";
@@ -46,6 +47,7 @@ export interface SentryTriageContext {
   registry: EntityRegistry;
   discord: DiscordBot | null;
   config: LobsterFarmConfig;
+  github_app: GitHubAppAuth | null;
 }
 
 // ── Sentry webhook payload shapes ──
@@ -465,6 +467,33 @@ Rules for auto_fixable:
 Do NOT attempt to fix the code yourself. Diagnose only.`;
 }
 
+// ── GitHub token resolution ──
+
+/**
+ * Resolve a GitHub App installation token for the given entity.
+ * Uses the entity's `github_app_installation_id` if configured,
+ * otherwise falls back to the default installation from env.
+ *
+ * Same pattern as pr-cron's resolve_entity_token, extracted as a
+ * standalone function since sentry-triage doesn't live in a class.
+ */
+async function resolve_gh_token(
+  github_app: GitHubAppAuth,
+  entity_id: string,
+  registry: EntityRegistry,
+): Promise<string | undefined> {
+  const entry = registry.get(entity_id);
+  const override_id = entry?.entity.accounts?.github?.github_app_installation_id;
+  try {
+    return override_id
+      ? await github_app.get_token_for_installation(override_id)
+      : await github_app.get_token();
+  } catch (err) {
+    console.warn(`[sentry-triage] Failed to resolve GH token for ${entity_id}: ${String(err)}`);
+    return undefined;
+  }
+}
+
 // ── Queue processing ──
 
 async function process_queue(ctx: SentryTriageContext): Promise<void> {
@@ -521,6 +550,15 @@ async function spawn_triage_session(
 
   const prompt = build_triage_prompt(entity_name, project_info, issue_details, action);
 
+  // Resolve GitHub token so Ray can use `gh` CLI (issue creation, PR listing)
+  let spawn_env: Record<string, string> | undefined;
+  if (ctx.github_app) {
+    const gh_token = await resolve_gh_token(ctx.github_app, entity_id, ctx.registry);
+    if (gh_token) {
+      spawn_env = { GH_TOKEN: gh_token };
+    }
+  }
+
   let session: ActiveSession;
   try {
     session = await ctx.session_manager.spawn({
@@ -532,6 +570,7 @@ async function spawn_triage_session(
       worktree_path: repo_path,
       prompt,
       interactive: false,
+      env: spawn_env,
     });
   } catch (err) {
     console.error(
@@ -693,6 +732,15 @@ async function spawn_sentry_fix(
     culprit: issue_details.culprit,
   });
 
+  // Resolve GitHub token so Bob can push branches and open PRs
+  let spawn_env: Record<string, string> | undefined;
+  if (ctx.github_app) {
+    const gh_token = await resolve_gh_token(ctx.github_app, entity_id, ctx.registry);
+    if (gh_token) {
+      spawn_env = { GH_TOKEN: gh_token };
+    }
+  }
+
   console.log(
     `[sentry-triage] Spawning Bob for Sentry fix in ${entity_id} ` +
       `(issue ${sentry_issue_id}, attempt ${String(attempt)}/${String(MAX_SENTRY_FIX_ATTEMPTS)})`,
@@ -709,6 +757,7 @@ async function spawn_sentry_fix(
       worktree_path: repo_path,
       prompt,
       interactive: false,
+      env: spawn_env,
     });
   } catch (err) {
     console.error(

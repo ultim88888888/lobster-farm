@@ -286,6 +286,7 @@ async function process_sentry_webhook(
       registry: ctx.registry,
       discord: ctx.discord,
       config: ctx.config,
+      github_app: ctx.github_app,
     };
 
     // Fire-and-forget: triage runs async; failure is caught inside

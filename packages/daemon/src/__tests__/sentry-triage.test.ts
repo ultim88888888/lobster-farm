@@ -152,6 +152,7 @@ function make_context(overrides: Partial<SentryTriageContext> = {}): SentryTriag
     registry: make_registry(),
     discord: make_discord(),
     config: make_config(),
+    github_app: null,
     ...overrides,
   };
 }
