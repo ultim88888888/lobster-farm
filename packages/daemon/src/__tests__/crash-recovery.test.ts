@@ -763,4 +763,135 @@ describe("crash recovery (issue #157)", () => {
       });
     });
   });
+
+  // ── Alert channel label resolution ──
+
+  describe("alert shows entity/channel-purpose format", () => {
+    /** Inject a mock registry so pool can resolve channel purpose from config. */
+    function inject_registry(
+      pool_instance: TestBotPool,
+      entity_id: string,
+      channels: Array<{ type: string; id: string; purpose?: string }>,
+    ): void {
+      const fake_registry = {
+        get: (eid: string) =>
+          eid === entity_id
+            ? {
+                entity: {
+                  id: entity_id,
+                  channels: { category_id: "", list: channels },
+                  secrets: {},
+                  repos: [{ path: `/tmp/test-${entity_id}` }],
+                },
+              }
+            : undefined,
+      };
+      (pool_instance as unknown as { registry: unknown }).registry = fake_registry;
+    }
+
+    it("restart alert shows entity/purpose when channel has purpose", async () => {
+      const bot = make_bot({
+        id: 5,
+        state: "assigned",
+        channel_id: "ch-workflows",
+        entity_id: "canal-street",
+        archetype: "planner",
+        session_id: "sess-1",
+      });
+      pool.inject_bots([bot]);
+      inject_registry(pool, "canal-street", [
+        { type: "work_room", id: "ch-workflows", purpose: "workflows" },
+      ]);
+
+      await pool.run_health_check();
+
+      const [, message] = mock_notify.mock.calls[0] as [string, string];
+      expect(message).toContain("canal-street/workflows");
+    });
+
+    it("restart alert falls back to channel_id when no purpose", async () => {
+      const bot = make_bot({
+        id: 5,
+        state: "assigned",
+        channel_id: "ch-unknown-123",
+        entity_id: "canal-street",
+        archetype: "planner",
+        session_id: "sess-1",
+      });
+      pool.inject_bots([bot]);
+      inject_registry(pool, "canal-street", [
+        { type: "work_room", id: "ch-unknown-123" }, // no purpose
+      ]);
+
+      await pool.run_health_check();
+
+      const [, message] = mock_notify.mock.calls[0] as [string, string];
+      expect(message).toContain("canal-street/ch-unknown-123");
+    });
+
+    it("restart alert falls back to channel_id when channel not in config", async () => {
+      const bot = make_bot({
+        id: 5,
+        state: "assigned",
+        channel_id: "ch-orphan",
+        entity_id: "canal-street",
+        archetype: "planner",
+        session_id: "sess-1",
+      });
+      pool.inject_bots([bot]);
+      inject_registry(pool, "canal-street", []); // empty channel list
+
+      await pool.run_health_check();
+
+      const [, message] = mock_notify.mock.calls[0] as [string, string];
+      expect(message).toContain("canal-street/ch-orphan");
+    });
+
+    it("crash-loop alert shows entity/purpose", async () => {
+      const bot = make_bot({
+        id: 6,
+        state: "assigned",
+        channel_id: "ch-ar-site",
+        entity_id: "canal-street",
+        archetype: "planner",
+        session_id: "sess-loop-1",
+      });
+      pool.inject_bots([bot]);
+      inject_registry(pool, "canal-street", [
+        { type: "work_room", id: "ch-ar-site", purpose: "ar-site" },
+      ]);
+
+      // Pre-populate with 3 recent crashes to trigger crash loop
+      const now = Date.now();
+      pool.get_crash_history().set(6, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
+
+      await pool.run_health_check();
+
+      const [, message] = mock_notify.mock.calls[0] as [string, string];
+      expect(message).toContain("crash loop");
+      expect(message).toContain("canal-street/ar-site");
+    });
+
+    it("crash-loop alert falls back to channel_id when no purpose", async () => {
+      const bot = make_bot({
+        id: 6,
+        state: "assigned",
+        channel_id: "ch-mystery",
+        entity_id: "canal-street",
+        archetype: "planner",
+        session_id: "sess-loop-2",
+      });
+      pool.inject_bots([bot]);
+      inject_registry(pool, "canal-street", []); // no matching channel
+
+      const now = Date.now();
+      pool.get_crash_history().set(6, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
+
+      await pool.run_health_check();
+
+      const [, message] = mock_notify.mock.calls[0] as [string, string];
+      expect(message).toContain("crash loop");
+      expect(message).toContain("canal-street/ch-mystery");
+    });
+  });
 });

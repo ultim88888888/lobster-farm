@@ -1792,10 +1792,14 @@ export class BotPool extends EventEmitter {
 
     // Alert outside the release/event flow — a notify() failure must not
     // prevent the crash_loop event or skip remaining bots in the health check.
+    const channel_label =
+      entity_config?.entity.channels.list.find((ch) => ch.id === channel_id)?.purpose ??
+      channel_id ??
+      "unknown";
     try {
       await notify(
         "alerts",
-        `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"}/${entity_config?.entity.channels.list.find((ch) => ch.id === bot.channel_id)?.purpose ?? bot.channel_id ?? "unknown"} — released. Check daemon logs.`,
+        `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"}/${channel_label} — released. Check daemon logs.`,
         entity_config,
       );
     } catch (notify_err) {
