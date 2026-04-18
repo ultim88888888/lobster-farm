@@ -13,6 +13,7 @@ export type ChannelMapping = z.infer<typeof ChannelMappingSchema>;
 export const ChannelsSchema = z
   .object({
     category_id: z.string().default(""),
+    role_id: z.string().optional(),
     list: z.array(ChannelMappingSchema).default([]),
   })
   .default({ category_id: "", list: [] });

@@ -28,6 +28,9 @@ import {
   GatewayIntentBits,
   type Guild,
   type Message,
+  OverwriteType,
+  PermissionFlagsBits,
+  type Role,
   SlashCommandBuilder,
   type TextChannel,
   type Webhook,
@@ -491,6 +494,7 @@ export class DiscordBot extends EventEmitter {
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
       ],
@@ -1694,8 +1698,78 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
+   * Find or create the "LobsterFarm Bot" role.
+   * Used by scaffold_entity and lockdown to ensure bots have a shared role.
+   */
+  async find_or_create_bot_role(guild: Guild): Promise<Role> {
+    const existing = guild.roles.cache.find((r) => r.name === "LobsterFarm Bot");
+    if (existing) return existing;
+
+    const role = await guild.roles.create({
+      name: "LobsterFarm Bot",
+      permissions: [PermissionFlagsBits.Administrator],
+      reason: "LobsterFarm bot role — grants bots access to all channels",
+    });
+    console.log(`[discord] Created "LobsterFarm Bot" role (${role.id})`);
+    return role;
+  }
+
+  /**
+   * Find or create the entity-specific Discord role.
+   * The role itself has no special permissions — it's used as a tag
+   * for category permission overrides.
+   */
+  async find_or_create_entity_role(guild: Guild, entity_id: string): Promise<Role> {
+    const existing = guild.roles.cache.find((r) => r.name === entity_id);
+    if (existing) return existing;
+
+    const role = await guild.roles.create({
+      name: entity_id,
+      reason: `LobsterFarm entity role for ${entity_id}`,
+    });
+    console.log(`[discord] Created entity role "${entity_id}" (${role.id})`);
+    return role;
+  }
+
+  /**
+   * Set permission overrides on a category so only the entity role and
+   * bot role can view channels within it. @everyone is denied ViewChannel.
+   */
+  async set_entity_category_permissions(
+    category: CategoryChannel,
+    entity_role: Role,
+    bot_role: Role,
+  ): Promise<void> {
+    const guild = category.guild;
+
+    await category.permissionOverwrites.set([
+      {
+        id: guild.roles.everyone.id,
+        type: OverwriteType.Role,
+        deny: [PermissionFlagsBits.ViewChannel],
+      },
+      {
+        id: entity_role.id,
+        type: OverwriteType.Role,
+        allow: [PermissionFlagsBits.ViewChannel],
+      },
+      {
+        id: bot_role.id,
+        type: OverwriteType.Role,
+        allow: [PermissionFlagsBits.ViewChannel],
+      },
+    ]);
+
+    console.log(
+      `[discord] Set permission overrides on category "${category.name}" ` +
+        `(entity: ${entity_role.name}, bot: ${bot_role.name})`,
+    );
+  }
+
+  /**
    * Scaffold Discord channels for a new entity.
-   * Creates a category and standard channels (general, alerts).
+   * Creates a category, standard channels (general, alerts), an entity role,
+   * and sets permission overrides so only the entity role + bot role can view.
    * Work rooms are created on demand via /room.
    * Returns the channel mappings to store in entity config.
    */
@@ -1704,13 +1778,15 @@ export class DiscordBot extends EventEmitter {
     entity_name: string,
   ): Promise<{
     category_id: string;
+    role_id: string;
     channels: Array<{ type: string; id: string; purpose: string }>;
   }> {
     const guild = await this.get_guild();
-    if (!guild) return { category_id: "", channels: [] };
+    if (!guild) return { category_id: "", role_id: "", channels: [] };
 
     const channels: Array<{ type: string; id: string; purpose: string }> = [];
     let category_id = "";
+    let role_id = "";
 
     try {
       // Create entity category
@@ -1728,6 +1804,12 @@ export class DiscordBot extends EventEmitter {
         console.log(`[discord] Created category "${category_name}"`);
       }
       category_id = category.id;
+
+      // Create entity role and bot role, set category permissions
+      const bot_role = await this.find_or_create_bot_role(guild);
+      const entity_role = await this.find_or_create_entity_role(guild, entity_id);
+      role_id = entity_role.id;
+      await this.set_entity_category_permissions(category, entity_role, bot_role);
 
       // Standard entity channels — work rooms are created on demand via /room
       const entity_channels = [
@@ -1762,7 +1844,213 @@ export class DiscordBot extends EventEmitter {
       });
     }
 
-    return { category_id, channels };
+    return { category_id, role_id, channels };
+  }
+
+  /**
+   * One-time lockdown migration.
+   *
+   * Idempotent — safe to run multiple times. For each entity:
+   * 1. Creates/finds the "LobsterFarm Bot" role, assigns to all bot members
+   * 2. Creates/finds entity roles, sets category permission overrides
+   * 3. Stores role_id in entity config
+   * 4. Locks down the GLOBAL category (Jax + bots only)
+   * 5. Locks down the failsafe channel if it exists
+   * 6. Reloads entity configs
+   */
+  async lockdown(): Promise<{
+    bot_role_id: string;
+    entities_processed: number;
+    global_locked: boolean;
+    failsafe_locked: boolean;
+    bots_assigned: number;
+  }> {
+    const guild = await this.get_guild();
+    if (!guild) {
+      throw new Error("Cannot fetch guild — Discord not connected or server_id missing");
+    }
+
+    const user_id = this.config.discord?.user_id;
+    if (!user_id) {
+      throw new Error("discord.user_id not set in config — required for global channel lockdown");
+    }
+
+    // 1. Create/find the bot role
+    const bot_role = await this.find_or_create_bot_role(guild);
+
+    // 2. Assign bot role to all bot members in the server
+    const members = await guild.members.fetch();
+    let bots_assigned = 0;
+    for (const [, member] of members) {
+      if (member.user.bot && !member.roles.cache.has(bot_role.id)) {
+        try {
+          await member.roles.add(bot_role, "LobsterFarm lockdown — assigning bot role");
+          bots_assigned++;
+          console.log(`[lockdown] Assigned bot role to ${member.user.tag}`);
+        } catch (err) {
+          // The daemon bot's own application role may be higher, causing this
+          // to fail for the bot itself. Log and continue.
+          console.warn(
+            `[lockdown] Failed to assign bot role to ${member.user.tag}: ${String(err)}`,
+          );
+        }
+      }
+    }
+    console.log(`[lockdown] Bot role assigned to ${String(bots_assigned)} new bots`);
+
+    // 3. Process each entity — create role, set category overrides, store role_id
+    let entities_processed = 0;
+    for (const entity_config of this.registry.get_all()) {
+      const entity_id = entity_config.entity.id;
+      const category_id = entity_config.entity.channels.category_id;
+      if (!category_id || !is_discord_snowflake(category_id)) {
+        console.log(`[lockdown] Skipping entity "${entity_id}" — no valid category_id`);
+        continue;
+      }
+
+      try {
+        // Find or create entity role
+        const entity_role = await this.find_or_create_entity_role(guild, entity_id);
+
+        // Fetch category channel and set overrides
+        const category = (await guild.channels.fetch(category_id)) as CategoryChannel | null;
+        if (!category || category.type !== DiscordChannelType.GuildCategory) {
+          console.warn(`[lockdown] Category ${category_id} not found for entity "${entity_id}"`);
+          continue;
+        }
+
+        await this.set_entity_category_permissions(category, entity_role, bot_role);
+
+        // Sync child channel permissions to match category
+        for (const [, child] of category.children.cache) {
+          try {
+            await child.lockPermissions();
+          } catch (err) {
+            console.warn(
+              `[lockdown] Failed to sync permissions for #${child.name}: ${String(err)}`,
+            );
+          }
+        }
+
+        // Store role_id in entity config if not already set
+        if (entity_config.entity.channels.role_id !== entity_role.id) {
+          entity_config.entity.channels.role_id = entity_role.id;
+          await this.persist_entity_config(entity_config);
+          console.log(`[lockdown] Stored role_id for entity "${entity_id}"`);
+        }
+
+        entities_processed++;
+        console.log(`[lockdown] Processed entity "${entity_id}"`);
+      } catch (err) {
+        console.error(`[lockdown] Failed to process entity "${entity_id}": ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "discord", action: "lockdown", entity: entity_id },
+        });
+      }
+    }
+
+    // 4. Lock down GLOBAL category — Jax + bots only
+    let global_locked = false;
+    try {
+      const global_category = guild.channels.cache.find(
+        (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+      ) as CategoryChannel | undefined;
+
+      if (global_category) {
+        await global_category.permissionOverwrites.set([
+          {
+            id: guild.roles.everyone.id,
+            type: OverwriteType.Role,
+            deny: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: user_id,
+            type: OverwriteType.Member,
+            allow: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: bot_role.id,
+            type: OverwriteType.Role,
+            allow: [PermissionFlagsBits.ViewChannel],
+          },
+        ]);
+
+        // Sync child channels
+        for (const [, child] of global_category.children.cache) {
+          try {
+            await child.lockPermissions();
+          } catch (err) {
+            console.warn(`[lockdown] Failed to sync GLOBAL child #${child.name}: ${String(err)}`);
+          }
+        }
+
+        global_locked = true;
+        console.log("[lockdown] GLOBAL category locked down");
+      } else {
+        console.log("[lockdown] GLOBAL category not found — skipping");
+      }
+    } catch (err) {
+      console.error(`[lockdown] Failed to lock GLOBAL category: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "lockdown_global" },
+      });
+    }
+
+    // 5. Lock down failsafe channel (may exist outside a category)
+    let failsafe_locked = false;
+    try {
+      const failsafe = guild.channels.cache.find(
+        (c) => c.name === "failsafe" && c.type === DiscordChannelType.GuildText,
+      ) as TextChannel | undefined;
+
+      if (failsafe) {
+        await failsafe.permissionOverwrites.set([
+          {
+            id: guild.roles.everyone.id,
+            type: OverwriteType.Role,
+            deny: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: user_id,
+            type: OverwriteType.Member,
+            allow: [PermissionFlagsBits.ViewChannel],
+          },
+          {
+            id: bot_role.id,
+            type: OverwriteType.Role,
+            allow: [PermissionFlagsBits.ViewChannel],
+          },
+        ]);
+
+        failsafe_locked = true;
+        console.log("[lockdown] Failsafe channel locked down");
+      } else {
+        console.log("[lockdown] Failsafe channel not found — skipping");
+      }
+    } catch (err) {
+      console.error(`[lockdown] Failed to lock failsafe channel: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "lockdown_failsafe" },
+      });
+    }
+
+    // 6. Reload entity configs and rebuild channel map
+    await this.registry.load_all();
+    this.build_channel_map();
+
+    console.log(
+      `[lockdown] Complete: ${String(entities_processed)} entities, ` +
+        `${String(bots_assigned)} bots, global=${String(global_locked)}, ` +
+        `failsafe=${String(failsafe_locked)}`,
+    );
+
+    return {
+      bot_role_id: bot_role.id,
+      entities_processed,
+      global_locked,
+      failsafe_locked,
+      bots_assigned,
+    };
   }
 
   /** Rebuild the channel → entity/type index from entity configs. */
@@ -2243,8 +2531,8 @@ export class DiscordBot extends EventEmitter {
 
       await target.reply(`Setting up entity **${entity_id}** ("${entity_name}")...`);
 
-      // 1. Create Discord channels
-      const { category_id, channels } = await this.scaffold_entity(entity_id, entity_name);
+      // 1. Create Discord channels and entity role
+      const { category_id, role_id, channels } = await this.scaffold_entity(entity_id, entity_name);
 
       // 2. Create directory structure
       const paths = this.config.paths;
@@ -2277,6 +2565,7 @@ export class DiscordBot extends EventEmitter {
           accounts: {},
           channels: {
             category_id,
+            role_id: role_id || undefined,
             list: channels,
           },
           memory: {

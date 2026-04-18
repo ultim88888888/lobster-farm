@@ -753,6 +753,23 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   json_response(res, 200, { ok: true, deleted: params.channel_id });
 };
 
+// ── Lockdown route ──
+
+const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
+  if (!ctx.discord) {
+    json_response(res, 503, { error: "Discord bot not connected" });
+    return;
+  }
+
+  try {
+    const result = await ctx.discord.lockdown();
+    json_response(res, 200, { ok: true, ...result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 500, { error: msg });
+  }
+};
+
 // ── Router ──
 
 const routes: Route[] = [
@@ -768,6 +785,7 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/pr\/watch$/, handler: handle_pr_watch },
   { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
   { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
+  { method: "POST", pattern: /^\/lockdown$/, handler: handle_lockdown },
   { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },
   { method: "POST", pattern: /^\/webhooks\/sentry$/, handler: handle_webhook_sentry },

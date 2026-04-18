@@ -183,6 +183,37 @@ describe("EntityConfigSchema", () => {
     expect(config.entity.channels.list[1]!.assigned_feature).toBe("alpha-42");
   });
 
+  it("accepts channels with role_id (#295)", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        channels: {
+          category_id: "cat-123",
+          role_id: "role-456",
+          list: [{ type: "general", id: "discord-123" }],
+        },
+      },
+    });
+    expect(config.entity.channels.category_id).toBe("cat-123");
+    expect(config.entity.channels.role_id).toBe("role-456");
+    expect(config.entity.channels.list).toHaveLength(1);
+  });
+
+  it("defaults role_id to undefined when omitted (#295)", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        channels: {
+          category_id: "cat-123",
+          list: [],
+        },
+      },
+    });
+    expect(config.entity.channels.role_id).toBeUndefined();
+  });
+
   it("accepts per-entity accounts", () => {
     const config = EntityConfigSchema.parse({
       ...MINIMAL_ENTITY,
