@@ -1958,13 +1958,15 @@ export class DiscordBot extends EventEmitter {
       }
 
       try {
-        // Find or create entity role
-        const entity_role = await this.find_or_create_entity_role(guild, entity_id);
+        // Find or create entity role — skip_fetch=true because find_or_create_bot_role
+        // already populated the role cache at the start of lockdown
+        const entity_role = await this.find_or_create_entity_role(guild, entity_id, true);
 
         // Fetch category channel and set overrides
         const category = (await guild.channels.fetch(category_id)) as CategoryChannel | null;
         if (!category || category.type !== DiscordChannelType.GuildCategory) {
           console.warn(`[lockdown] Category ${category_id} not found for entity "${entity_id}"`);
+          entities_failed++;
           continue;
         }
 
