@@ -494,6 +494,9 @@ export class DiscordBot extends EventEmitter {
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
+        // Privileged intent — requires "Server Members Intent" enabled in
+        // Discord Developer Portal (Bot → Privileged Gateway Intents).
+        // Needed for guild.members.fetch() in lockdown().
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
@@ -1861,6 +1864,7 @@ export class DiscordBot extends EventEmitter {
   async lockdown(): Promise<{
     bot_role_id: string;
     entities_processed: number;
+    entities_failed: number;
     global_locked: boolean;
     failsafe_locked: boolean;
     bots_assigned: number;
@@ -1900,6 +1904,7 @@ export class DiscordBot extends EventEmitter {
 
     // 3. Process each entity — create role, set category overrides, store role_id
     let entities_processed = 0;
+    let entities_failed = 0;
     for (const entity_config of this.registry.get_all()) {
       const entity_id = entity_config.entity.id;
       const category_id = entity_config.entity.channels.category_id;
@@ -1942,6 +1947,7 @@ export class DiscordBot extends EventEmitter {
         entities_processed++;
         console.log(`[lockdown] Processed entity "${entity_id}"`);
       } catch (err) {
+        entities_failed++;
         console.error(`[lockdown] Failed to process entity "${entity_id}": ${String(err)}`);
         sentry.captureException(err, {
           tags: { module: "discord", action: "lockdown", entity: entity_id },
@@ -2039,7 +2045,8 @@ export class DiscordBot extends EventEmitter {
     this.build_channel_map();
 
     console.log(
-      `[lockdown] Complete: ${String(entities_processed)} entities, ` +
+      `[lockdown] Complete: ${String(entities_processed)} entities processed, ` +
+        `${String(entities_failed)} failed, ` +
         `${String(bots_assigned)} bots, global=${String(global_locked)}, ` +
         `failsafe=${String(failsafe_locked)}`,
     );
@@ -2047,6 +2054,7 @@ export class DiscordBot extends EventEmitter {
     return {
       bot_role_id: bot_role.id,
       entities_processed,
+      entities_failed,
       global_locked,
       failsafe_locked,
       bots_assigned,

@@ -75,8 +75,9 @@ describe("LobsterFarmConfig discord.user_id (#295)", () => {
 });
 
 // ── Route registration test ──
-// Verifies that POST /lockdown is a registered route in the server module.
-// We import the routes indirectly by checking the module structure.
+// Pattern shape test only — validates the regex matches expected paths.
+// Actual route wiring (presence in server.ts routes[]) is verified via
+// integration testing, not unit tests.
 
 describe("POST /lockdown endpoint", () => {
   it("lockdown route pattern matches /lockdown path", () => {
