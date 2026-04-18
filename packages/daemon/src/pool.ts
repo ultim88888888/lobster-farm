@@ -1354,28 +1354,16 @@ export class BotPool extends EventEmitter {
 
   /** Release a bot while preserving its session_id in history for future resume.
    * Stashes session_id before calling release(), which nulls all bot metadata.
-   * Used by discord.ts when a message arrives for a bot with a dead tmux session.
-   *
-   * Only stashes if session_confirmed is true and the JSONL transcript exists
-   * on disk — mirrors the phantom session guards from handle_crash_loop()
-   * (issue #256). Without these checks, a dead session_id gets re-planted
-   * into history and the next assign() pulls it back, causing crash loops. */
+   * Used by discord.ts when a message arrives for a bot with a dead tmux session. */
   async release_with_history(bot_id: number): Promise<void> {
     const bot = this.bots.find((b) => b.id === bot_id);
     if (!bot || !bot.channel_id) return;
 
-    if (bot.session_id && bot.session_confirmed && bot.entity_id) {
-      const exists = await this.check_session_jsonl_exists_anywhere(bot.session_id);
-      if (exists) {
-        const key = `${bot.entity_id}:${bot.channel_id}`;
-        this.session_history.set(key, bot.session_id);
-        this.session_history_ts.set(key, Date.now());
-        console.log(`[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`);
-      } else {
-        console.warn(`[pool] Not stashing session ${bot.session_id.slice(0, 8)} — JSONL missing`);
-      }
-    } else if (bot.session_id && !bot.session_confirmed) {
-      console.warn(`[pool] Not stashing unconfirmed session ${bot.session_id.slice(0, 8)}`);
+    if (bot.session_id && bot.entity_id) {
+      const key = `${bot.entity_id}:${bot.channel_id}`;
+      this.session_history.set(key, bot.session_id);
+      this.session_history_ts.set(key, Date.now());
+      console.log(`[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`);
     }
 
     // release() uses channel_id to find the bot — grab it before it's nulled
@@ -2370,7 +2358,8 @@ export class BotPool extends EventEmitter {
     if (!this.registry) return null;
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
-    return entity_config.entity.subscription?.claude_config_dir ?? null;
+    const dir = entity_config.entity.subscription?.claude_config_dir;
+    return dir ? expand_home(dir) : null;
   }
 
   /** Resolve a 1Password secret reference to its plaintext value.

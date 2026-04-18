@@ -215,6 +215,26 @@ describe("per-entity CLAUDE_CONFIG_DIR injection — pool path", () => {
     });
   });
 
+  describe("entity WITH tilde path in subscription.claude_config_dir", () => {
+    it("expands tilde to absolute path in tmux command and spawn env", async () => {
+      const TILDE_PATH = "~/.lobsterfarm/entities/alpha/.claude-config";
+      const EXPANDED_PATH = `${process.env.HOME}/.lobsterfarm/entities/alpha/.claude-config`;
+      registry.add(make_entity_config({ id: "alpha-tilde", claude_config_dir: TILDE_PATH }));
+      pool.inject_registry(registry);
+      pool.inject_bots([make_bot({ id: 4, state: "free" })]);
+
+      await pool.assign("ch-test", "alpha-tilde", "builder", undefined, "work_room");
+
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
+      expect(tmux_call).toBeDefined();
+
+      // The resolved path should be expanded — no tilde
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.CLAUDE_CONFIG_DIR).toBe(EXPANDED_PATH);
+      expect(spawn_env.CLAUDE_CONFIG_DIR).not.toContain("~");
+    });
+  });
+
   describe("entity WITHOUT subscription.claude_config_dir", () => {
     it("does NOT include CLAUDE_CONFIG_DIR in tmux command or spawn env", async () => {
       registry.add(make_entity_config({ id: "no-sub" }));
@@ -295,6 +315,33 @@ describe("per-entity CLAUDE_CONFIG_DIR injection — session (queue) path", () =
 
       const spawn_env = claude_call.options.env as Record<string, string>;
       expect(spawn_env.CLAUDE_CONFIG_DIR).toBe(CONFIG_DIR);
+    });
+  });
+
+  describe("entity WITH tilde path in subscription.claude_config_dir", () => {
+    it("expands tilde to absolute path in spawn env", async () => {
+      const TILDE_PATH = "~/.lobsterfarm/entities/beta/.claude-config";
+      const EXPANDED_PATH = `${process.env.HOME}/.lobsterfarm/entities/beta/.claude-config`;
+      registry.add(make_entity_config({ id: "beta-tilde", claude_config_dir: TILDE_PATH }));
+      mgr.set_registry(registry);
+
+      await mgr.spawn({
+        entity_id: "beta-tilde",
+        feature_id: "review-tilde",
+        archetype: "reviewer",
+        dna: [],
+        model: { model: "sonnet", think: "standard" },
+        worktree_path: "/tmp/test-worktree",
+        prompt: "Review PR with tilde path",
+        interactive: false,
+      });
+
+      expect(spawn_calls.length).toBeGreaterThanOrEqual(1);
+      const claude_call = spawn_calls[0]!;
+
+      const spawn_env = claude_call.options.env as Record<string, string>;
+      expect(spawn_env.CLAUDE_CONFIG_DIR).toBe(EXPANDED_PATH);
+      expect(spawn_env.CLAUDE_CONFIG_DIR).not.toContain("~");
     });
   });
 

@@ -212,7 +212,8 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     if (!this.registry) return null;
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
-    return entity_config.entity.subscription?.claude_config_dir ?? null;
+    const dir = entity_config.entity.subscription?.claude_config_dir;
+    return dir ? expand_home(dir) : null;
   }
 
   /** Build the full CLI arguments for spawning a claude session. */
@@ -306,10 +307,6 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       console.log(
         `[session] Spawning session for ${options.entity_id} ` +
           `with CLAUDE_CONFIG_DIR=${claude_config_dir}`,
-      );
-    } else {
-      console.log(
-        `[session] Spawning session for ${options.entity_id} with CLAUDE_CONFIG_DIR=default (~/.claude)`,
       );
     }
 

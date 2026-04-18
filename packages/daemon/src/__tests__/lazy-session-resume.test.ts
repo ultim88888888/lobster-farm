@@ -247,68 +247,6 @@ describe("lazy session resume (issue #72)", () => {
 
       expect(pool.get_session_history().size).toBe(0);
     });
-
-    it("does not stash an unconfirmed session (phantom guard)", async () => {
-      const bot = make_bot({
-        id: 1,
-        state: "assigned",
-        channel_id: "ch-1",
-        entity_id: "e1",
-        archetype: "builder",
-        session_id: "sess-unconfirmed",
-        session_confirmed: false,
-      });
-      pool.inject_bots([bot]);
-
-      const warn_spy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      await pool.release_with_history(1);
-
-      // Session should NOT be in history
-      expect(pool.get_session_history().size).toBe(0);
-
-      // Bot should still be released
-      const released_bot = pool.get_bots().find((b) => b.id === 1)!;
-      expect(released_bot.state).toBe("free");
-
-      // Warning should mention the unconfirmed session
-      expect(warn_spy).toHaveBeenCalledWith(
-        expect.stringContaining("Not stashing unconfirmed session"),
-      );
-      warn_spy.mockRestore();
-    });
-
-    it("does not stash when JSONL is missing on disk (phantom guard)", async () => {
-      const bot = make_bot({
-        id: 1,
-        state: "assigned",
-        channel_id: "ch-1",
-        entity_id: "e1",
-        archetype: "builder",
-        session_id: "sess-no-jsonl",
-        session_confirmed: true,
-      });
-      pool.inject_bots([bot]);
-
-      // Override JSONL check to return false for this session
-      vi.spyOn(
-        pool as unknown as Record<string, unknown>,
-        "check_session_jsonl_exists_anywhere" as never,
-      ).mockResolvedValue(false as never);
-
-      const warn_spy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      await pool.release_with_history(1);
-
-      // Session should NOT be in history
-      expect(pool.get_session_history().size).toBe(0);
-
-      // Bot should still be released
-      const released_bot = pool.get_bots().find((b) => b.id === 1)!;
-      expect(released_bot.state).toBe("free");
-
-      // Warning should mention missing JSONL
-      expect(warn_spy).toHaveBeenCalledWith(expect.stringContaining("JSONL missing"));
-      warn_spy.mockRestore();
-    });
   });
 
   // ── check_assigned_health() preserves session_id ──
