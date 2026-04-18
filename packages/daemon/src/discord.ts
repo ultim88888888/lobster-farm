@@ -1711,12 +1711,12 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * Find or create the "LobsterFarm Bot" role.
+   * Find or create the "LobsterFarm Bot" role with Administrator permissions.
    * Used by scaffold_entity and lockdown to ensure bots have a shared role.
+   * @param skip_fetch - Skip the API fetch if the caller already refreshed the role cache.
    */
-  async find_or_create_bot_role(guild: Guild): Promise<Role> {
-    // Fetch fresh from API to avoid creating duplicates if role was created externally
-    await guild.roles.fetch();
+  async find_or_create_bot_role(guild: Guild, skip_fetch = false): Promise<Role> {
+    if (!skip_fetch) await guild.roles.fetch();
     const existing = guild.roles.cache.find((r) => r.name === "LobsterFarm Bot");
     if (existing) return existing;
 
@@ -1733,10 +1733,14 @@ export class DiscordBot extends EventEmitter {
    * Find or create the entity-specific Discord role.
    * The role itself has no special permissions — it's used as a tag
    * for category permission overrides.
+   * @param skip_fetch - Skip the API fetch if the caller already refreshed the role cache.
    */
-  async find_or_create_entity_role(guild: Guild, entity_id: string): Promise<Role> {
-    // Fetch fresh from API to avoid creating duplicates if role was created externally
-    await guild.roles.fetch();
+  async find_or_create_entity_role(
+    guild: Guild,
+    entity_id: string,
+    skip_fetch = false,
+  ): Promise<Role> {
+    if (!skip_fetch) await guild.roles.fetch();
     const existing = guild.roles.cache.find((r) => r.name === entity_id);
     if (existing) return existing;
 
@@ -1805,6 +1809,25 @@ export class DiscordBot extends EventEmitter {
     let category_id = "";
     let role_id = "";
 
+    // Create roles before any channels — if role creation fails (e.g., bot lacks
+    // Manage Roles permission), we fail fast before leaving an empty, unprotected category.
+    let bot_role: Role;
+    let entity_role: Role;
+    try {
+      await guild.roles.fetch();
+      bot_role = await this.find_or_create_bot_role(guild, true);
+      entity_role = await this.find_or_create_entity_role(guild, entity_id, true);
+      role_id = entity_role.id;
+    } catch (err) {
+      console.error(
+        `[discord] Role creation failed for ${entity_id} — aborting scaffold: ${String(err)}`,
+      );
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "scaffold_entity_roles", entity: entity_id },
+      });
+      return { category_id, role_id, channels };
+    }
+
     try {
       // Create entity category
       const category_name = entity_name;
@@ -1822,10 +1845,7 @@ export class DiscordBot extends EventEmitter {
       }
       category_id = category.id;
 
-      // Create entity role and bot role, set category permissions
-      const bot_role = await this.find_or_create_bot_role(guild);
-      const entity_role = await this.find_or_create_entity_role(guild, entity_id);
-      role_id = entity_role.id;
+      // Set category permissions with the already-created roles
       await this.set_entity_category_permissions(category, entity_role, bot_role);
 
       // Standard entity channels — work rooms are created on demand via /room
@@ -1891,6 +1911,11 @@ export class DiscordBot extends EventEmitter {
     const user_id = this.config.discord?.user_id;
     if (!user_id) {
       throw new Error("discord.user_id not set in config — required for global channel lockdown");
+    }
+    if (!is_discord_snowflake(user_id)) {
+      throw new Error(
+        `discord.user_id "${user_id}" is not a valid Discord snowflake — expected a 17-20 digit numeric string`,
+      );
     }
 
     // 1. Create/find the bot role
@@ -1975,8 +2000,10 @@ export class DiscordBot extends EventEmitter {
     }
 
     // 4. Lock down GLOBAL category — Jax + bots only
+    // Fetch fresh channel list to match the API-fetched approach used for entity categories
     let global_locked = false;
     try {
+      await guild.channels.fetch();
       const global_category = guild.channels.cache.find(
         (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
       ) as CategoryChannel | undefined;
