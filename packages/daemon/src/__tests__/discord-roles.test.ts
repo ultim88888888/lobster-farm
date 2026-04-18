@@ -1,6 +1,8 @@
+import type { Server } from "node:http";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { is_lf_bot } from "../discord.js";
+import { start_server } from "../server.js";
 
 // ── Schema tests ──
 
@@ -105,5 +107,90 @@ describe("is_lf_bot (#295)", () => {
     expect(is_lf_bot("Dyno")).toBe(false);
     expect(is_lf_bot("GitHub")).toBe(false);
     expect(is_lf_bot("some-random-bot")).toBe(false);
+  });
+});
+
+// ── /lockdown route guard tests (#295) ──
+
+describe("/lockdown route guards (#295)", () => {
+  let server: Server;
+  let port: number;
+
+  /** Minimal mocks — just enough to start the server and test route guards. */
+  function make_server_deps(discord: unknown = null) {
+    const registry = {
+      get_all: () => [],
+      get_active: () => [],
+      count: () => 0,
+      get: () => null,
+    } as never;
+    const config = LobsterFarmConfigSchema.parse({ user: { name: "Test" } });
+    const session_manager = { get_active: () => [] } as never;
+    const queue = {
+      get_stats: () => ({ pending: 0, active: 0, total: 0 }),
+      get_pending: () => [],
+      get_active: () => [],
+    } as never;
+    return { registry, config, session_manager, queue, discord };
+  }
+
+  async function start_test_server(discord: unknown = null): Promise<void> {
+    const deps = make_server_deps(discord);
+    // Use port 0 so the OS assigns a free port
+    server = start_server(
+      deps.registry,
+      deps.config,
+      deps.session_manager,
+      deps.queue,
+      null,
+      deps.discord as never,
+      null,
+      null,
+      null,
+      null,
+      0,
+    );
+    // Wait for listen
+    await new Promise<void>((resolve) => {
+      server.on("listening", resolve);
+    });
+    const addr = server.address();
+    port = typeof addr === "object" && addr ? addr.port : 0;
+  }
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it("returns 503 when discord is not connected", async () => {
+    await start_test_server(null);
+
+    const res = await fetch(`http://localhost:${String(port)}/lockdown`, { method: "POST" });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Discord bot not connected/);
+  });
+
+  it("returns 409 when lockdown is already in progress", async () => {
+    // Mock discord with a lockdown that never resolves (simulates long-running migration)
+    const discord = {
+      lockdown: () => new Promise<void>(() => {}), // never resolves
+    };
+
+    await start_test_server(discord);
+
+    // First request: should return 202 (accepted, fire-and-forget)
+    const first = await fetch(`http://localhost:${String(port)}/lockdown`, { method: "POST" });
+    expect(first.status).toBe(202);
+
+    // Second request while first is still in progress: should return 409
+    const second = await fetch(`http://localhost:${String(port)}/lockdown`, { method: "POST" });
+    expect(second.status).toBe(409);
+    const body = (await second.json()) as { error: string };
+    expect(body.error).toMatch(/already in progress/);
   });
 });

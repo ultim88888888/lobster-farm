@@ -757,6 +757,10 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
 
 let lockdown_in_progress = false;
 
+// Safety timeout for lockdown — if it hangs (e.g., Discord API rate-limit loop),
+// the flag resets so the endpoint isn't permanently stuck until process restart.
+const LOCKDOWN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
   if (!ctx.discord) {
     json_response(res, 503, { error: "Discord bot not connected" });
@@ -777,8 +781,11 @@ const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
     message: "Lockdown started — check daemon logs for results",
   });
 
-  void ctx.discord
-    .lockdown()
+  const timeout_promise = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error("Lockdown timed out after 5 minutes")), LOCKDOWN_TIMEOUT_MS);
+  });
+
+  void Promise.race([ctx.discord.lockdown(), timeout_promise])
     .then(
       (result) => {
         console.log("[lockdown] Completed successfully:", JSON.stringify(result));

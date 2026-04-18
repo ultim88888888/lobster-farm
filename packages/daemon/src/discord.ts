@@ -1711,12 +1711,21 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
+   * Populate the guild's role cache from the API. Call once before using
+   * find_or_create_bot_role / find_or_create_entity_role, which operate
+   * on cache only. Newly created roles are automatically added to cache
+   * by discord.js, so a single fetch at the start of a batch is sufficient.
+   */
+  async ensure_roles_cached(guild: Guild): Promise<void> {
+    await guild.roles.fetch();
+  }
+
+  /**
    * Find or create the "LobsterFarm Bot" role with Administrator permissions.
    * Used by scaffold_entity and lockdown to ensure bots have a shared role.
-   * @param skip_fetch - Skip the API fetch if the caller already refreshed the role cache.
+   * Caller must call ensure_roles_cached(guild) first.
    */
-  async find_or_create_bot_role(guild: Guild, skip_fetch = false): Promise<Role> {
-    if (!skip_fetch) await guild.roles.fetch();
+  async find_or_create_bot_role(guild: Guild): Promise<Role> {
     const existing = guild.roles.cache.find((r) => r.name === "LobsterFarm Bot");
     if (existing) return existing;
 
@@ -1733,14 +1742,9 @@ export class DiscordBot extends EventEmitter {
    * Find or create the entity-specific Discord role.
    * The role itself has no special permissions — it's used as a tag
    * for category permission overrides.
-   * @param skip_fetch - Skip the API fetch if the caller already refreshed the role cache.
+   * Caller must call ensure_roles_cached(guild) first.
    */
-  async find_or_create_entity_role(
-    guild: Guild,
-    entity_id: string,
-    skip_fetch = false,
-  ): Promise<Role> {
-    if (!skip_fetch) await guild.roles.fetch();
+  async find_or_create_entity_role(guild: Guild, entity_id: string): Promise<Role> {
     const existing = guild.roles.cache.find((r) => r.name === entity_id);
     if (existing) return existing;
 
@@ -1814,9 +1818,9 @@ export class DiscordBot extends EventEmitter {
     let bot_role: Role;
     let entity_role: Role;
     try {
-      await guild.roles.fetch();
-      bot_role = await this.find_or_create_bot_role(guild, true);
-      entity_role = await this.find_or_create_entity_role(guild, entity_id, true);
+      await this.ensure_roles_cached(guild);
+      bot_role = await this.find_or_create_bot_role(guild);
+      entity_role = await this.find_or_create_entity_role(guild, entity_id);
       role_id = entity_role.id;
     } catch (err) {
       console.error(
@@ -1827,6 +1831,11 @@ export class DiscordBot extends EventEmitter {
       });
       return { category_id, role_id, channels };
     }
+
+    // Track whether permissions were successfully set. If the category is created
+    // but permissions fail, we must clean up to avoid leaving an unprotected category
+    // visible to @everyone.
+    let permissions_set = false;
 
     try {
       // Create entity category
@@ -1845,8 +1854,10 @@ export class DiscordBot extends EventEmitter {
       }
       category_id = category.id;
 
-      // Set category permissions with the already-created roles
+      // Set category permissions — this is a fatal step. If it fails after the
+      // category exists, the entity would be scaffolded but unprotected.
       await this.set_entity_category_permissions(category, entity_role, bot_role);
+      permissions_set = true;
 
       // Standard entity channels — work rooms are created on demand via /room
       const entity_channels = [
@@ -1879,6 +1890,23 @@ export class DiscordBot extends EventEmitter {
       sentry.captureException(err, {
         tags: { module: "discord", action: "scaffold_entity", entity: entity_id },
       });
+
+      // If the category was created but permissions weren't set, delete it
+      // to avoid leaving an unprotected category visible to @everyone.
+      if (category_id && !permissions_set) {
+        try {
+          const cat = guild.channels.cache.get(category_id);
+          if (cat) {
+            await cat.delete("LobsterFarm scaffold cleanup — permission setup failed");
+            console.log(`[discord] Deleted unprotected category ${category_id} for ${entity_id}`);
+          }
+        } catch (cleanup_err) {
+          console.error(
+            `[discord] Failed to clean up unprotected category ${category_id}: ${String(cleanup_err)}`,
+          );
+        }
+        category_id = "";
+      }
     }
 
     return { category_id, role_id, channels };
@@ -1918,7 +1946,8 @@ export class DiscordBot extends EventEmitter {
       );
     }
 
-    // 1. Create/find the bot role
+    // 1. Create/find the bot role — populate cache once for the entire lockdown
+    await this.ensure_roles_cached(guild);
     const bot_role = await this.find_or_create_bot_role(guild);
 
     // 2. Assign bot role to LobsterFarm bot members only (not all bots in the server).
@@ -1958,9 +1987,9 @@ export class DiscordBot extends EventEmitter {
       }
 
       try {
-        // Find or create entity role — skip_fetch=true because find_or_create_bot_role
-        // already populated the role cache at the start of lockdown
-        const entity_role = await this.find_or_create_entity_role(guild, entity_id, true);
+        // Find or create entity role — cache was populated by ensure_roles_cached()
+        // at the start of lockdown; newly created roles are auto-added to cache.
+        const entity_role = await this.find_or_create_entity_role(guild, entity_id);
 
         // Fetch category channel and set overrides
         const category = (await guild.channels.fetch(category_id)) as CategoryChannel | null;
@@ -1972,7 +2001,8 @@ export class DiscordBot extends EventEmitter {
 
         await this.set_entity_category_permissions(category, entity_role, bot_role);
 
-        // Sync child channel permissions to match category
+        // lockPermissions() syncs the channel to inherit from the category, wiping any
+        // channel-level overrides. Safe for our setup — all LF channels should inherit.
         for (const [, child] of category.children.cache) {
           try {
             await child.lockPermissions();
@@ -2029,7 +2059,8 @@ export class DiscordBot extends EventEmitter {
           },
         ]);
 
-        // Sync child channels
+        // lockPermissions() syncs the channel to inherit from the category, wiping any
+        // channel-level overrides. Safe for our setup — all LF channels should inherit.
         for (const [, child] of global_category.children.cache) {
           try {
             await child.lockPermissions();
