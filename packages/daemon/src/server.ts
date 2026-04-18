@@ -761,13 +761,25 @@ const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
     return;
   }
 
-  try {
-    const result = await ctx.discord.lockdown();
-    json_response(res, 200, { ok: true, ...result });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    json_response(res, 500, { error: msg });
-  }
+  // Respond immediately — lockdown makes many sequential Discord API calls
+  // and may be rate-limited. Fire-and-forget; check logs for results.
+  json_response(res, 202, {
+    ok: true,
+    message: "Lockdown started — check daemon logs for results",
+  });
+
+  void ctx.discord.lockdown().then(
+    (result) => {
+      console.log("[lockdown] Completed successfully:", JSON.stringify(result));
+    },
+    (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[lockdown] Failed: ${msg}`);
+      sentry.captureException(err, {
+        tags: { module: "server", action: "lockdown" },
+      });
+    },
+  );
 };
 
 // ── Router ──

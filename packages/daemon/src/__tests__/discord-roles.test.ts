@@ -1,5 +1,6 @@
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import { describe, expect, it } from "vitest";
+import { is_lf_bot } from "../discord.js";
 
 // ── Schema tests ──
 
@@ -74,41 +75,35 @@ describe("LobsterFarmConfig discord.user_id (#295)", () => {
   });
 });
 
-// ── Route registration test ──
-// Pattern shape test only — validates the regex matches expected paths.
-// Actual route wiring (presence in server.ts routes[]) is verified via
-// integration testing, not unit tests.
+// ── is_lf_bot — ensures only LobsterFarm bots receive the Administrator role ──
 
-describe("POST /lockdown endpoint", () => {
-  it("lockdown route pattern matches /lockdown path", () => {
-    // The route is registered as: { method: "POST", pattern: /^\/lockdown$/ }
-    // Verify the pattern works correctly.
-    const pattern = /^\/lockdown$/;
-    expect(pattern.test("/lockdown")).toBe(true);
-    expect(pattern.test("/lockdown/")).toBe(false);
-    expect(pattern.test("/lockdowns")).toBe(false);
-    expect(pattern.test("/scaffold/lockdown")).toBe(false);
+describe("is_lf_bot (#295)", () => {
+  it("matches LobsterFarm pool bots (lf-0 through lf-14)", () => {
+    expect(is_lf_bot("lf-0")).toBe(true);
+    expect(is_lf_bot("lf-9")).toBe(true);
+    expect(is_lf_bot("lf-14")).toBe(true);
   });
-});
 
-// ── scaffold_entity return shape ──
+  it("matches lobsterfarm-prefixed bots", () => {
+    expect(is_lf_bot("lobsterfarm")).toBe(true);
+    expect(is_lf_bot("lobsterfarm-daemon")).toBe(true);
+    expect(is_lf_bot("LobsterFarm-Failsafe")).toBe(true);
+  });
 
-describe("scaffold_entity return value includes role_id (#295)", () => {
-  it("return type includes role_id field", () => {
-    // Verify the expected shape — this is a type/contract test.
-    // The actual Discord API calls are mocked in integration tests.
-    const result: {
-      category_id: string;
-      role_id: string;
-      channels: Array<{ type: string; id: string; purpose: string }>;
-    } = {
-      category_id: "cat-123",
-      role_id: "role-456",
-      channels: [{ type: "general", id: "ch-789", purpose: "Entity-level discussion" }],
-    };
+  it("matches lobster-farm-prefixed bots", () => {
+    expect(is_lf_bot("lobster-farm")).toBe(true);
+    expect(is_lf_bot("Lobster-Farm-Pat")).toBe(true);
+  });
 
-    expect(result.role_id).toBe("role-456");
-    expect(result.category_id).toBe("cat-123");
-    expect(result.channels).toHaveLength(1);
+  it("is case-insensitive", () => {
+    expect(is_lf_bot("LF-0")).toBe(true);
+    expect(is_lf_bot("LOBSTERFARM")).toBe(true);
+  });
+
+  it("rejects non-LobsterFarm bots", () => {
+    expect(is_lf_bot("MEE6")).toBe(false);
+    expect(is_lf_bot("Dyno")).toBe(false);
+    expect(is_lf_bot("GitHub")).toBe(false);
+    expect(is_lf_bot("some-random-bot")).toBe(false);
   });
 });

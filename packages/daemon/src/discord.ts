@@ -50,6 +50,16 @@ export function is_discord_snowflake(id: string): boolean {
   return /^\d{17,20}$/.test(id);
 }
 
+/**
+ * Check whether a Discord bot username belongs to LobsterFarm.
+ * Only LF bots should receive the Administrator-privileged "LobsterFarm Bot" role.
+ */
+const LF_BOT_USERNAME_PREFIXES = ["lf-", "lobsterfarm", "lobster-farm"];
+export function is_lf_bot(username: string): boolean {
+  const lower = username.toLowerCase();
+  return LF_BOT_USERNAME_PREFIXES.some((prefix) => lower.startsWith(prefix));
+}
+
 // ── Formatting helpers ──
 
 /** Format the duration between a start time and now as a human-readable string (e.g., "2h 14m"). */
@@ -1705,6 +1715,8 @@ export class DiscordBot extends EventEmitter {
    * Used by scaffold_entity and lockdown to ensure bots have a shared role.
    */
   async find_or_create_bot_role(guild: Guild): Promise<Role> {
+    // Fetch fresh from API to avoid creating duplicates if role was created externally
+    await guild.roles.fetch();
     const existing = guild.roles.cache.find((r) => r.name === "LobsterFarm Bot");
     if (existing) return existing;
 
@@ -1723,6 +1735,8 @@ export class DiscordBot extends EventEmitter {
    * for category permission overrides.
    */
   async find_or_create_entity_role(guild: Guild, entity_id: string): Promise<Role> {
+    // Fetch fresh from API to avoid creating duplicates if role was created externally
+    await guild.roles.fetch();
     const existing = guild.roles.cache.find((r) => r.name === entity_id);
     if (existing) return existing;
 
@@ -1882,11 +1896,16 @@ export class DiscordBot extends EventEmitter {
     // 1. Create/find the bot role
     const bot_role = await this.find_or_create_bot_role(guild);
 
-    // 2. Assign bot role to all bot members in the server
+    // 2. Assign bot role to LobsterFarm bot members only (not all bots in the server).
+    // The "LobsterFarm Bot" role carries Administrator — only our bots should have it.
     const members = await guild.members.fetch();
     let bots_assigned = 0;
     for (const [, member] of members) {
-      if (member.user.bot && !member.roles.cache.has(bot_role.id)) {
+      if (
+        member.user.bot &&
+        is_lf_bot(member.user.username) &&
+        !member.roles.cache.has(bot_role.id)
+      ) {
         try {
           await member.roles.add(bot_role, "LobsterFarm lockdown — assigning bot role");
           bots_assigned++;
