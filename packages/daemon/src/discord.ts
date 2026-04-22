@@ -1906,11 +1906,14 @@ export class DiscordBot extends EventEmitter {
   /**
    * Assign the entity role to a guild member.
    * The role must already exist in the entity config (populated by lockdown).
+   * Returns the role_id that was assigned, so callers can include it in audit
+   * logs / API responses without re-reading the entity config.
    */
-  async assign_entity_role(entity_id: string, user_id: string): Promise<void> {
+  async assign_entity_role(entity_id: string, user_id: string): Promise<string> {
     const { guild, role_id } = await this.get_entity_role_context(entity_id);
     const member = await guild.members.fetch(user_id);
     await member.roles.add(role_id, `LobsterFarm entity membership — ${entity_id}`);
+    return role_id;
   }
 
   /** Remove the entity role from a guild member. Idempotent. */

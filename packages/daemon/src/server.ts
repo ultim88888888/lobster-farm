@@ -806,8 +806,11 @@ function send_member_error(res: ServerResponse, err: unknown): void {
     json_response(res, 404, { error: "User not found in guild" });
     return;
   }
+  // Any other error from a member operation is a Discord API failure (network,
+  // rate limit, 5xx upstream, unexpected member.fetch rejection). Per spec,
+  // surface these as 502 Bad Gateway — our code is fine, the upstream isn't.
   const msg = err instanceof Error ? err.message : String(err);
-  json_response(res, 500, { error: msg });
+  json_response(res, 502, { error: `Discord API failure: ${msg}` });
 }
 
 const handle_entity_member_add: RouteHandler = async (req, res, ctx) => {
@@ -864,10 +867,13 @@ const handle_entity_member_add: RouteHandler = async (req, res, ctx) => {
       user_id = await ctx.discord.resolve_user_id(params.username!.trim());
     }
 
-    await ctx.discord.assign_entity_role(entity_id, user_id);
+    const role_id = await ctx.discord.assign_entity_role(entity_id, user_id);
+    const assigned_at = new Date().toISOString();
     const via = params.username ? ` (via username "${params.username.trim()}")` : "";
-    console.log(`[members] Assigned entity role for "${entity_id}" to ${user_id}${via}`);
-    json_response(res, 201, { ok: true, entity_id, user_id });
+    console.log(
+      `[members] ${assigned_at} — Assigned entity role for "${entity_id}" to ${user_id}${via}`,
+    );
+    json_response(res, 200, { ok: true, entity_id, user_id, role_id, assigned_at });
   } catch (err) {
     send_member_error(res, err);
   }
@@ -896,8 +902,9 @@ const handle_entity_member_remove: RouteHandler = async (req, res, ctx) => {
 
   try {
     await ctx.discord.remove_entity_role(entity_id, user_id);
-    console.log(`[members] Removed entity role for "${entity_id}" from ${user_id}`);
-    json_response(res, 200, { ok: true, entity_id, user_id });
+    const removed_at = new Date().toISOString();
+    console.log(`[members] ${removed_at} — Removed entity role for "${entity_id}" from ${user_id}`);
+    json_response(res, 200, { ok: true, entity_id, user_id, removed_at });
   } catch (err) {
     send_member_error(res, err);
   }

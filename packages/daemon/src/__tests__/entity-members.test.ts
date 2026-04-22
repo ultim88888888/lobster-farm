@@ -194,7 +194,7 @@ describe("DiscordBot.resolve_user_id (#308)", () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("DiscordBot.assign_entity_role (#308)", () => {
-  it("adds the entity role to the member", async () => {
+  it("adds the entity role to the member and returns the role_id", async () => {
     const entity = make_entity("alpha");
     const member = make_member(VALID_USER_ID, "alice");
     const { guild, add_spy } = make_guild({
@@ -202,8 +202,9 @@ describe("DiscordBot.assign_entity_role (#308)", () => {
     });
     const bot = make_bot([entity], guild);
 
-    await bot.assign_entity_role("alpha", VALID_USER_ID);
+    const role_id = await bot.assign_entity_role("alpha", VALID_USER_ID);
 
+    expect(role_id).toBe(ENTITY_ROLE_ID);
     expect(add_spy).toHaveBeenCalledTimes(1);
     expect(add_spy).toHaveBeenCalledWith(ENTITY_ROLE_ID, expect.stringContaining("alpha"));
   });
@@ -289,8 +290,8 @@ describe("POST /entities/:id/members (#308)", () => {
     }
   });
 
-  it("201 — happy path with user_id → role assigned", async () => {
-    const assign = vi.fn().mockResolvedValue(undefined);
+  it("200 — happy path with user_id → role assigned, response includes role_id + assigned_at", async () => {
+    const assign = vi.fn().mockResolvedValue(ENTITY_ROLE_ID);
     const discord = { assign_entity_role: assign, resolve_user_id: vi.fn() };
     await start([make_entity("alpha")], discord);
 
@@ -300,15 +301,23 @@ describe("POST /entities/:id/members (#308)", () => {
       body: JSON.stringify({ user_id: VALID_USER_ID }),
     });
 
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as { ok: boolean; user_id: string };
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      user_id: string;
+      role_id: string;
+      assigned_at: string;
+    };
     expect(body.ok).toBe(true);
     expect(body.user_id).toBe(VALID_USER_ID);
+    expect(body.role_id).toBe(ENTITY_ROLE_ID);
+    // ISO-8601 with milliseconds + Z suffix
+    expect(body.assigned_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
     expect(assign).toHaveBeenCalledWith("alpha", VALID_USER_ID);
   });
 
-  it("201 — happy path with username → resolved then assigned", async () => {
-    const assign = vi.fn().mockResolvedValue(undefined);
+  it("200 — happy path with username → resolved then assigned", async () => {
+    const assign = vi.fn().mockResolvedValue(ENTITY_ROLE_ID);
     const resolve = vi.fn().mockResolvedValue(VALID_USER_ID);
     const discord = { assign_entity_role: assign, resolve_user_id: resolve };
     await start([make_entity("alpha")], discord);
@@ -319,9 +328,28 @@ describe("POST /entities/:id/members (#308)", () => {
       body: JSON.stringify({ username: "alice" }),
     });
 
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { role_id: string; assigned_at: string };
+    expect(body.role_id).toBe(ENTITY_ROLE_ID);
+    expect(body.assigned_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(resolve).toHaveBeenCalledWith("alice");
     expect(assign).toHaveBeenCalledWith("alpha", VALID_USER_ID);
+  });
+
+  it("502 — Discord API failure surfaces as Bad Gateway", async () => {
+    const assign = vi.fn().mockRejectedValue(new Error("Discord API unavailable"));
+    const discord = { assign_entity_role: assign, resolve_user_id: vi.fn() };
+    await start([make_entity("alpha")], discord);
+
+    const res = await fetch(`http://localhost:${String(port)}/entities/alpha/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: VALID_USER_ID }),
+    });
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Discord API/);
   });
 
   it("404 — entity not found", async () => {
