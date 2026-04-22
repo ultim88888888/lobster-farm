@@ -1,7 +1,16 @@
 import type { Server } from "node:http";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import { afterEach, describe, expect, it } from "vitest";
-import { is_lf_bot } from "../discord.js";
+import type { EntityConfig } from "@lobster-farm/shared";
+import {
+  DiscordAPIError,
+  ChannelType as DiscordChannelType,
+  type Guild,
+  RESTJSONErrorCodes,
+  type Role,
+} from "discord.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DiscordBot, is_lf_bot } from "../discord.js";
+import type { EntityRegistry } from "../registry.js";
 import { start_server } from "../server.js";
 
 // ── Schema tests ──
@@ -265,5 +274,166 @@ describe("/lockdown route guards (#295)", () => {
     expect(second.status).toBe(409);
     const body = (await second.json()) as { error: string };
     expect(body.error).toMatch(/already in progress/);
+  });
+});
+
+// ── process_entity_lockdown — stale category handling (#303) ──
+
+describe("process_entity_lockdown stale category handling (#303)", () => {
+  const VALID_CATEGORY_ID = "111111111111111111";
+  const STALE_CATEGORY_ID = "222222222222222222";
+  const BOT_ROLE_ID = "333333333333333333";
+  const ENTITY_ROLE_ID = "444444444444444444";
+
+  function make_entity(id: string, category_id: string): EntityConfig {
+    return EntityConfigSchema.parse({
+      entity: {
+        id,
+        name: id,
+        memory: { path: `~/.lobsterfarm/entities/${id}` },
+        secrets: { vault_name: `entity-${id}` },
+        channels: {
+          category_id,
+          // Pre-set role_id so persist_entity_config is not triggered in
+          // the processed-path test (see factory below for how this works
+          // with the mocked find_or_create_entity_role).
+          role_id: ENTITY_ROLE_ID,
+          list: [],
+        },
+      },
+    });
+  }
+
+  function make_bot_role(): Role {
+    return { id: BOT_ROLE_ID, name: "LobsterFarm Bot" } as unknown as Role;
+  }
+
+  function make_bot_with_mocks(spies: {
+    fetch_category: (id: string) => Promise<unknown>;
+    find_or_create_entity_role: ReturnType<typeof vi.fn>;
+    set_permissions: ReturnType<typeof vi.fn>;
+  }): DiscordBot {
+    const config = LobsterFarmConfigSchema.parse({ user: { name: "Test" } });
+    const registry = { get_all: () => [] } as unknown as EntityRegistry;
+    const bot = new DiscordBot(config, registry);
+
+    // Override role + permission methods — these should NOT be called for the
+    // stale-category case, and they need mocks for the processed case.
+    (bot as unknown as Record<string, unknown>).find_or_create_entity_role =
+      spies.find_or_create_entity_role;
+    (bot as unknown as Record<string, unknown>).set_entity_category_permissions =
+      spies.set_permissions;
+    return bot;
+  }
+
+  /**
+   * Build a mock Guild whose channels.fetch(id) delegates to the caller-supplied
+   * resolver. Minimal surface — only what process_entity_lockdown touches.
+   */
+  function make_guild(fetch_category: (id: string) => Promise<unknown>): Guild {
+    return {
+      channels: {
+        fetch: (id: string) => fetch_category(id),
+      },
+    } as unknown as Guild;
+  }
+
+  /**
+   * Build a mock CategoryChannel with an empty children cache (no child sync work).
+   */
+  function make_category(id: string) {
+    return {
+      id,
+      name: "mock-category",
+      type: DiscordChannelType.GuildCategory,
+      children: { cache: new Map() },
+    };
+  }
+
+  it("skips entity with stale category_id — no role created, returns skipped_missing_category", async () => {
+    const entity = make_entity("alpha", STALE_CATEGORY_ID);
+    const bot_role = make_bot_role();
+
+    const find_or_create_entity_role = vi.fn();
+    const set_permissions = vi.fn();
+    const fetch_category = vi.fn(async (id: string) => {
+      if (id === STALE_CATEGORY_ID) {
+        // Emulate Discord's "Unknown Channel" response for a deleted category.
+        throw new DiscordAPIError(
+          { code: RESTJSONErrorCodes.UnknownChannel, message: "Unknown Channel" },
+          RESTJSONErrorCodes.UnknownChannel,
+          404,
+          "GET",
+          `/channels/${id}`,
+          {},
+        );
+      }
+      throw new Error(`unexpected fetch: ${id}`);
+    });
+
+    const bot = make_bot_with_mocks({
+      fetch_category,
+      find_or_create_entity_role,
+      set_permissions,
+    });
+    const guild = make_guild(fetch_category);
+
+    const result = await bot.process_entity_lockdown(guild, entity, bot_role);
+
+    expect(result.status).toBe("skipped_missing_category");
+    // Critical invariant from #303: no orphan role should be created on the guild.
+    expect(find_or_create_entity_role).not.toHaveBeenCalled();
+    expect(set_permissions).not.toHaveBeenCalled();
+    expect(fetch_category).toHaveBeenCalledWith(STALE_CATEGORY_ID);
+  });
+
+  it("processes entity with valid category — role created, permissions set (regression)", async () => {
+    const entity = make_entity("beta", VALID_CATEGORY_ID);
+    const bot_role = make_bot_role();
+    const category = make_category(VALID_CATEGORY_ID);
+
+    const entity_role = { id: ENTITY_ROLE_ID, name: "beta" } as unknown as Role;
+    const find_or_create_entity_role = vi.fn().mockResolvedValue(entity_role);
+    const set_permissions = vi.fn().mockResolvedValue(undefined);
+    const fetch_category = vi.fn(async (id: string) => {
+      if (id === VALID_CATEGORY_ID) return category;
+      throw new Error(`unexpected fetch: ${id}`);
+    });
+
+    const bot = make_bot_with_mocks({
+      fetch_category,
+      find_or_create_entity_role,
+      set_permissions,
+    });
+    const guild = make_guild(fetch_category);
+
+    const result = await bot.process_entity_lockdown(guild, entity, bot_role);
+
+    expect(result.status).toBe("processed");
+    expect(find_or_create_entity_role).toHaveBeenCalledWith(guild, "beta");
+    expect(set_permissions).toHaveBeenCalledWith(category, entity_role, bot_role);
+  });
+
+  it("skips entity with no valid category_id — no fetch attempted, no role created", async () => {
+    // category_id intentionally blank → short-circuits before any Discord call
+    const entity = make_entity("gamma", "");
+    const bot_role = make_bot_role();
+
+    const find_or_create_entity_role = vi.fn();
+    const set_permissions = vi.fn();
+    const fetch_category = vi.fn();
+
+    const bot = make_bot_with_mocks({
+      fetch_category,
+      find_or_create_entity_role,
+      set_permissions,
+    });
+    const guild = make_guild(fetch_category);
+
+    const result = await bot.process_entity_lockdown(guild, entity, bot_role);
+
+    expect(result.status).toBe("skipped_no_category_id");
+    expect(fetch_category).not.toHaveBeenCalled();
+    expect(find_or_create_entity_role).not.toHaveBeenCalled();
   });
 });

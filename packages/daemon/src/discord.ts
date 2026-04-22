@@ -6,6 +6,7 @@ import type {
   ArchetypeRole,
   ChannelMapping,
   ChannelType,
+  EntityConfig,
   LobsterFarmConfig,
 } from "@lobster-farm/shared";
 import {
@@ -23,6 +24,7 @@ import {
   type CategoryChannel,
   type ChatInputCommandInteraction,
   Client,
+  DiscordAPIError,
   ChannelType as DiscordChannelType,
   EmbedBuilder,
   GatewayIntentBits,
@@ -30,6 +32,7 @@ import {
   type Message,
   OverwriteType,
   PermissionFlagsBits,
+  RESTJSONErrorCodes,
   type Role,
   SlashCommandBuilder,
   type TextChannel,
@@ -1921,6 +1924,123 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
+   * Process a single entity during lockdown.
+   *
+   * Fetches the Discord category FIRST — if it's missing (Unknown Channel /
+   * 10003), returns `skipped_missing_category` without creating the entity
+   * role. Previously the role was created first and then orphaned on the
+   * guild when the category fetch threw (see #303).
+   *
+   * Caller must have called `ensure_roles_cached(guild)` and
+   * `find_or_create_bot_role(guild)` beforehand.
+   */
+  async process_entity_lockdown(
+    guild: Guild,
+    entity_config: EntityConfig,
+    bot_role: Role,
+  ): Promise<{
+    status: "processed" | "skipped_no_category_id" | "skipped_missing_category" | "failed";
+  }> {
+    const entity_id = entity_config.entity.id;
+    const category_id = entity_config.entity.channels.category_id;
+
+    if (!category_id || !is_discord_snowflake(category_id)) {
+      console.log(`[lockdown] Skipping entity "${entity_id}" — no valid category_id`);
+      return { status: "skipped_no_category_id" };
+    }
+
+    // Fetch the category FIRST. If Discord returns 10003 (Unknown Channel)
+    // the category was deleted out from under us — skip this entity without
+    // creating a role, so we don't leave an orphan role on the guild.
+    let category: CategoryChannel | null;
+    try {
+      category = (await guild.channels.fetch(category_id)) as CategoryChannel | null;
+    } catch (err) {
+      if (err instanceof DiscordAPIError && err.code === RESTJSONErrorCodes.UnknownChannel) {
+        console.warn(
+          `[lockdown] Skipped entity "${entity_id}" — category ${category_id} not found (stale config?). No role created. Update config or re-scaffold the entity.`,
+        );
+        return { status: "skipped_missing_category" };
+      }
+      console.error(
+        `[lockdown] Failed to fetch category for entity "${entity_id}": ${String(err)}`,
+      );
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "lockdown_fetch_category", entity: entity_id },
+      });
+      return { status: "failed" };
+    }
+
+    if (!category || category.type !== DiscordChannelType.GuildCategory) {
+      console.warn(
+        `[lockdown] Skipped entity "${entity_id}" — category ${category_id} not a guild category. No role created.`,
+      );
+      return { status: "skipped_missing_category" };
+    }
+
+    try {
+      // Only create the entity role after we've confirmed the category exists.
+      // Cache was populated by ensure_roles_cached() at the start of lockdown;
+      // newly created roles are auto-added to cache.
+      const entity_role = await this.find_or_create_entity_role(guild, entity_id);
+
+      await this.set_entity_category_permissions(category, entity_role, bot_role);
+
+      // lockPermissions() syncs the channel to inherit from the category, wiping any
+      // channel-level overrides. Safe for our setup — all LF channels should inherit.
+      for (const [, child] of category.children.cache) {
+        try {
+          await child.lockPermissions();
+        } catch (err) {
+          console.warn(`[lockdown] Failed to sync permissions for #${child.name}: ${String(err)}`);
+        }
+      }
+
+      // Store role_id in entity config if not already set
+      if (entity_config.entity.channels.role_id !== entity_role.id) {
+        entity_config.entity.channels.role_id = entity_role.id;
+        await this.persist_entity_config(entity_config);
+        console.log(`[lockdown] Stored role_id for entity "${entity_id}"`);
+      }
+
+      console.log(`[lockdown] Processed entity "${entity_id}"`);
+      return { status: "processed" };
+    } catch (err) {
+      console.error(`[lockdown] Failed to process entity "${entity_id}": ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "lockdown", entity: entity_id },
+      });
+      return { status: "failed" };
+    }
+  }
+
+  /**
+   * Surface entities that were skipped during lockdown because their Discord
+   * category was missing. Posts to #system-status — a global channel, so the
+   * notification lands even when the affected entity's own #alerts channel
+   * is also gone (usually the case when the category is deleted).
+   */
+  private async notify_missing_categories(entity_ids: string[]): Promise<void> {
+    try {
+      const channel_id = await this.find_system_status_channel();
+      if (!channel_id) {
+        console.warn(
+          `[lockdown] Cannot surface stale-category skips — #system-status not found. Entities needing attention: ${entity_ids.join(", ")}`,
+        );
+        return;
+      }
+      const list = entity_ids.map((id) => `\`${id}\``).join(", ");
+      const body = `⚠️ Lockdown skipped ${String(entity_ids.length)} entity(ies) — their configured \`category_id\` points to a category that no longer exists on the Discord server: ${list}.\nNo role was created for these entities. Update the entity config or re-scaffold to restore them.`;
+      await this.send(channel_id, body);
+    } catch (err) {
+      console.error(`[lockdown] Failed to surface stale-category skips: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "lockdown_notify_missing_categories" },
+      });
+    }
+  }
+
+  /**
    * One-time lockdown migration.
    *
    * Idempotent — safe to run multiple times. For each entity:
@@ -1935,6 +2055,8 @@ export class DiscordBot extends EventEmitter {
     bot_role_id: string;
     entities_processed: number;
     entities_failed: number;
+    /** Entity IDs whose Discord category was missing (10003 Unknown Channel). */
+    entities_skipped_missing_category: string[];
     global_locked: boolean;
     failsafe_locked: boolean;
     bots_assigned: number;
@@ -1986,60 +2108,34 @@ export class DiscordBot extends EventEmitter {
     }
     console.log(`[lockdown] Bot role assigned to ${String(bots_assigned)} new bots`);
 
-    // 3. Process each entity — create role, set category overrides, store role_id
+    // 3. Process each entity — fetch category, create role, set overrides, store role_id
     let entities_processed = 0;
     let entities_failed = 0;
+    const entities_skipped_missing_category: string[] = [];
     for (const entity_config of this.registry.get_all()) {
-      const entity_id = entity_config.entity.id;
-      const category_id = entity_config.entity.channels.category_id;
-      if (!category_id || !is_discord_snowflake(category_id)) {
-        console.log(`[lockdown] Skipping entity "${entity_id}" — no valid category_id`);
-        continue;
-      }
-
-      try {
-        // Find or create entity role — cache was populated by ensure_roles_cached()
-        // at the start of lockdown; newly created roles are auto-added to cache.
-        const entity_role = await this.find_or_create_entity_role(guild, entity_id);
-
-        // Fetch category channel and set overrides
-        const category = (await guild.channels.fetch(category_id)) as CategoryChannel | null;
-        if (!category || category.type !== DiscordChannelType.GuildCategory) {
-          console.warn(`[lockdown] Category ${category_id} not found for entity "${entity_id}"`);
+      const result = await this.process_entity_lockdown(guild, entity_config, bot_role);
+      switch (result.status) {
+        case "processed":
+          entities_processed++;
+          break;
+        case "skipped_missing_category":
+          entities_skipped_missing_category.push(entity_config.entity.id);
           entities_failed++;
-          continue;
-        }
-
-        await this.set_entity_category_permissions(category, entity_role, bot_role);
-
-        // lockPermissions() syncs the channel to inherit from the category, wiping any
-        // channel-level overrides. Safe for our setup — all LF channels should inherit.
-        for (const [, child] of category.children.cache) {
-          try {
-            await child.lockPermissions();
-          } catch (err) {
-            console.warn(
-              `[lockdown] Failed to sync permissions for #${child.name}: ${String(err)}`,
-            );
-          }
-        }
-
-        // Store role_id in entity config if not already set
-        if (entity_config.entity.channels.role_id !== entity_role.id) {
-          entity_config.entity.channels.role_id = entity_role.id;
-          await this.persist_entity_config(entity_config);
-          console.log(`[lockdown] Stored role_id for entity "${entity_id}"`);
-        }
-
-        entities_processed++;
-        console.log(`[lockdown] Processed entity "${entity_id}"`);
-      } catch (err) {
-        entities_failed++;
-        console.error(`[lockdown] Failed to process entity "${entity_id}": ${String(err)}`);
-        sentry.captureException(err, {
-          tags: { module: "discord", action: "lockdown", entity: entity_id },
-        });
+          break;
+        case "skipped_no_category_id":
+          // Intentional no-op: entity has no category configured yet (e.g. not scaffolded).
+          break;
+        case "failed":
+          entities_failed++;
+          break;
       }
+    }
+
+    // Surface stale-category skips so they don't silently rot — post to #system-status
+    // (which isn't entity-scoped) so Jax sees a single global notification even when
+    // the affected entity's own #alerts channel is also gone.
+    if (entities_skipped_missing_category.length > 0) {
+      await this.notify_missing_categories(entities_skipped_missing_category);
     }
 
     // 4. Lock down GLOBAL category — Jax + bots only
@@ -2136,7 +2232,8 @@ export class DiscordBot extends EventEmitter {
 
     console.log(
       `[lockdown] Complete: ${String(entities_processed)} entities processed, ` +
-        `${String(entities_failed)} failed, ` +
+        `${String(entities_failed)} failed ` +
+        `(${String(entities_skipped_missing_category.length)} skipped: missing category), ` +
         `${String(bots_assigned)} bots, global=${String(global_locked)}, ` +
         `failsafe=${String(failsafe_locked)}`,
     );
@@ -2145,6 +2242,7 @@ export class DiscordBot extends EventEmitter {
       bot_role_id: bot_role.id,
       entities_processed,
       entities_failed,
+      entities_skipped_missing_category,
       global_locked,
       failsafe_locked,
       bots_assigned,
