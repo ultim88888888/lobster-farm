@@ -54,6 +54,13 @@ export const LobsterFarmConfigSchema = z.object({
       bot_token_ref: z.string().optional(),
       /** The owner's Discord user ID — used for pool bot access control. */
       user_id: z.string().optional(),
+      /**
+       * Usernames of non-pool infrastructure bots (Pat, daemon, failsafe, merm).
+       * During lockdown these are assigned the "LobsterFarm Bot" role alongside
+       * the pool bots (lf-*), which would otherwise lock them out of locked
+       * channels because they don't share the pool prefix (#302).
+       */
+      infrastructure_bots: z.array(z.string()).default(["pat", "daemon", "failsafe", "merm"]),
     })
     .optional(),
 

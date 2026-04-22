@@ -53,11 +53,19 @@ export function is_discord_snowflake(id: string): boolean {
 /**
  * Check whether a Discord bot username belongs to LobsterFarm.
  * Only LF bots should receive the Administrator-privileged "LobsterFarm Bot" role.
+ *
+ * Pool bots match by prefix (`lf-*`, `lobsterfarm*`, `lobster-farm*`). Infrastructure
+ * bots (Pat, daemon, failsafe, merm) don't share a prefix with pool bots, so callers
+ * pass an `infrastructure_bots` allowlist — matched by exact username (case-insensitive)
+ * to avoid collisions with short names like "pat" accidentally matching "patrick" (#302).
  */
 const LF_BOT_USERNAME_PREFIXES = ["lf-", "lobsterfarm", "lobster-farm"];
-export function is_lf_bot(username: string): boolean {
+export function is_lf_bot(username: string, infrastructure_bots: string[] = []): boolean {
   const lower = username.toLowerCase();
-  return LF_BOT_USERNAME_PREFIXES.some((prefix) => lower.startsWith(prefix));
+  if (LF_BOT_USERNAME_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+    return true;
+  }
+  return infrastructure_bots.some((name) => name.toLowerCase() === lower);
 }
 
 // ── Formatting helpers ──
@@ -1952,12 +1960,15 @@ export class DiscordBot extends EventEmitter {
 
     // 2. Assign bot role to LobsterFarm bot members only (not all bots in the server).
     // The "LobsterFarm Bot" role carries Administrator — only our bots should have it.
+    // Infrastructure bots (Pat, daemon, failsafe, merm) don't share a prefix with pool
+    // bots, so the config-driven allowlist covers them explicitly (#302).
+    const infrastructure_bots = this.config.discord?.infrastructure_bots ?? [];
     const members = await guild.members.fetch();
     let bots_assigned = 0;
     for (const [, member] of members) {
       if (
         member.user.bot &&
-        is_lf_bot(member.user.username) &&
+        is_lf_bot(member.user.username, infrastructure_bots) &&
         !member.roles.cache.has(bot_role.id)
       ) {
         try {

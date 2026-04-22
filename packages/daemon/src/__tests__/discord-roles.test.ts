@@ -110,6 +110,79 @@ describe("is_lf_bot (#295)", () => {
   });
 });
 
+// ── is_lf_bot — infrastructure bot allowlist (#302) ──
+//
+// Pat, daemon, failsafe, and merm do not share a username prefix with pool bots,
+// so the original prefix-match check locked them out during lockdown. Callers pass
+// a config-driven allowlist of exact usernames to include alongside the prefix set.
+
+describe("is_lf_bot infrastructure allowlist (#302)", () => {
+  const INFRA = ["pat", "daemon", "failsafe", "merm"];
+
+  it("matches configured infrastructure bot names (pat)", () => {
+    expect(is_lf_bot("pat", INFRA)).toBe(true);
+  });
+
+  it("matches configured infrastructure bot names (daemon)", () => {
+    expect(is_lf_bot("daemon", INFRA)).toBe(true);
+  });
+
+  it("matches configured infrastructure bot names (failsafe)", () => {
+    expect(is_lf_bot("failsafe", INFRA)).toBe(true);
+  });
+
+  it("matches configured infrastructure bot names (merm)", () => {
+    expect(is_lf_bot("merm", INFRA)).toBe(true);
+  });
+
+  it("still matches pool bots when an allowlist is provided (regression)", () => {
+    expect(is_lf_bot("lf-3", INFRA)).toBe(true);
+  });
+
+  it("rejects random bots when an allowlist is provided (no false positives)", () => {
+    expect(is_lf_bot("random-bot", INFRA)).toBe(false);
+  });
+
+  it("uses exact match for infrastructure names to avoid prefix collisions", () => {
+    // "pat" is short — "patrick" must not match just because it starts with "pat".
+    expect(is_lf_bot("patrick", INFRA)).toBe(false);
+    expect(is_lf_bot("daemonic", INFRA)).toBe(false);
+  });
+
+  it("matches infrastructure names case-insensitively", () => {
+    expect(is_lf_bot("Pat", INFRA)).toBe(true);
+    expect(is_lf_bot("DAEMON", INFRA)).toBe(true);
+  });
+
+  it("omitting the allowlist preserves legacy prefix-only behaviour", () => {
+    expect(is_lf_bot("pat")).toBe(false);
+    expect(is_lf_bot("lf-0")).toBe(true);
+  });
+});
+
+// ── Config schema: discord.infrastructure_bots default (#302) ──
+
+describe("LobsterFarmConfig discord.infrastructure_bots (#302)", () => {
+  it("defaults to the canonical infrastructure bot list", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Test" },
+      discord: { server_id: "1485323605331017859" },
+    });
+    expect(config.discord?.infrastructure_bots).toEqual(["pat", "daemon", "failsafe", "merm"]);
+  });
+
+  it("accepts a custom infrastructure_bots list", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Test" },
+      discord: {
+        server_id: "1485323605331017859",
+        infrastructure_bots: ["pat", "daemon", "failsafe", "merm", "bouncer"],
+      },
+    });
+    expect(config.discord?.infrastructure_bots).toContain("bouncer");
+  });
+});
+
 // ── /lockdown route guard tests (#295) ──
 
 describe("/lockdown route guards (#295)", () => {
