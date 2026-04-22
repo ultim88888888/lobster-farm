@@ -10,6 +10,8 @@ Claude Code hook scripts that run before tool invocations. Registered in `~/.cla
 
 - `protect-branch.sh` -- Prevents Edit/Write operations on main/master branches. Extracts `tool_input.file_path` from stdin JSON, checks if the file is inside the current git repo, and blocks if the current branch is main or master. Fails open if not in a git repo, jq is missing, or input is malformed.
 
+- `entity-isolation.sh` -- Prevents cross-entity filesystem access for pool bot sessions. Identifies the session's self-entity from `CLAUDE_PROJECT_DIR` (or the hook input `cwd` as a fallback), enumerates sibling entities under `~/.lobsterfarm/entities/`, and blocks Bash commands or Read/Edit/Write/NotebookEdit file paths that reference another entity. Fails open for platform-level sessions (e.g., Pat) that aren't scoped to an entity, when no sibling entities exist, and when jq is missing or input is malformed. Deployed to `~/.claude/hooks/` by `lf init` and registered in `~/.claude/settings.json` with matcher `Bash|Read|Edit|Write|NotebookEdit`.
+
 ### tests/
 
 - `test-scan-bash-secrets.sh` -- Test suite for the Bash secret scanner. Exercises each pattern category with both positive (should block) and negative (should allow) cases.
@@ -17,3 +19,5 @@ Claude Code hook scripts that run before tool invocations. Registered in `~/.cla
 - `test-scan-edit-write-secrets.sh` -- Test suite for the Edit/Write secret scanner. Tests all 3 pattern categories for both Edit and Write tools, plus edge cases (empty stdin, malformed JSON, missing jq, secret in old_string only).
 
 - `test-protect-branch.sh` -- Test suite for the branch protector. Tests blocking on main/master, allowing on feature branches, files outside repo, and fail-open edge cases.
+
+- `test-entity-isolation.sh` -- Test suite for the entity isolation hook. Uses a fake `HOME` with multiple entity directories to cover same-entity allowed, cross-entity blocked (Bash + Read/Edit/Write/NotebookEdit), platform-level sessions allowed, `CLAUDE_PROJECT_DIR` vs `cwd` fallback, and fail-open edge cases (empty/malformed stdin, missing fields, missing jq).

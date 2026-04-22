@@ -126,14 +126,16 @@ export async function generate_config_files(
   // Hooks are tiny shell scripts invoked by Claude Code during lifecycle
   // events (SessionStart, PreToolUse, Stop, etc.). See generate_settings()
   // for the settings.json registration that wires them up.
-  const hooks_src = join(config_dir, "claude", "hooks");
+  const dest_hooks_dir = claude_hooks_dir(path_overrides);
+  await mkdir(dest_hooks_dir, { recursive: true });
+
+  // Lifecycle hooks (SessionStart etc.) live in config/claude/hooks/.
+  const lifecycle_hooks_src = join(config_dir, "claude", "hooks");
   try {
-    const hook_entries = await readdir(hooks_src, { withFileTypes: true });
-    const dest_hooks_dir = claude_hooks_dir(path_overrides);
-    await mkdir(dest_hooks_dir, { recursive: true });
+    const hook_entries = await readdir(lifecycle_hooks_src, { withFileTypes: true });
     for (const entry of hook_entries) {
       if (!entry.isFile()) continue;
-      const src_file = join(hooks_src, entry.name);
+      const src_file = join(lifecycle_hooks_src, entry.name);
       const dest_file = join(dest_hooks_dir, entry.name);
       await copyFile(src_file, dest_file);
       // Preserve executability — copyFile doesn't always carry perms across
@@ -147,15 +149,38 @@ export async function generate_config_files(
     // hooks directory might not exist — not fatal
   }
 
+  // PreToolUse guard hooks live in config/hooks/ (alongside their tests).
+  // We deploy entity-isolation.sh here because generate_settings() references
+  // it by absolute path in ~/.claude/settings.json — without the file, the
+  // hook call errors out on every tool invocation. Other scripts in
+  // config/hooks/ are currently wired inline in generate_settings() and don't
+  // need deployment yet; add them to this list as they're migrated to
+  // file-based registration.
+  const guard_hooks_src = join(config_dir, "hooks");
+  const guard_hook_files = ["entity-isolation.sh"];
+  for (const name of guard_hook_files) {
+    try {
+      const src_file = join(guard_hooks_src, name);
+      const dest_file = join(dest_hooks_dir, name);
+      await copyFile(src_file, dest_file);
+      await chmod(dest_file, 0o755);
+      created.push(dest_file);
+    } catch {
+      // Missing guard hook script — not fatal. The inline fallback (if any)
+      // in generate_settings() will still protect the session.
+    }
+  }
+
   return created;
 }
 
 /** Generate the ~/.claude/settings.json with bypass permissions and hooks. */
 export async function generate_settings(path_overrides?: Partial<PathConfig>): Promise<string> {
-  // Absolute path to the deployed SessionStart hook. We use an absolute path
-  // rather than relying on $HOME expansion because Claude Code's hook runner
-  // doesn't guarantee a shell wrapper.
+  // Absolute paths to deployed hook scripts. We use absolute paths rather than
+  // relying on $HOME expansion because Claude Code's hook runner doesn't
+  // guarantee a shell wrapper.
   const session_start_hook = join(claude_hooks_dir(path_overrides), "session-start-inject.sh");
+  const entity_isolation_hook = join(claude_hooks_dir(path_overrides), "entity-isolation.sh");
 
   const settings = {
     permissions: {
@@ -198,6 +223,22 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
               type: "command",
               command:
                 'bash -c \'if echo "$TOOL_INPUT" | grep -qiE "(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)"; then echo "BLOCK: Detected potential hardcoded secret in tool input." >&2; exit 2; fi\'',
+            },
+          ],
+        },
+        {
+          // Entity isolation — pool bots run with bypassPermissions and would
+          // otherwise be able to read any entity's files on disk. This hook
+          // blocks reads/writes/bash against sibling entities under
+          // ~/.lobsterfarm/entities/<other>/ when a session is scoped to a
+          // specific entity. Deployed by generate_config_files() from
+          // config/hooks/entity-isolation.sh.
+          matcher: "Bash|Read|Edit|Write|NotebookEdit",
+          hooks: [
+            {
+              type: "command",
+              command: `bash ${entity_isolation_hook}`,
+              timeout: 5,
             },
           ],
         },
