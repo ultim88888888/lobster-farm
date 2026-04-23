@@ -362,6 +362,15 @@ async function process_sentry_webhook(
         await ctx.discord.send_to_entity(first_active.entity.id, "alerts", alert_message, "system");
       }
     }
+  } else if (ctx.alert_router && !effective_entity_id && !is_triage_worthy) {
+    // Alert router is configured but there's no entity to route to (no active
+    // entities in the registry and no target_entity_id on the event). The
+    // previous implementation broadcast to all entities via send_to_all here,
+    // which was noisy; the intentional silence replaces it. Logging makes the
+    // drop observable so operators can diagnose "why didn't I see that alert?".
+    console.warn(
+      `[sentry-webhook] Dropping non-triage event — no effective entity_id (resource=${resource}, action=${action ?? "unknown"}, title=${error_title})`,
+    );
   }
 
   console.log(`[sentry-webhook] Processed: ${resource}.${action ?? "unknown"} — ${error_title}`);
