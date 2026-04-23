@@ -1253,6 +1253,30 @@ describe("thread-based alerts — ingress", () => {
     expect(payload.body).toContain("received");
   });
 
+  it("triaging posts 🔍 thread update after session spawns", async () => {
+    const ctx = make_context();
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+
+    await handle_sentry_triage_event("ISSUE-TRIAGING", "test-backend", "created", ctx);
+    // Allow the async post_alert in spawn_triage_session (fire-and-forget) to flush.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const triaging_update = alert_router.post_alert.mock.calls.find((c) => {
+      const p = c[0] as { tier: string; body: string };
+      return p.tier === "incident_update" && p.body.includes("Triage session started");
+    });
+    expect(triaging_update).toBeDefined();
+    const payload = triaging_update![0] as {
+      tier: string;
+      incident_id: string;
+      body: string;
+    };
+    expect(payload.incident_id).toBe("thread-200");
+    expect(payload.body).toContain("\u{1f50d}");
+  });
+
   it("persists thread_id on triage state after ingress", async () => {
     const config = make_config();
     const ctx = make_context({ config });

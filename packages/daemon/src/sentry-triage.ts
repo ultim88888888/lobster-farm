@@ -35,6 +35,7 @@ import {
   format_incident_open_body,
   format_no_verdict_body,
   format_session_failed_body,
+  format_triaging_body,
   format_verdict_body,
   get_cached_issue_details,
   truncate_title,
@@ -570,6 +571,27 @@ async function spawn_triage_session(
     project_slug: project_info.slug,
     error_title: issue_details.title,
   });
+
+  // Post "triaging" update into the incident thread (#310).
+  // Mirrors the format_fix_spawned_body pattern in spawn_sentry_fix — read the
+  // thread_id set by open_incident_for_triage and post an incident_update.
+  if (ctx.alert_router) {
+    const { triages } = await load_triage_state(ctx.config);
+    const thread_id = triages[sentry_issue_id]?.thread_id;
+    if (thread_id) {
+      void ctx.alert_router
+        .post_alert({
+          entity_id,
+          tier: "incident_update",
+          incident_id: thread_id,
+          title: "",
+          body: format_triaging_body(),
+        })
+        .catch((err) => {
+          console.error(`[sentry-triage] Failed to post triaging update: ${String(err)}`);
+        });
+    }
+  }
 
   // ── Post-session listeners ──
 
