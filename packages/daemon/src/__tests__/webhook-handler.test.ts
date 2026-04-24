@@ -1533,7 +1533,7 @@ describe("handle_github_webhook", () => {
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       const prompt: string = spawn_args.prompt;
 
-      expect(prompt).toContain("Before posting, check for any existing reviews");
+      expect(prompt).toContain("Before posting, check for any existing bot reviews");
       expect(prompt).toContain('select(.user.login | endswith("[bot]"))');
       expect(prompt).toContain("gh api repos/test-org/lobster-farm/pulls/300/reviews");
     });
@@ -1797,6 +1797,82 @@ describe("handle_github_webhook", () => {
       it("does not include the linked-issue context section", () => {
         expect(prompt).not.toContain("## Linked Issue Context");
       });
+    });
+  });
+
+  // Regression: reviewer skips re-review after fix commits because its
+  // "skip if existing review" check is SHA-agnostic. A CHANGES_REQUESTED
+  // review on a superseded commit should NOT block a fresh review on the
+  // current head SHA. See issue #314, PR #311 as the triggering incident.
+  describe("build_reviewer_prompt SHA-aware skip logic (issue #314)", () => {
+    const make_pr_with_sha = (sha: string) => ({
+      number: 42,
+      title: "Test PR",
+      head: { ref: "feature/test", sha },
+      body: null,
+      user: { login: "testuser" },
+    });
+
+    it("includes the current PR head SHA in the rendered prompt", () => {
+      const sha = "00a22aff1234567890abcdef1234567890abcdef";
+      const prompt = build_reviewer_prompt(
+        make_pr_with_sha(sha),
+        "/tmp/repo",
+        "test-org/test-repo",
+        "",
+      );
+
+      expect(prompt).toContain(sha);
+    });
+
+    it("scopes the 'skip if review exists' instruction to the current head SHA", () => {
+      const sha = "00a22aff1234567890abcdef1234567890abcdef";
+      const prompt = build_reviewer_prompt(
+        make_pr_with_sha(sha),
+        "/tmp/repo",
+        "test-org/test-repo",
+        "",
+      );
+
+      // The instruction must tie the skip decision to the current head SHA.
+      // Prior reviews on older commits must be treated as stale.
+      expect(prompt).toMatch(/current head SHA/i);
+      expect(prompt.toLowerCase()).toContain("stale");
+      // The exact SHA must appear in the skip-instruction context.
+      expect(prompt).toContain(sha);
+    });
+
+    it("includes commit_id in the pre-existing-review jq query", () => {
+      const prompt = build_reviewer_prompt(
+        make_pr_with_sha("abc123"),
+        "/tmp/repo",
+        "test-org/test-repo",
+        "",
+      );
+
+      // The jq query must select commit_id so the reviewer can compare it
+      // to the current head SHA. Without this, there's no way to tell
+      // a stale review apart from a live one.
+      expect(prompt).toContain("commit_id");
+      // And the commit_id must appear in the reviews-API jq context, not
+      // just as a stray mention elsewhere.
+      expect(prompt).toMatch(/gh api repos\/[^\s]+\/reviews[^\n]*commit_id/);
+    });
+
+    it("does not instruct the reviewer to post review outcomes via `gh pr comment`", () => {
+      const prompt = build_reviewer_prompt(
+        make_pr_with_sha("abc123"),
+        "/tmp/repo",
+        "test-org/test-repo",
+        "## Acceptance Criteria\n- [ ] Do thing",
+      );
+
+      // Formal review states (approve / request-changes / comment as a
+      // review state) are posted via `gh pr review`. A plain `gh pr comment`
+      // is a PR comment, NOT a formal review — it does not update
+      // reviewDecision and does not unblock auto-merge. The #311 "Round 2
+      // Approved" plain-comment anomaly must not be reintroduced.
+      expect(prompt).not.toContain("gh pr comment");
     });
   });
 });

@@ -1490,18 +1490,42 @@ export function build_reviewer_prompt(
   issue_context: string,
 ): string {
   const pr_num = String(pr.number);
+  const head_sha = pr.head.sha;
   const has_issue = issue_context.length > 0;
 
   // Header + linked issue context FIRST, so the reviewer reads the spec before
   // being told what to do with it.
+  //
+  // The pre-existing-review check is SHA-aware (see #314). Prior buggy
+  // behavior: the skip test ignored commit_id, so when fix commits pushed and
+  // a new reviewer session spawned, it saw the stale CHANGES_REQUESTED review
+  // on the OLD commit and exited silently — never posting a fresh review on
+  // the new head. Fix: scope the skip to reviews whose commit_id matches the
+  // current head SHA. Reviews on superseded commits are stale and must not
+  // block a fresh review.
   const lines: string[] = [
     `Review PR #${pr_num}: "${pr.title}" on branch ${pr.head.ref}.`,
     `Repository: ${repo_path}`,
+    `Current head SHA: ${head_sha}`,
     "",
-    "Before posting, check for any existing reviews you've already posted:",
-    `  gh api repos/${repo_full_name}/pulls/${pr_num}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | { count: length, reviews: map({state, submitted_at}) }'`,
-    "If a review already exists with state APPROVED or CHANGES_REQUESTED, skip posting",
-    "and go directly to the merge step (if approved) or stop (if changes requested).",
+    "Before posting, check for any existing bot reviews AND their commit_id:",
+    `  gh api repos/${repo_full_name}/pulls/${pr_num}/reviews --jq '[.[] | select(.user.login | endswith("[bot]")) | {state, submitted_at, commit_id}]'`,
+    "",
+    `Skip posting ONLY if a review already exists with state APPROVED or CHANGES_REQUESTED on the current head SHA: ${head_sha}.`,
+    "If prior reviews exist only on older commits, treat them as stale and",
+    "proceed with a fresh formal review on the current head. A CHANGES_REQUESTED",
+    "review on a superseded commit does NOT block a fresh review — the builder",
+    "has since pushed fix commits and the new head must be re-evaluated.",
+    "",
+    "When you DO post, use a FORMAL review state via `gh pr review` ONLY:",
+    `  gh pr review ${pr_num} --approve --body "<body>"`,
+    `  gh pr review ${pr_num} --request-changes --body "<body>"`,
+    `  gh pr review ${pr_num} --comment --body "<body>"`,
+    "Formal review states update reviewDecision and drive auto-merge. Plain PR",
+    "comments do NOT — they are invisible to the merge gate. Never substitute a",
+    "plain comment for a formal review state, even if a prior review already",
+    "exists and you are 'just adding a note'. If you have something to say about",
+    "the PR, say it via `gh pr review`.",
     "",
   ];
 
