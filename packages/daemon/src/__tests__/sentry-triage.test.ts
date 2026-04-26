@@ -892,6 +892,175 @@ describe("parse_triage_verdict", () => {
   it("returns null for empty output_lines", () => {
     expect(parse_triage_verdict([])).toBeNull();
   });
+
+  // ── Stream-JSON parsing (#316) ──
+  //
+  // The Claude CLI is invoked with --output-format stream-json (session.ts:212),
+  // so each captured line is a JSON event such as:
+  //   {"type":"assistant","message":{"content":[{"type":"text","text":"...verdict..."}]}}
+  // The verdict marker lives inside the .message.content[].text field where
+  // double quotes are escaped (\"). Plain indexOf-then-JSON.parse on the raw
+  // line picks up the marker but tries to parse the still-escaped tail as JSON
+  // and silently fails. The parser must first decode the stream-json envelope
+  // then search the unescaped text.
+
+  it("parses verdict from a stream-json assistant text block", () => {
+    const verdict_payload =
+      '{"severity":"P2","auto_fixable":false,"github_issue":265,"fix_approach":"On cold cache, return 503+Retry-After immediately instead of blocking on _cache_lock; frontend auto-retries."}';
+    const text = `**GitHub issue #265 filed.** Two options documented.\n\nSENTRY_TRIAGE_VERDICT:${verdict_payload}`;
+    const event = {
+      type: "assistant",
+      message: { content: [{ type: "text", text }] },
+      session_id: "922845b0-cfdd-4788-ba2e-b28b0d97623d",
+    };
+
+    const verdict = parse_triage_verdict([JSON.stringify(event)]);
+
+    expect(verdict).toEqual({
+      severity: "P2",
+      auto_fixable: false,
+      github_issue: 265,
+      fix_approach:
+        "On cold cache, return 503+Retry-After immediately instead of blocking on _cache_lock; frontend auto-retries.",
+    });
+  });
+
+  it("parses verdict when text block contains other content before the marker", () => {
+    const text =
+      "Lots of analysis here.\n" +
+      "Multiple paragraphs of diagnosis.\n" +
+      "Even an earlier note that mentions verdict-shaped strings in passing.\n\n" +
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":99,"fix_approach":"Add null guard"}';
+    const event = {
+      type: "assistant",
+      message: { content: [{ type: "text", text }] },
+    };
+
+    const verdict = parse_triage_verdict([JSON.stringify(event)]);
+
+    expect(verdict).toEqual({
+      severity: "P1",
+      auto_fixable: true,
+      github_issue: 99,
+      fix_approach: "Add null guard",
+    });
+  });
+
+  it("parses verdict when it is the final line of a multi-line text block", () => {
+    const text = [
+      "## Summary",
+      "The error originates in src/handler.ts.",
+      "",
+      "## Recommendation",
+      "Tracked in #142.",
+      "",
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P2","auto_fixable":true,"github_issue":142,"fix_approach":"Wrap in try/catch"}',
+    ].join("\n");
+    const event = {
+      type: "assistant",
+      message: { content: [{ type: "text", text }] },
+    };
+
+    const verdict = parse_triage_verdict([JSON.stringify(event)]);
+
+    expect(verdict).toEqual({
+      severity: "P2",
+      auto_fixable: true,
+      github_issue: 142,
+      fix_approach: "Wrap in try/catch",
+    });
+  });
+
+  it("skips non-assistant stream-json events without error", () => {
+    const lines = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "abc" }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id: "tu_1", name: "Bash", input: { command: "ls" } }],
+        },
+      }),
+      JSON.stringify({ type: "user", message: { content: [{ type: "tool_result" }] } }),
+      JSON.stringify({ type: "result", subtype: "success", duration_ms: 1234 }),
+    ];
+
+    expect(parse_triage_verdict(lines)).toBeNull();
+  });
+
+  it("scans stream-json lines in reverse — last verdict wins", () => {
+    const earlier = {
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "text",
+            text: 'First pass.\nSENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":false,"github_issue":1,"fix_approach":"draft"}',
+          },
+        ],
+      },
+    };
+    const later = {
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "text",
+            text: 'Final answer.\nSENTRY_TRIAGE_VERDICT:{"severity":"P2","auto_fixable":true,"github_issue":2,"fix_approach":"final"}',
+          },
+        ],
+      },
+    };
+
+    const verdict = parse_triage_verdict([JSON.stringify(earlier), JSON.stringify(later)]);
+
+    expect(verdict).toEqual({
+      severity: "P2",
+      auto_fixable: true,
+      github_issue: 2,
+      fix_approach: "final",
+    });
+  });
+
+  it("falls back to plain-line parsing when output_lines mix non-JSON and stream-json", () => {
+    // Defensive: if the marker happens to land on a plain (non-JSON) line,
+    // the legacy indexOf path must still find it.
+    const lines = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P0","auto_fixable":false,"github_issue":7,"fix_approach":null}',
+    ];
+
+    expect(parse_triage_verdict(lines)).toEqual({
+      severity: "P0",
+      auto_fixable: false,
+      github_issue: 7,
+      fix_approach: null,
+    });
+  });
+
+  it("walks multiple text blocks in a single assistant message", () => {
+    // Some assistant messages contain multiple text blocks (e.g. when the model
+    // emits text, tool_use, then more text). The verdict can be in any of them.
+    const event = {
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "Initial framing." },
+          { type: "tool_use", id: "tu_1", name: "Read", input: { file_path: "/x" } },
+          {
+            type: "text",
+            text: 'Conclusion.\nSENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":50,"fix_approach":"patch up"}',
+          },
+        ],
+      },
+    };
+
+    expect(parse_triage_verdict([JSON.stringify(event)])).toEqual({
+      severity: "P1",
+      auto_fixable: true,
+      github_issue: 50,
+      fix_approach: "patch up",
+    });
+  });
 });
 
 // ── Auto-fix spawning tests (#250) ──

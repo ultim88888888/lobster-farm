@@ -283,61 +283,124 @@ export interface TriageVerdict {
 const VERDICT_MARKER = "SENTRY_TRIAGE_VERDICT:";
 
 /**
+ * Validate and shape a parsed verdict payload. Returns null if any required
+ * field is missing or the wrong type. Same rules as the original parser.
+ */
+function validate_verdict(parsed: unknown): TriageVerdict | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const obj = parsed as Record<string, unknown>;
+
+  const severity = obj.severity;
+  if (severity !== "P0" && severity !== "P1" && severity !== "P2") return null;
+
+  if (typeof obj.auto_fixable !== "boolean") return null;
+
+  // github_issue must be null/undefined or a number — reject other types
+  if (
+    obj.github_issue !== null &&
+    obj.github_issue !== undefined &&
+    typeof obj.github_issue !== "number"
+  ) {
+    return null;
+  }
+  const github_issue = typeof obj.github_issue === "number" ? obj.github_issue : null;
+
+  const fix_approach = typeof obj.fix_approach === "string" ? obj.fix_approach : null;
+
+  return {
+    severity,
+    auto_fixable: obj.auto_fixable,
+    github_issue,
+    fix_approach,
+  };
+}
+
+/**
+ * Extract the verdict from a string that contains the marker. Slices from the
+ * marker, trims, and JSON.parses the trailing object literal. Returns null on
+ * any parse or validation failure.
+ */
+function extract_verdict_from_text(text: string): TriageVerdict | null {
+  // Use lastIndexOf so a verdict appearing after other (possibly verdict-shaped)
+  // text in the same string still wins — last marker is the authoritative one.
+  const marker_idx = text.lastIndexOf(VERDICT_MARKER);
+  if (marker_idx === -1) return null;
+
+  const json_str = text.slice(marker_idx + VERDICT_MARKER.length).trim();
+  try {
+    return validate_verdict(JSON.parse(json_str));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stream-JSON event shape we care about. The Claude CLI emits one JSON event
+ * per line on stdout (see session.ts: `--output-format stream-json`); assistant
+ * messages carry the verdict inside `.message.content[].text`.
+ */
+interface StreamJsonAssistantEvent {
+  type: "assistant";
+  message?: {
+    content?: Array<{ type?: string; text?: string }>;
+  };
+}
+
+/**
  * Parse a structured verdict from Ray's triage output.
  *
- * Searches output_lines in reverse for the SENTRY_TRIAGE_VERDICT: marker,
- * then parses the JSON payload after it. Returns null on any failure
- * (missing marker, malformed JSON, missing required fields).
+ * Output capture path: session.ts spawns the Claude CLI with
+ * `--output-format stream-json`, so each line in `output_lines` is a JSON
+ * envelope like:
+ *   {"type":"assistant","message":{"content":[{"type":"text","text":"…SENTRY_TRIAGE_VERDICT:{…}"}]}}
  *
- * Null = no auto-fix = safe fallback.
+ * Strategy (per #316):
+ *   1. For each line (scanned in reverse — verdicts arrive last), try to parse
+ *      it as a stream-json event. If it's an assistant message, walk the
+ *      content blocks, pull `.text` from each text block, and look for the
+ *      verdict marker in those (already-unescaped) strings.
+ *   2. If the line is NOT valid JSON, fall back to the legacy plain-line
+ *      `indexOf` path. This preserves behavior for non-stream-json captures
+ *      (test fixtures, future capture-format changes).
+ *
+ * Null = no auto-fix = safe fallback (same contract as before).
  */
 export function parse_triage_verdict(output_lines: string[] | undefined): TriageVerdict | null {
   if (!output_lines || output_lines.length === 0) return null;
 
-  // Search in reverse — the verdict should be the last thing Ray outputs
   for (let i = output_lines.length - 1; i >= 0; i--) {
     const line = output_lines[i]!;
-    const marker_idx = line.indexOf(VERDICT_MARKER);
-    if (marker_idx === -1) continue;
 
-    const json_str = line.slice(marker_idx + VERDICT_MARKER.length).trim();
+    // Path 1: try stream-json envelope first.
+    let parsed_envelope: unknown;
     try {
-      const parsed = JSON.parse(json_str) as Record<string, unknown>;
-
-      // Validate required fields
-      const severity = parsed.severity;
-      if (severity !== "P0" && severity !== "P1" && severity !== "P2") return null;
-
-      if (typeof parsed.auto_fixable !== "boolean") return null;
-
-      const github_issue =
-        parsed.github_issue === null || parsed.github_issue === undefined
-          ? null
-          : typeof parsed.github_issue === "number"
-            ? parsed.github_issue
-            : null;
-
-      // github_issue must be null or a number — reject other types
-      if (
-        parsed.github_issue !== null &&
-        parsed.github_issue !== undefined &&
-        typeof parsed.github_issue !== "number"
-      ) {
-        return null;
-      }
-
-      const fix_approach = typeof parsed.fix_approach === "string" ? parsed.fix_approach : null;
-
-      return {
-        severity,
-        auto_fixable: parsed.auto_fixable,
-        github_issue,
-        fix_approach,
-      };
+      parsed_envelope = JSON.parse(line);
     } catch {
-      // Malformed JSON — safe fallback
-      return null;
+      parsed_envelope = undefined;
     }
+
+    if (parsed_envelope && typeof parsed_envelope === "object") {
+      const event = parsed_envelope as StreamJsonAssistantEvent;
+      if (event.type === "assistant") {
+        const blocks = event.message?.content ?? [];
+        // Walk text blocks in reverse — within a single message, the last
+        // text block holding the marker is authoritative (last-wins).
+        for (let b = blocks.length - 1; b >= 0; b--) {
+          const block = blocks[b];
+          if (!block || block.type !== "text" || typeof block.text !== "string") continue;
+          const verdict = extract_verdict_from_text(block.text);
+          if (verdict) return verdict;
+        }
+      }
+      // Stream-json line that wasn't an assistant text-bearing event (system,
+      // tool_use, tool_result, result, etc.) — skip without falling through to
+      // the plain-line path. The marker shouldn't appear in those.
+      continue;
+    }
+
+    // Path 2: legacy plain-line fallback (preserves pre-stream-json fixtures).
+    const verdict = extract_verdict_from_text(line);
+    if (verdict) return verdict;
   }
 
   return null;
