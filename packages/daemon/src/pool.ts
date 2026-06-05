@@ -8,6 +8,10 @@ import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
+import {
+  ensure_per_entity_config_dir_ready,
+  session_jsonl_exists_anywhere_in,
+} from "./claude-config-migration.js";
 import { resolve_binary } from "./env.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
@@ -432,12 +436,35 @@ export class BotPool extends EventEmitter {
   }
 
   /** Protected wrappers around JSONL existence checks so tests can override
-   * without touching the real filesystem. Defaults to the module-level helpers
-   * which read from `~/.claude/projects/`. */
-  protected check_session_jsonl_exists(working_dir: string, session_id: string): Promise<boolean> {
+   * without touching the real filesystem. When `entity_id` is supplied and the
+   * entity has a `subscription.claude_config_dir` configured, the check is
+   * routed to `<config_dir>/projects/` instead of `~/.claude/projects/` —
+   * essential for entities running on a per-entity Claude Max sub (#327).
+   * Without that routing, the JSONL guard would look in the wrong directory
+   * and silently mis-detect every resumed session as phantom. */
+  protected check_session_jsonl_exists(
+    working_dir: string,
+    session_id: string,
+    entity_id?: string | null,
+  ): Promise<boolean> {
+    const config_dir = entity_id ? this.resolve_claude_config_dir(entity_id) : null;
+    if (config_dir) {
+      // Per-entity sub: scan every slug under the configured projects/ dir.
+      // We don't restrict to working_dir's slug because the JSONL may live
+      // under a worktree slug that differs from the entity_dir we're booting
+      // into now — same logic as the "_anywhere" variant.
+      return session_jsonl_exists_anywhere_in(config_dir, session_id);
+    }
     return session_jsonl_exists(working_dir, session_id);
   }
-  protected check_session_jsonl_exists_anywhere(session_id: string): Promise<boolean> {
+  protected check_session_jsonl_exists_anywhere(
+    session_id: string,
+    entity_id?: string | null,
+  ): Promise<boolean> {
+    const config_dir = entity_id ? this.resolve_claude_config_dir(entity_id) : null;
+    if (config_dir) {
+      return session_jsonl_exists_anywhere_in(config_dir, session_id);
+    }
     return session_jsonl_exists_anywhere(session_id);
   }
 
@@ -556,7 +583,10 @@ export class BotPool extends EventEmitter {
     const now = Date.now();
     let history_dropped = 0;
     for (const [key, session_id] of Object.entries(saved_state.session_history)) {
-      const exists = await this.check_session_jsonl_exists_anywhere(session_id);
+      // `key` is `${entity_id}:${channel_id}` — split out entity_id so the
+      // JSONL check resolves to the entity's per-entity sub dir (#327).
+      const entity_id_from_key = key.split(":")[0] ?? null;
+      const exists = await this.check_session_jsonl_exists_anywhere(session_id, entity_id_from_key);
       if (!exists) {
         console.warn(
           `[pool] Dropping phantom session_history entry ${key} → ${session_id.slice(0, 8)} (no JSONL on disk)`,
@@ -620,7 +650,10 @@ export class BotPool extends EventEmitter {
       // in a feature worktree that differs from entity_dir.
       let restored_session_id = entry.session_id;
       if (restored_session_id) {
-        const exists = await this.check_session_jsonl_exists_anywhere(restored_session_id);
+        const exists = await this.check_session_jsonl_exists_anywhere(
+          restored_session_id,
+          entry.entity_id,
+        );
         if (!exists) {
           console.warn(
             `[pool] pool-${String(entry.id)}: persisted session ${restored_session_id.slice(0, 8)} has no JSONL on disk — dropping to prevent --resume crash loop`,
@@ -823,9 +856,12 @@ export class BotPool extends EventEmitter {
         }
 
         // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so this session
-        // uses the entity's own Claude Max subscription.
+        // uses the entity's own Claude Max subscription. Pre-flight the dir
+        // (migrate JSONLs from the default ~/.claude, patch onboarding fields)
+        // before spawn so --resume and the interactive TUI both come up clean (#327).
         const resume_claude_config = this.resolve_claude_config_dir(candidate.entity_id);
         if (resume_claude_config) {
+          await ensure_per_entity_config_dir_ready(candidate.entity_id, resume_claude_config);
           extra_env.CLAUDE_CONFIG_DIR = resume_claude_config;
           console.log(
             `[pool] Resuming pool-${String(bot.id)} with CLAUDE_CONFIG_DIR=${resume_claude_config} (entity: ${candidate.entity_id})`,
@@ -1106,9 +1142,12 @@ export class BotPool extends EventEmitter {
       }
 
       // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so this session
-      // uses the entity's own Claude Max subscription.
+      // uses the entity's own Claude Max subscription. Pre-flight the dir
+      // (migrate JSONLs from the default ~/.claude, patch onboarding fields)
+      // before spawn so --resume and the interactive TUI both come up clean (#327).
       const assign_claude_config = this.resolve_claude_config_dir(entity_id);
       if (assign_claude_config) {
+        await ensure_per_entity_config_dir_ready(entity_id, assign_claude_config);
         extra_env.CLAUDE_CONFIG_DIR = assign_claude_config;
         console.log(
           `[pool] Assigning pool-${String(bot.id)} with CLAUDE_CONFIG_DIR=${assign_claude_config} (entity: ${entity_id})`,
@@ -1686,7 +1725,7 @@ export class BotPool extends EventEmitter {
     const working_dir = entity_dir(this.config.paths, entity_id);
     let resume_id: string;
     let is_resume: boolean;
-    if (session_id && (await this.check_session_jsonl_exists_anywhere(session_id))) {
+    if (session_id && (await this.check_session_jsonl_exists_anywhere(session_id, entity_id))) {
       resume_id = session_id;
       is_resume = true;
     } else {
@@ -1712,9 +1751,12 @@ export class BotPool extends EventEmitter {
       }
 
       // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so the restarted
-      // session uses the entity's own Claude Max subscription.
+      // session uses the entity's own Claude Max subscription. Pre-flight the
+      // dir (migrate JSONLs from default ~/.claude, patch onboarding fields)
+      // so --resume and the interactive TUI both come up clean (#327).
       const crash_claude_config = this.resolve_claude_config_dir(entity_id);
       if (crash_claude_config) {
+        await ensure_per_entity_config_dir_ready(entity_id, crash_claude_config);
         extra_env.CLAUDE_CONFIG_DIR = crash_claude_config;
         console.log(
           `[pool] Restarting pool-${String(bot.id)} with CLAUDE_CONFIG_DIR=${crash_claude_config} (entity: ${entity_id})`,
@@ -1846,7 +1888,7 @@ export class BotPool extends EventEmitter {
     // original bug self-perpetuated: the next assignment would pull the dead
     // UUID out of history and re-enter the crash loop (issue #256).
     if (bot.session_id && bot.session_confirmed && channel_id && entity_id) {
-      const exists = await this.check_session_jsonl_exists_anywhere(bot.session_id);
+      const exists = await this.check_session_jsonl_exists_anywhere(bot.session_id, entity_id);
       if (exists) {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, bot.session_id);
@@ -1996,7 +2038,13 @@ export class BotPool extends EventEmitter {
         return;
       }
 
-      const exists = await this.check_session_jsonl_exists(working_dir, session_id);
+      // Pass entity_id so the existence check routes to the per-entity
+      // CLAUDE_CONFIG_DIR when the entity has a subscription override (#327).
+      const exists = await this.check_session_jsonl_exists(
+        working_dir,
+        session_id,
+        current.entity_id,
+      );
 
       // Re-check after await: bot may have been reassigned during the async
       // suspension — cancel_session_watcher only stops future ticks, not an
