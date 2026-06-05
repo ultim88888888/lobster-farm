@@ -109,6 +109,53 @@ The injection happens at two points in the daemon:
 
 Both paths log which config directory is being used at spawn time.
 
+### First-launch preparation (issue #327)
+
+Before any pool-bot spawn under a per-entity `claude_config_dir`, the daemon
+runs two idempotent fixes to make `--resume` and the interactive TUI work
+cleanly. Both happen automatically — no manual setup is required beyond
+`claude auth login`. The work runs at most once per `(entity, config_dir)`
+pair per daemon process and is cached in memory thereafter.
+
+1. **Session JSONL migration.** Claude Code stores session transcripts at
+   `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session-id>.jsonl`. Sessions
+   that were originally written under the default `~/.claude` (before the
+   entity switched to a per-entity sub) are invisible to the new config dir,
+   so `--resume` would silently drop the bot into the onboarding wizard.
+
+   On first launch, the daemon mirrors every project dir under
+   `~/.claude/projects/` whose slug contains the entity_id into
+   `<config_dir>/projects/`. Existing destination dirs are preserved
+   (`cp -rn` semantics) so the migration is safe to re-run.
+
+2. **Onboarding-completion patch.** A freshly-authed config dir has
+   `oauthAccount` populated but `hasCompletedOnboarding`, `theme`, and
+   `bypassPermissionsModeAccepted` are all unset. Headless `-p` mode skips
+   onboarding, but pool bots launch interactively (TUI) and would stall on
+   the first picker.
+
+   On first launch, the daemon patches `<config_dir>/.claude.json` to set
+   the three idle-bypass fields. Only missing/falsy fields are written —
+   existing user preferences are preserved. The theme is sourced from the
+   user's primary `~/.claude.json` with `dark-ansi` as fallback.
+   `oauthAccount` is never touched.
+
+3. **Config-dir-aware JSONL guard.** The existing "drop --resume when the
+   transcript is missing" guard (issue #256) is now config-dir-aware. For
+   entities with `subscription.claude_config_dir` set, the guard looks in
+   `<config_dir>/projects/` instead of `~/.claude/projects/`. If the JSONL
+   is genuinely missing even after the migration, the daemon drops `--resume`
+   and spawns a fresh session — avoiding the wedge while sacrificing one
+   session's continuity (recoverable; daemon-crash on recycle is not).
+
+Both fixes fail open: any I/O error is logged and execution continues. The
+worst case is one bot losing session context — the daemon never hard-crashes
+on a recycle because of these helpers.
+
+Legacy entities that were manually migrated before issue #327 landed
+(canal-street, sonar) don't need any change. The new code is idempotent and
+will no-op against the already-prepared dirs.
+
 ## Troubleshooting
 
 ### Verify which subscription a session is using
