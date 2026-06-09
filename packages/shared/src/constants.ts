@@ -11,21 +11,21 @@ export interface ArchetypeDefaults {
 export const DEFAULT_ARCHETYPES: Record<ArchetypeRole, ArchetypeDefaults> = {
   planner: {
     default_name: "Gary",
-    model: "opus",
+    model: "fable",
     think: "high",
     primary_dna: "planning-dna",
     additional_dna: [],
   },
   designer: {
     default_name: "Pearl",
-    model: "opus",
+    model: "fable",
     think: "standard",
     primary_dna: "design-dna",
     additional_dna: ["coding-dna"],
   },
   builder: {
     default_name: "Bob",
-    model: "opus",
+    model: "fable",
     think: "high",
     primary_dna: "coding-dna",
     additional_dna: ["design-dna", "database-dna"],
@@ -46,7 +46,7 @@ export const DEFAULT_ARCHETYPES: Record<ArchetypeRole, ArchetypeDefaults> = {
   },
   commander: {
     default_name: "Pat",
-    model: "opus",
+    model: "fable",
     think: "high",
     primary_dna: "commander-dna",
     additional_dna: [],

@@ -35,10 +35,10 @@ export const LobsterFarmConfigSchema = z.object({
     .object({
       models: z
         .object({
-          planning: ModelTierSchema.default({ model: "opus", think: "high" }),
-          design: ModelTierSchema.default({ model: "opus", think: "standard" }),
-          building: ModelTierSchema.default({ model: "opus", think: "high" }),
-          database: ModelTierSchema.default({ model: "opus", think: "high" }),
+          planning: ModelTierSchema.default({ model: "fable", think: "high" }),
+          design: ModelTierSchema.default({ model: "fable", think: "standard" }),
+          building: ModelTierSchema.default({ model: "fable", think: "high" }),
+          database: ModelTierSchema.default({ model: "fable", think: "high" }),
           review: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
           operations: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
           triage: ModelTierSchema.default({ model: "sonnet", think: "standard" }),

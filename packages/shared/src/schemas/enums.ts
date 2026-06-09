@@ -19,7 +19,7 @@ export type EntityStatus = z.infer<typeof EntityStatusSchema>;
 export const AgentModeSchema = z.enum(["dedicated", "generalist", "hybrid"]);
 export type AgentMode = z.infer<typeof AgentModeSchema>;
 
-export const ModelNameSchema = z.enum(["opus", "sonnet", "haiku"]);
+export const ModelNameSchema = z.enum(["fable", "opus", "sonnet", "haiku"]);
 export type ModelName = z.infer<typeof ModelNameSchema>;
 
 export const ThinkLevelSchema = z.enum(["none", "standard", "high", "xhigh", "max"]);
