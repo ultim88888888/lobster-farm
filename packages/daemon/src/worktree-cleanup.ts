@@ -83,6 +83,31 @@ export function relocate_sessions_from_path(target_path: string, safe_path: stri
   return relocated;
 }
 
+/**
+ * Check whether any live tmux pane has its cwd inside `target_path`.
+ *
+ * Used as an in-flight guard: a worktree with an active session/build inside
+ * it must never be force-removed, even mid-merge. Best-effort — if tmux is
+ * unavailable we return false (no evidence of activity) rather than throwing.
+ */
+export function has_active_session_in_path(target_path: string): boolean {
+  const target_prefix = target_path.endsWith("/") ? target_path : `${target_path}/`;
+
+  let pane_lines: string[];
+  try {
+    const result = execFileSync("tmux", ["list-panes", "-a", "-F", "#{pane_current_path}"], {
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    pane_lines = result.trim().split("\n").filter(Boolean);
+  } catch {
+    // tmux not running or no sessions — no evidence of an active build.
+    return false;
+  }
+
+  return pane_lines.some((cwd) => cwd === target_path || cwd.startsWith(target_prefix));
+}
+
 // ── Parsed worktree entry from `git worktree list --porcelain` ──
 
 interface WorktreeEntry {
@@ -94,6 +119,8 @@ interface WorktreeEntry {
   branch: string | null;
   /** True if this is the main working tree. */
   bare: boolean;
+  /** True if the worktree is locked (`git worktree lock` / a `locked` file). */
+  locked: boolean;
 }
 
 /**
@@ -117,6 +144,7 @@ export function parse_worktree_list(output: string): WorktreeEntry[] {
     let head = "";
     let branch: string | null = null;
     let bare = false;
+    let locked = false;
 
     for (const line of lines) {
       if (line.startsWith("worktree ")) {
@@ -127,11 +155,14 @@ export function parse_worktree_list(output: string): WorktreeEntry[] {
         branch = line.slice("branch ".length);
       } else if (line === "bare") {
         bare = true;
+      } else if (line === "locked" || line.startsWith("locked ")) {
+        // Porcelain emits a bare "locked" line, or "locked <reason>".
+        locked = true;
       }
     }
 
     if (path) {
-      entries.push({ path, head, branch, bare });
+      entries.push({ path, head, branch, bare, locked });
     }
   }
 
@@ -145,6 +176,39 @@ export function parse_worktree_list(output: string): WorktreeEntry[] {
 function short_branch(ref: string): string {
   const prefix = "refs/heads/";
   return ref.startsWith(prefix) ? ref.slice(prefix.length) : ref;
+}
+
+/**
+ * Check whether the worktree at `worktree_path` is locked.
+ *
+ * The harness (EnterWorktree) marks every active agent build with a git
+ * `locked` file. We treat a locked worktree as in-flight and must never
+ * force-remove it. Best-effort — on any error we conservatively report
+ * `true` (assume in-flight) so cleanup never destroys an active build.
+ */
+export async function is_worktree_locked(
+  repo_path: string,
+  worktree_path: string,
+): Promise<boolean> {
+  try {
+    const { stdout } = await exec("git", ["worktree", "list", "--porcelain"], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    const normalized = worktree_path.replace(/\/+$/, "");
+    const entry = parse_worktree_list(stdout).find(
+      (e) => e.path.replace(/\/+$/, "") === normalized,
+    );
+    // Unknown path → not a registered worktree here → let normal removal proceed.
+    return entry ? entry.locked : false;
+  } catch (err) {
+    // Couldn't determine lock state — fail safe: treat as in-flight, skip removal.
+    console.error(
+      `[worktree-cleanup] Could not determine lock state for ${worktree_path}, ` +
+        `treating as in-flight: ${String(err instanceof Error ? err.message : err)}`,
+    );
+    return true;
+  }
 }
 
 // ── Core cleanup function ──
@@ -163,6 +227,22 @@ export async function remove_worktree(
   branch: string,
 ): Promise<boolean> {
   let removed_worktree = false;
+
+  // In-flight guard: never force-remove a worktree that is locked (the harness
+  // marks active agent builds with a git `locked` file) or that has a live
+  // session/build with its cwd inside it. This is what protects in-progress
+  // builds from being reaped when an unrelated PR merges or during the stale
+  // sweep — the failure mode that destroyed #155/#174.
+  if (await is_worktree_locked(repo_path, worktree_path)) {
+    console.warn(`[worktree-cleanup] Skipping locked (in-flight) worktree: ${worktree_path}`);
+    return false;
+  }
+  if (has_active_session_in_path(worktree_path)) {
+    console.warn(
+      `[worktree-cleanup] Skipping worktree with an active session/build: ${worktree_path}`,
+    );
+    return false;
+  }
 
   // Step 1: Remove the worktree
   try {
@@ -261,13 +341,10 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
   // 1. Check git worktree list for a worktree on this branch
   const worktree_path = await find_worktree_for_branch(repo_path, branch);
   if (worktree_path) {
-    // Relocate any sessions whose cwd is inside this worktree before removal
-    const relocated = relocate_sessions_from_path(worktree_path, repo_path);
-    if (relocated > 0) {
-      console.log(
-        `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${worktree_path}`,
-      );
-    }
+    // remove_worktree refuses to remove a locked or in-use worktree, so we do
+    // NOT relocate sessions out first — relocating would move a live build's
+    // pane away and defeat the in-flight guard. If the worktree is genuinely
+    // idle, there's nothing to relocate anyway.
     await remove_worktree(repo_path, worktree_path, branch);
   } else {
     console.log(`[worktree-cleanup] No git worktree found for branch: ${branch}`);
@@ -315,13 +392,9 @@ async function cleanup_claude_worktrees(repo_path: string, branch: string): Prom
       if (entry.name.includes(branch_slug)) {
         const wt_path = join(claude_wt_dir, entry.name);
         console.log(`[worktree-cleanup] Found .claude/worktrees/ match: ${wt_path}`);
-        // Relocate any sessions whose cwd is inside this worktree before removal
-        const relocated = relocate_sessions_from_path(wt_path, repo_path);
-        if (relocated > 0) {
-          console.log(
-            `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${wt_path}`,
-          );
-        }
+        // remove_worktree refuses locked / in-use worktrees; don't relocate
+        // first (it would defeat the in-flight guard). Agent worktrees here
+        // carry a `locked` file, so an active build is skipped outright.
         await remove_worktree(repo_path, wt_path, branch);
       }
     }
