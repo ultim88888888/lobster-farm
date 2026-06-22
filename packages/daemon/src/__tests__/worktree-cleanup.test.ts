@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup_after_merge,
   find_worktree_for_branch,
+  lock_owner_alive,
   parse_worktree_list,
   relocate_sessions_from_path,
   remove_worktree,
@@ -59,6 +60,7 @@ function make_porcelain(
     branch?: string;
     bare?: boolean;
     locked?: boolean;
+    lock_reason?: string;
   }>
 ): string {
   return entries
@@ -67,7 +69,9 @@ function make_porcelain(
       lines.push(`HEAD ${e.head ?? "abc1234567890"}`);
       if (e.branch) lines.push(`branch ${e.branch}`);
       if (e.bare) lines.push("bare");
-      if (e.locked) lines.push("locked");
+      // "locked <reason>" when a reason is given, else a bare "locked" line.
+      if (e.lock_reason) lines.push(`locked ${e.lock_reason}`);
+      else if (e.locked) lines.push("locked");
       return lines.join("\n");
     })
     .join("\n\n");
@@ -266,6 +270,7 @@ describe("parse_worktree_list", () => {
       branch: "refs/heads/main",
       bare: false,
       locked: false,
+      lock_reason: null,
     });
   });
 
@@ -317,7 +322,27 @@ describe("parse_worktree_list", () => {
 
     const entries = parse_worktree_list(output);
     expect(entries[0]!.locked).toBe(true);
+    expect(entries[0]!.lock_reason).toBeNull();
     expect(entries[1]!.locked).toBe(true);
+    expect(entries[1]!.lock_reason).toBe("in-flight build");
+  });
+});
+
+describe("lock_owner_alive", () => {
+  it("returns null when there is no reason or no parseable pid", () => {
+    expect(lock_owner_alive(null)).toBeNull();
+    expect(lock_owner_alive("")).toBeNull();
+    expect(lock_owner_alive("claude agent agent-x")).toBeNull();
+    expect(lock_owner_alive("locked by something")).toBeNull();
+  });
+
+  it("returns true when the owner pid is alive (this test process)", () => {
+    expect(lock_owner_alive(`claude agent agent-x (pid ${process.pid})`)).toBe(true);
+  });
+
+  it("returns false when the owner pid is dead", () => {
+    // A pid far above the OS maximum is guaranteed not to be a live process.
+    expect(lock_owner_alive("claude agent agent-x (pid 2147483646)")).toBe(false);
   });
 });
 
@@ -519,6 +544,55 @@ describe("cleanup_after_merge", () => {
         (c[1] as string[])[0] === "worktree" &&
         (c[1] as string[])[1] === "remove" &&
         (c[1] as string[])[2] === "/repo/.claude/worktrees/agent-x",
+    );
+    expect(remove_called).toBe(false);
+  });
+
+  it("reclaims a worktree whose lock owner pid is dead (orphaned lock)", async () => {
+    const porcelain = make_porcelain(
+      { path: "/repo", branch: "refs/heads/main" },
+      {
+        path: "/repo/.claude/worktrees/agent-dead",
+        branch: "refs/heads/feature/my-feature",
+        // Dead owner pid (far above the OS max) → orphaned lock, safe to reclaim.
+        lock_reason: "claude agent agent-dead (pid 2147483646)",
+      },
+    );
+    setup_git_mocks({ worktree_list: porcelain });
+
+    await cleanup_after_merge("/repo", "feature/my-feature");
+
+    // It should unlock first, then force-remove with a doubled --force.
+    expect(mock_exec_file).toHaveBeenCalledWith(
+      "git",
+      ["worktree", "unlock", "/repo/.claude/worktrees/agent-dead"],
+      expect.objectContaining({ cwd: "/repo" }),
+    );
+    expect(mock_exec_file).toHaveBeenCalledWith(
+      "git",
+      ["worktree", "remove", "/repo/.claude/worktrees/agent-dead", "--force", "--force"],
+      expect.objectContaining({ cwd: "/repo" }),
+    );
+  });
+
+  it("does NOT reclaim a locked worktree whose owner pid is alive", async () => {
+    const porcelain = make_porcelain(
+      { path: "/repo", branch: "refs/heads/main" },
+      {
+        path: "/repo/.claude/worktrees/agent-live",
+        branch: "refs/heads/feature/my-feature",
+        lock_reason: `claude agent agent-live (pid ${process.pid})`,
+      },
+    );
+    setup_git_mocks({ worktree_list: porcelain });
+
+    await cleanup_after_merge("/repo", "feature/my-feature");
+
+    const remove_called = mock_exec_file.mock.calls.some(
+      (c: unknown[]) =>
+        (c[1] as string[])[0] === "worktree" &&
+        (c[1] as string[])[1] === "remove" &&
+        (c[1] as string[])[2] === "/repo/.claude/worktrees/agent-live",
     );
     expect(remove_called).toBe(false);
   });

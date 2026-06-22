@@ -121,6 +121,11 @@ interface WorktreeEntry {
   bare: boolean;
   /** True if the worktree is locked (`git worktree lock` / a `locked` file). */
   locked: boolean;
+  /**
+   * The lock reason, if the porcelain emitted one (`locked <reason>`), else null.
+   * The harness embeds the owning pid here, e.g. "claude agent agent-x (pid 123)".
+   */
+  lock_reason: string | null;
 }
 
 /**
@@ -145,6 +150,7 @@ export function parse_worktree_list(output: string): WorktreeEntry[] {
     let branch: string | null = null;
     let bare = false;
     let locked = false;
+    let lock_reason: string | null = null;
 
     for (const line of lines) {
       if (line.startsWith("worktree ")) {
@@ -155,14 +161,18 @@ export function parse_worktree_list(output: string): WorktreeEntry[] {
         branch = line.slice("branch ".length);
       } else if (line === "bare") {
         bare = true;
-      } else if (line === "locked" || line.startsWith("locked ")) {
-        // Porcelain emits a bare "locked" line, or "locked <reason>".
+      } else if (line === "locked") {
+        // Porcelain emits a bare "locked" line when there's no reason.
         locked = true;
+      } else if (line.startsWith("locked ")) {
+        // "locked <reason>" — the reason carries the owning agent's pid.
+        locked = true;
+        lock_reason = line.slice("locked ".length);
       }
     }
 
     if (path) {
-      entries.push({ path, head, branch, bare, locked });
+      entries.push({ path, head, branch, bare, locked, lock_reason });
     }
   }
 
@@ -179,28 +189,65 @@ function short_branch(ref: string): string {
 }
 
 /**
+ * Determine whether the process that locked a worktree is still alive.
+ *
+ * The harness embeds the owning pid in the git lock reason, e.g.
+ * "claude agent agent-abc (pid 12345)". Returns:
+ *   - `true`  → the owner pid is alive (a genuine in-flight build, keep it)
+ *   - `false` → the owner pid is dead (an orphaned lock, safe to reclaim)
+ *   - `null`  → no parseable pid in the reason (unknown — caller treats as in-flight)
+ */
+export function lock_owner_alive(reason: string | null): boolean | null {
+  if (!reason) return null;
+  const match = reason.match(/\bpid (\d+)\b/);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    // Signal 0 performs existence/permission checks without sending a signal.
+    process.kill(pid, 0);
+    return true; // process exists
+  } catch (err) {
+    // EPERM → process exists but we may not signal it → still alive.
+    // ESRCH → no such process → dead/orphaned.
+    if ((err as NodeJS.ErrnoException).code === "EPERM") return true;
+    return false;
+  }
+}
+
+/**
+ * Read the lock status (and reason) of a specific worktree from git porcelain.
+ * Throws on git failure — callers decide how to fail safe.
+ */
+async function get_lock_status(
+  repo_path: string,
+  worktree_path: string,
+): Promise<{ locked: boolean; reason: string | null }> {
+  const { stdout } = await exec("git", ["worktree", "list", "--porcelain"], {
+    cwd: repo_path,
+    timeout: GIT_TIMEOUT_MS,
+  });
+  const normalized = worktree_path.replace(/\/+$/, "");
+  const entry = parse_worktree_list(stdout).find((e) => e.path.replace(/\/+$/, "") === normalized);
+  // Unknown path → not a registered worktree here → treat as unlocked.
+  return { locked: entry ? entry.locked : false, reason: entry ? entry.lock_reason : null };
+}
+
+/**
  * Check whether the worktree at `worktree_path` is locked.
  *
  * The harness (EnterWorktree) marks every active agent build with a git
- * `locked` file. We treat a locked worktree as in-flight and must never
- * force-remove it. Best-effort — on any error we conservatively report
- * `true` (assume in-flight) so cleanup never destroys an active build.
+ * `locked` file. Best-effort — on any error we conservatively report `true`
+ * (assume in-flight) so cleanup never destroys an active build. Note this does
+ * NOT consider whether the lock is orphaned; `remove_worktree` does that.
  */
 export async function is_worktree_locked(
   repo_path: string,
   worktree_path: string,
 ): Promise<boolean> {
   try {
-    const { stdout } = await exec("git", ["worktree", "list", "--porcelain"], {
-      cwd: repo_path,
-      timeout: GIT_TIMEOUT_MS,
-    });
-    const normalized = worktree_path.replace(/\/+$/, "");
-    const entry = parse_worktree_list(stdout).find(
-      (e) => e.path.replace(/\/+$/, "") === normalized,
-    );
-    // Unknown path → not a registered worktree here → let normal removal proceed.
-    return entry ? entry.locked : false;
+    const { locked } = await get_lock_status(repo_path, worktree_path);
+    return locked;
   } catch (err) {
     // Couldn't determine lock state — fail safe: treat as in-flight, skip removal.
     console.error(
@@ -228,15 +275,14 @@ export async function remove_worktree(
 ): Promise<boolean> {
   let removed_worktree = false;
 
-  // In-flight guard: never force-remove a worktree that is locked (the harness
-  // marks active agent builds with a git `locked` file) or that has a live
-  // session/build with its cwd inside it. This is what protects in-progress
-  // builds from being reaped when an unrelated PR merges or during the stale
-  // sweep — the failure mode that destroyed #155/#174.
-  if (await is_worktree_locked(repo_path, worktree_path)) {
-    console.warn(`[worktree-cleanup] Skipping locked (in-flight) worktree: ${worktree_path}`);
-    return false;
-  }
+  // In-flight guard: never force-remove a worktree that has a live session/build
+  // with its cwd inside it, or that is locked by a still-running agent. The
+  // harness marks active builds with a git `locked` file whose reason embeds the
+  // owner pid. We reclaim a lock ONLY when that pid is dead AND no live session
+  // remains — an orphaned lock left by a build that crashed without cleanup.
+  // Otherwise we skip. This preserves the protection for in-progress builds (the
+  // #155/#174 reaping hazard) while letting cleanup reclaim dead worktrees that
+  // would otherwise pile up and spam the sweep forever.
   if (has_active_session_in_path(worktree_path)) {
     console.warn(
       `[worktree-cleanup] Skipping worktree with an active session/build: ${worktree_path}`,
@@ -244,9 +290,57 @@ export async function remove_worktree(
     return false;
   }
 
-  // Step 1: Remove the worktree
+  let reclaim_orphaned_lock = false;
+  let lock: { locked: boolean; reason: string | null };
   try {
-    await exec("git", ["worktree", "remove", worktree_path, "--force"], {
+    lock = await get_lock_status(repo_path, worktree_path);
+  } catch (err) {
+    // Couldn't determine lock state — fail safe: assume in-flight, skip.
+    console.error(
+      `[worktree-cleanup] Could not determine lock state for ${worktree_path}, ` +
+        `treating as in-flight: ${String(err instanceof Error ? err.message : err)}`,
+    );
+    return false;
+  }
+
+  if (lock.locked) {
+    const owner_alive = lock_owner_alive(lock.reason);
+    if (owner_alive !== false) {
+      // Alive, or unknown owner (no parseable pid) — treat as in-flight, keep.
+      console.warn(
+        `[worktree-cleanup] Skipping locked (in-flight) worktree: ${worktree_path}${
+          lock.reason ? ` [${lock.reason}]` : ""
+        }`,
+      );
+      return false;
+    }
+    // owner_alive === false: the locking agent is gone and no live session
+    // remains — this is an orphaned lock, safe to reclaim.
+    console.warn(
+      `[worktree-cleanup] Reclaiming orphaned lock (owner pid dead) for worktree: ${worktree_path}${
+        lock.reason ? ` [${lock.reason}]` : ""
+      }`,
+    );
+    reclaim_orphaned_lock = true;
+    // Best-effort unlock so the subsequent remove isn't blocked by the lock.
+    try {
+      await exec("git", ["worktree", "unlock", worktree_path], {
+        cwd: repo_path,
+        timeout: GIT_TIMEOUT_MS,
+      });
+    } catch {
+      // Unlock may fail (already unlocked, or git refuses) — the second
+      // `--force` below still overrides a residual lock.
+    }
+  }
+
+  // Step 1: Remove the worktree. A single `--force` lets git's own lock check
+  // guard against a build that locked the path between our check and now; a
+  // second `--force` is added only when deliberately reclaiming a dead lock.
+  const remove_args = ["worktree", "remove", worktree_path, "--force"];
+  if (reclaim_orphaned_lock) remove_args.push("--force");
+  try {
+    await exec("git", remove_args, {
       cwd: repo_path,
       timeout: GIT_TIMEOUT_MS,
     });
