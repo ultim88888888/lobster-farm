@@ -31,20 +31,20 @@ describe("build_model_flags", () => {
   it("maps opus/high to correct flags", () => {
     const flags = build_model_flags({ model: "opus", think: "high" });
     expect(flags).toContain("--model");
-    expect(flags).toContain("claude-opus-4-8");
+    expect(flags).toContain("opus");
     expect(flags).toContain("--effort");
     expect(flags).toContain("high");
   });
 
   it("maps sonnet/standard to correct flags", () => {
     const flags = build_model_flags({ model: "sonnet", think: "standard" });
-    expect(flags).toContain("claude-sonnet-4-6");
+    expect(flags).toContain("sonnet");
     expect(flags).toContain("medium");
   });
 
   it("maps haiku/none to model only", () => {
     const flags = build_model_flags({ model: "haiku", think: "none" });
-    expect(flags).toContain("claude-haiku-4-5-20251001");
+    expect(flags).toContain("haiku");
     expect(flags).toContain("--effort");
     expect(flags).toContain("low");
   });
@@ -52,7 +52,7 @@ describe("build_model_flags", () => {
   it("maps opus/xhigh to correct flags", () => {
     const flags = build_model_flags({ model: "opus", think: "xhigh" });
     expect(flags).toContain("--model");
-    expect(flags).toContain("claude-opus-4-8");
+    expect(flags).toContain("opus");
     expect(flags).toContain("--effort");
     expect(flags).toContain("xhigh");
   });
@@ -60,7 +60,7 @@ describe("build_model_flags", () => {
   it("maps opus/max to correct flags", () => {
     const flags = build_model_flags({ model: "opus", think: "max" });
     expect(flags).toContain("--model");
-    expect(flags).toContain("claude-opus-4-8");
+    expect(flags).toContain("opus");
     expect(flags).toContain("--effort");
     expect(flags).toContain("max");
   });
@@ -100,7 +100,7 @@ describe("ClaudeSessionManager", () => {
       expect(args).toContain("--agent");
       expect(args).toContain("bob"); // default builder name
       expect(args).toContain("--model");
-      expect(args).toContain("claude-opus-4-8");
+      expect(args).toContain("opus");
       expect(args).toContain("--permission-mode");
       expect(args).toContain("bypassPermissions");
       expect(args).toContain("--session-id");
