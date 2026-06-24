@@ -58,7 +58,6 @@ function make_porcelain(
     head?: string;
     branch?: string;
     bare?: boolean;
-    locked?: boolean;
   }>
 ): string {
   return entries
@@ -67,7 +66,6 @@ function make_porcelain(
       lines.push(`HEAD ${e.head ?? "abc1234567890"}`);
       if (e.branch) lines.push(`branch ${e.branch}`);
       if (e.bare) lines.push("bare");
-      if (e.locked) lines.push("locked");
       return lines.join("\n");
     })
     .join("\n\n");
@@ -265,7 +263,6 @@ describe("parse_worktree_list", () => {
       head: "abc123",
       branch: "refs/heads/main",
       bare: false,
-      locked: false,
     });
   });
 
@@ -300,24 +297,6 @@ describe("parse_worktree_list", () => {
 
     const entries = parse_worktree_list(output);
     expect(entries[0]!.bare).toBe(true);
-  });
-
-  it("recognizes locked worktree entries (bare and with reason)", () => {
-    const output = [
-      "worktree /repo/.claude/worktrees/agent-1",
-      "HEAD abc123",
-      "branch refs/heads/feature/a",
-      "locked",
-      "",
-      "worktree /repo/.claude/worktrees/agent-2",
-      "HEAD def456",
-      "branch refs/heads/feature/b",
-      "locked in-flight build",
-    ].join("\n");
-
-    const entries = parse_worktree_list(output);
-    expect(entries[0]!.locked).toBe(true);
-    expect(entries[1]!.locked).toBe(true);
   });
 });
 
@@ -473,54 +452,45 @@ describe("cleanup_after_merge", () => {
     expect(removed_paths).not.toContain("/repo/.claude/worktrees/agent-999-other");
   });
 
-  it("does NOT remove a worktree with an active session inside it (in-flight guard)", async () => {
+  it("relocates sessions before removing worktree", async () => {
     const porcelain = make_porcelain(
       { path: "/repo", branch: "refs/heads/main" },
       { path: "/repo/worktrees/my-feature", branch: "refs/heads/feature/my-feature" },
     );
     setup_git_mocks({ worktree_list: porcelain });
 
-    // A live pane has its cwd inside the worktree → it's an active build.
-    // `-F #{pane_current_path}` yields just the path per line.
+    // Track call order: relocation (execFileSync for list-panes) must happen
+    // before worktree removal (execFile for git worktree remove).
+    const call_order: string[] = [];
+
     mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === "tmux" && args[0] === "list-panes") {
-        return "/repo/worktrees/my-feature/src\n";
+        call_order.push("tmux:list-panes");
+        return "session1 %0 /repo/worktrees/my-feature/src\n";
+      }
+      if (cmd === "tmux" && args[0] === "send-keys") {
+        call_order.push("tmux:send-keys");
+        return "";
       }
       return "";
     });
 
-    await cleanup_after_merge("/repo", "feature/my-feature");
-
-    // The in-flight guard must prevent the force-remove entirely.
-    const remove_called = mock_exec_file.mock.calls.some(
-      (c: unknown[]) =>
-        (c[1] as string[])[0] === "worktree" &&
-        (c[1] as string[])[1] === "remove" &&
-        (c[1] as string[])[2] === "/repo/worktrees/my-feature",
-    );
-    expect(remove_called).toBe(false);
-  });
-
-  it("does NOT remove a locked worktree (in-flight guard)", async () => {
-    const porcelain = make_porcelain(
-      { path: "/repo", branch: "refs/heads/main" },
-      {
-        path: "/repo/.claude/worktrees/agent-x",
-        branch: "refs/heads/feature/my-feature",
-        locked: true,
-      },
-    );
-    setup_git_mocks({ worktree_list: porcelain });
+    const original_impl = mock_exec_file.getMockImplementation()!;
+    mock_exec_file.mockImplementation((cmd: string, args: string[], opts: unknown) => {
+      if (cmd === "git" && args[0] === "worktree" && args[1] === "remove") {
+        call_order.push("git:worktree-remove");
+      }
+      return original_impl(cmd, args, opts);
+    });
 
     await cleanup_after_merge("/repo", "feature/my-feature");
 
-    const remove_called = mock_exec_file.mock.calls.some(
-      (c: unknown[]) =>
-        (c[1] as string[])[0] === "worktree" &&
-        (c[1] as string[])[1] === "remove" &&
-        (c[1] as string[])[2] === "/repo/.claude/worktrees/agent-x",
-    );
-    expect(remove_called).toBe(false);
+    // Relocation must precede removal
+    const relocation_idx = call_order.indexOf("tmux:list-panes");
+    const removal_idx = call_order.indexOf("git:worktree-remove");
+    expect(relocation_idx).toBeGreaterThanOrEqual(0);
+    expect(removal_idx).toBeGreaterThanOrEqual(0);
+    expect(relocation_idx).toBeLessThan(removal_idx);
   });
 
   it("does not throw when .claude/worktrees/ does not exist", async () => {
