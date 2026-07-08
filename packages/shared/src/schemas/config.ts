@@ -92,6 +92,21 @@ export const LobsterFarmConfigSchema = z.object({
     })
     .optional(),
 
+  // Auth-recovery watchdog (#343). Detects stale/expired shared Claude OAuth
+  // credentials (per CLAUDE_CONFIG_DIR), auto-quarantines poisoned sessions,
+  // alerts the owner with a re-login URL, accepts the pasted code, and recycles
+  // affected pool bots.
+  auth_watchdog: z
+    .object({
+      enabled: z.boolean().default(true),
+      interval_minutes: z.number().int().min(1).default(5),
+      /** Proactively warn when a credential is within this many minutes of expiry. */
+      expiry_warn_minutes: z.number().int().min(1).default(30),
+      /** Channel to post alerts to. When unset, resolves to #command-center at runtime. */
+      alert_channel_id: z.string().optional(),
+    })
+    .default({}),
+
   tools: z
     .object({
       tailscale: z

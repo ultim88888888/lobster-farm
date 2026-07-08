@@ -38,6 +38,7 @@ import {
   type TextChannel,
   type Webhook,
 } from "discord.js";
+import type { AuthWatchdog } from "./auth-watchdog.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
 import { is_tmux_session_idle } from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
@@ -2430,10 +2431,17 @@ export class DiscordBot extends EventEmitter {
   }
 
   private _pool: BotPool | null = null;
+  private _auth_watchdog: AuthWatchdog | null = null;
 
   set_managers(_queue: TaskQueue): void {
     // Queue wiring deferred — will be used for slash-command task submission
     console.debug("[discord] set_managers called — queue wiring not yet implemented");
+  }
+
+  /** Wire the auth-recovery watchdog (#343) so the inbound message path can
+   * hand off pasted OAuth codes in the alert channel. */
+  set_auth_watchdog(watchdog: AuthWatchdog): void {
+    this._auth_watchdog = watchdog;
   }
 
   set_pool(pool: BotPool): void {
@@ -2475,6 +2483,23 @@ export class DiscordBot extends EventEmitter {
   private async handle_message(message: Message): Promise<void> {
     // Ignore bot messages
     if (message.author.bot) return;
+
+    // Auth-recovery watchdog (#343): a pasted OAuth code in the alert channel
+    // is consumed here before any normal routing. The handler enforces the
+    // owner-only security boundary and only matches an open incident's state —
+    // non-owner messages and non-code messages fall through untouched.
+    if (this._auth_watchdog) {
+      try {
+        const consumed = await this._auth_watchdog.try_handle_code_submission(
+          message.channelId,
+          message.author.id,
+          message.content,
+        );
+        if (consumed) return;
+      } catch (err) {
+        console.error(`[discord] auth-watchdog code handler failed: ${String(err)}`);
+      }
+    }
 
     // Look up channel in entity map
     const entry = this.channel_map.get(message.channelId);
