@@ -21,6 +21,7 @@ The LobsterFarm daemon process. Manages entities, spawns Claude Code agent sessi
 - `persistence.ts` -- JSON file persistence for PR review state and pool state. Saves to and loads from `~/.lobsterfarm/state/`.
 - `pid.ts` -- PID file management. Write, read, remove, and check if the daemon is already running.
 - `pr-cron.ts` -- `PRReviewCron`. Polls entity repos for open PRs, spawns headless reviewer sessions, and routes outcomes (approve/merge, fix, escalate).
+- `auth-watchdog.ts` -- `AuthWatchdog`. Per shared Claude credential (config dir), runs a periodic fresh-process canary probe + best-effort keychain expiry check. On a logged-out/invalid-grant credential it quarantines poisoned session transcripts, generates a re-login URL, and alerts the owner in the configured channel; the owner pastes the OAuth code back (owner-only security boundary), which completes the login and recycles the affected pool bots. Network/rate failures are never treated as auth incidents.
 - `webhook-handler.ts` -- GitHub webhook handler. Receives PR events, verifies signatures, maps repos to entities, and spawns reviewer/fixer sessions.
 
 ## Key Concepts

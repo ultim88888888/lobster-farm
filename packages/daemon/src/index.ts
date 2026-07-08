@@ -1,6 +1,7 @@
 import type { Server } from "node:http";
 import { set_discord_bot, set_pool } from "./actions.js";
 import { AlertRouter } from "./alert-router.js";
+import { AuthWatchdog } from "./auth-watchdog.js";
 import { CommanderProcess } from "./commander-process.js";
 import { load_config } from "./config.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
@@ -285,6 +286,20 @@ async function main(): Promise<void> {
     console.log("[pr-cron] Disabled via config (pr_cron.enabled: false)");
   }
 
+  // Start the auth-recovery watchdog (#343) — detects stale/expired shared
+  // Claude OAuth creds, quarantines poisoned sessions, alerts the owner with a
+  // re-login URL, accepts the pasted code via Discord, and recycles the bots.
+  const auth_watchdog = new AuthWatchdog({
+    config,
+    registry,
+    pool,
+    discord: discord_for_routing,
+  });
+  if (discord_connected) {
+    discord.set_auth_watchdog(auth_watchdog);
+  }
+  auth_watchdog.start();
+
   // Start periodic worktree sweep (hourly) — cleans up stale worktrees from
   // merged PRs that the webhook handler missed or from manual merges.
   const WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -370,6 +385,7 @@ async function main(): Promise<void> {
     // Enter drain mode — no new work accepted
     pool.drain();
     pr_cron.stop();
+    auth_watchdog.stop();
     clearInterval(worktree_sweep_timer);
     clearInterval(memory_prune_timer);
 

@@ -1377,6 +1377,29 @@ export class BotPool extends EventEmitter {
     }
   }
 
+  /** Recycle assigned bots on a given Claude credential (config dir) that show
+   * stale OAuth. Kills each matching bot's tmux so the health monitor restarts
+   * it fresh — with a now-valid token and `--resume` — while poisoned sessions
+   * (already quarantined by the auth watchdog) start clean. `config_dir` null
+   * matches bots on the default account (no subscription override). Returns the
+   * number of bots recycled. Read-only w.r.t. bot state — only the dead tmux is
+   * touched; crash recovery handles the respawn. See issue #343. */
+  recycle_stale_oauth_on_config_dir(config_dir: string | null): number {
+    let count = 0;
+    for (const bot of this.bots) {
+      if (bot.state !== "assigned" || !bot.entity_id) continue;
+      const bot_dir = this.resolve_claude_config_dir(bot.entity_id);
+      if ((bot_dir ?? null) !== (config_dir ?? null)) continue;
+      if (!this.is_pane_stale_oauth(bot.tmux_session)) continue;
+      this.kill_tmux(bot.tmux_session);
+      count++;
+      console.warn(
+        `[pool] Recycled pool-${String(bot.id)} (stale OAuth on ${config_dir ?? "default account"}) — health monitor will restart it fresh`,
+      );
+    }
+    return count;
+  }
+
   /** Kill the tmux session for a bot with a stale OAuth token.
    * Called by discord.ts before release_with_history() when the CLI is alive
    * but unresponsive due to expired authentication. */
