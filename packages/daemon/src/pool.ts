@@ -12,6 +12,8 @@ import {
   ensure_per_entity_config_dir_ready,
   session_jsonl_exists_anywhere_in,
 } from "./claude-config-migration.js";
+import { prune_wedge_state, scan_for_wedged_bots } from "./econnreset-recovery.js";
+import type { RecycleRecord, WedgeObservation } from "./econnreset-recovery.js";
 import { resolve_binary } from "./env.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
@@ -415,6 +417,14 @@ export class BotPool extends EventEmitter {
   private session_watchers = new Map<number, ReturnType<typeof setTimeout>>();
   /** Timer for the rate-limit modal recovery scan (60s interval, issue #270). */
   private rate_limit_timer: ReturnType<typeof setInterval> | null = null;
+  /** Timer for the API-wedge (ECONNRESET) recovery scan (30s, issue #337). */
+  private wedge_timer: ReturnType<typeof setInterval> | null = null;
+  /** Per-bot wedge observation windows — tracks consecutive wedge-positive ticks.
+   * bot_id → WedgeObservation. Cleared when a bot recovers or is released. */
+  private wedge_observations = new Map<number, WedgeObservation>();
+  /** Per-bot recycle history — used for rate-limiting and escalation.
+   * bot_id → RecycleRecord. Entries pruned once outside the escalation window. */
+  private wedge_recycle_records = new Map<number, RecycleRecord>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -1264,6 +1274,9 @@ export class BotPool extends EventEmitter {
       const bot_id = bot.id;
       this.kill_tmux(bot.tmux_session);
       this.cancel_session_watcher(bot_id);
+      // Clear wedge observation so a future assignment on this bot doesn't
+      // inherit a stale observation window from the previous assignment.
+      this.wedge_observations.delete(bot_id);
 
       // Clear any orphaned pending file when releasing a bot — prevents stale
       // message content from a previous assignment leaking into a future one.
@@ -1303,6 +1316,9 @@ export class BotPool extends EventEmitter {
   /** Park a bot — preserve session ID for later resume, free the bot. */
   private async park_bot(bot: PoolBot): Promise<void> {
     this.kill_tmux(bot.tmux_session);
+    // Clear wedge observation on park — the tmux session is being killed so
+    // any in-progress observation window is moot.
+    this.wedge_observations.delete(bot.id);
     bot.state = "parked";
     // session_id, channel_id, entity_id, archetype preserved for resume in memory.
     // Clear access.json on disk so no stale channel config survives if the bot's
@@ -1528,6 +1544,10 @@ export class BotPool extends EventEmitter {
    * When a dead session is found, attempts to restart it automatically.
    * If restart fails, emits "bot:session_ended" and frees the bot.
    * If the bot is in a crash loop (>3 crashes/hour), releases without restart.
+   *
+   * Also starts the API-wedge recovery monitor (issue #337) on the same call —
+   * wedge detection runs on a separate 30s interval so the two concerns remain
+   * independently observable and testable.
    */
   start_health_monitor(): void {
     if (this.health_timer) return; // already running
@@ -1537,6 +1557,7 @@ export class BotPool extends EventEmitter {
     }, 30_000);
 
     console.log("[pool] Health monitor started (30s interval)");
+    this.start_wedge_monitor();
   }
 
   /** Stop the health monitor. */
@@ -1546,6 +1567,7 @@ export class BotPool extends EventEmitter {
       this.health_timer = null;
       console.log("[pool] Health monitor stopped");
     }
+    this.stop_wedge_monitor();
   }
 
   /**
@@ -1578,6 +1600,41 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Start the API-wedge (ECONNRESET) recovery monitor (issue #337).
+   *
+   * Every 30 seconds, captures the tmux pane of each assigned pool bot and
+   * checks for the Claude Code API-error retry signature. A bot is considered
+   * wedged when the signature persists across ≥ 2 consecutive checks spanning
+   * ≥ 3 minutes AND last_active has not advanced (proving the bot got no
+   * successful response). When confirmed wedged, the tmux session is killed so
+   * the existing crash-recovery path respawns it with --resume.
+   *
+   * Rate-limit guard: at most 1 recycle per bot per 10 min; if ≥ 3 recycles in
+   * 30 min, escalate to #alerts instead of recycling (genuine API outage).
+   *
+   * Runs on the same 30s cadence as the crash-health monitor for simplicity —
+   * separate timer so the two concerns remain independent.
+   */
+  start_wedge_monitor(): void {
+    if (this.wedge_timer) return; // already running
+
+    this.wedge_timer = setInterval(() => {
+      void this.check_api_wedges();
+    }, 30_000);
+
+    console.log("[pool] API-wedge recovery monitor started (30s interval)");
+  }
+
+  /** Stop the API-wedge recovery monitor. */
+  stop_wedge_monitor(): void {
+    if (this.wedge_timer) {
+      clearInterval(this.wedge_timer);
+      this.wedge_timer = null;
+      console.log("[pool] API-wedge recovery monitor stopped");
+    }
+  }
+
+  /**
    * Scan assigned bots for rate-limit modals and dismiss them.
    * Protected so tests can invoke directly without waiting for the interval.
    */
@@ -1601,6 +1658,99 @@ export class BotPool extends EventEmitter {
       } catch (err) {
         console.warn(
           `[rate-limit-recovery] Failed to alert for ${result.tmux_session}: ${String(err)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Scan assigned bots for API-wedge (ECONNRESET) and handle them.
+   * Protected so tests can invoke directly without waiting for the interval.
+   *
+   * For each assigned bot whose tmux pane shows an API-error retry signature
+   * persisting across ≥ WEDGE_MIN_CHECKS ticks spanning ≥ WEDGE_MIN_MINUTES
+   * minutes (and last_active has not advanced), the tmux session is killed and
+   * the existing crash-recovery path respawns it with --resume.
+   *
+   * Rate-limit / escalation (issue #337):
+   *   - At most 1 recycle per bot per RECYCLE_COOLDOWN_MS (10 min).
+   *   - If ≥ ESCALATE_THRESHOLD recycles in ESCALATE_WINDOW_MS (30 min),
+   *     stop recycling and escalate to #alerts instead.
+   */
+  protected async check_api_wedges(): Promise<void> {
+    if (this._draining) return;
+
+    const assigned = this.bots.filter((b) => b.state === "assigned");
+    if (assigned.length === 0) return;
+
+    // Prune stale state for released/parked bots before scanning
+    const assigned_ids = new Set(assigned.map((b) => b.id));
+    prune_wedge_state(this.wedge_observations, this.wedge_recycle_records, assigned_ids);
+
+    const results = scan_for_wedged_bots(
+      assigned,
+      this.wedge_observations,
+      this.wedge_recycle_records,
+    );
+
+    for (const { bot, tick } of results) {
+      const entity_config = bot.entity_id ? this.registry?.get(bot.entity_id) : undefined;
+      const channel_label =
+        entity_config?.entity.channels.list.find((ch) => ch.id === bot.channel_id)?.purpose ??
+        bot.channel_id ??
+        bot.entity_id ??
+        "unknown";
+
+      if (tick.action === "escalate") {
+        // Too many recycles — the API is likely genuinely down. Stop recycling.
+        console.error(
+          `[pool] pool-${String(bot.id)} wedge-escalated: ${String(tick.recycle_count)} recycles in 30 min — stopping auto-recycle`,
+        );
+        try {
+          await notify(
+            "alerts",
+            `🔴 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) wedged on API retries ${String(tick.recycle_count)}x in 30 min for ${bot.entity_id ?? "unknown"}/${channel_label} — auto-recycle suspended. Check API status.`,
+            entity_config,
+          );
+        } catch (err) {
+          console.warn(
+            `[pool] Failed to alert escalation for pool-${String(bot.id)}: ${String(err)}`,
+          );
+        }
+        continue;
+      }
+
+      // action === "recycle": kill tmux so crash-recovery respawns with --resume
+      console.warn(
+        `[pool] pool-${String(bot.id)} wedged on API retries — recycling ` +
+          `(channel: ${bot.channel_id ?? "none"})`,
+      );
+
+      sentry.addBreadcrumb({
+        category: "daemon.pool",
+        message: `pool-${String(bot.id)} wedged on API retries — recycling`,
+        data: {
+          bot_id: bot.id,
+          channel_id: bot.channel_id,
+          entity_id: bot.entity_id,
+          archetype: bot.archetype,
+        },
+      });
+
+      // Kill the tmux session — the 30s crash-health monitor will notice
+      // on its next tick and call restart_crashed_session() with --resume.
+      this.kill_tmux(bot.tmux_session);
+
+      // Alert (mirroring crash-restart alert wording)
+      try {
+        await notify(
+          "alerts",
+          `⚠️ Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) wedged on API retries and was auto-recycled for ${bot.entity_id ?? "unknown"}/${channel_label}`,
+          entity_config,
+        );
+      } catch (err) {
+        console.warn(
+          `[pool] Failed to alert wedge recycle for pool-${String(bot.id)}: ${String(err)}`,
         );
       }
     }
@@ -2125,6 +2275,7 @@ export class BotPool extends EventEmitter {
   async shutdown(): Promise<void> {
     this.stop_health_monitor();
     this.stop_rate_limit_monitor();
+    this.stop_wedge_monitor();
 
     // Cancel all in-flight session confirmation watchers — we're about to
     // kill tmux anyway, and the timers would otherwise keep the event loop
