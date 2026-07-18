@@ -21,4 +21,15 @@ export class BotPoolTestBase extends BotPool {
   protected override watch_session_confirmation(bot: PoolBot): void {
     bot.session_confirmed = true;
   }
+  /** Default to "MCP healthy" (issue #345) — these tests don't exercise
+   * MCP verification and would otherwise incur real tmux/pgrep calls and
+   * multi-second wait loops against fake tmux session names. Test files
+   * that need to exercise MCP detection/recovery should extend BotPool
+   * directly (see pool-mcp-health.test.ts). */
+  protected override async check_mcp_health(): Promise<void> {
+    /* no-op */
+  }
+  protected override async verify_mcp_post_spawn(): Promise<boolean> {
+    return true;
+  }
 }

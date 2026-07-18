@@ -1,0 +1,503 @@
+/**
+ * MCP connection verification and auto-reconnect recovery for pool bots and
+ * the Commander (Pat).
+ *
+ * 2026-07-18 outage: after a machine reboot, sessions came up "alive but
+ * deaf" — tmux alive, Claude at the prompt, but the Discord plugin's MCP
+ * server process was never spawned (or died) inside the session, and
+ * nothing retried. Pane text is NOT a trustworthy proxy for a live MCP
+ * connection — `wait_for_bot_ready` already requires "Listening for channel
+ * messages" in the pane, and deaf sessions passed that check anyway.
+ *
+ * Detection is process-level: a healthy session has a `bun` child process
+ * (the plugin MCP server) under the pane PID.
+ *
+ * Recovery is ordered:
+ *   1. Scripted in-session `/mcp` Reconnect (primary) — driven via tmux
+ *      send-keys with a pane-state guard before every keystroke. Preserves
+ *      full conversation context, measured 19/19 during the incident.
+ *   2. Kill + resume (fallback) — after 2 failed Reconnect attempts, kill
+ *      the tmux session and let the existing crash-recovery path
+ *      (`restart_crashed_session`) respawn it with `--resume`. Recycling
+ *      alone (no MCP verification) was measured at ~25% success in bad
+ *      windows — Reconnect is tried first because it's far more reliable
+ *      and doesn't touch the crash-loop counter.
+ *
+ * Anti-thrash: at most one recovery action (a Reconnect attempt or the
+ * fallback) per bot per 10 minutes. After 3 failed full recovery cycles
+ * (Reconnect x2 + fallback, still unhealthy) within 30 minutes, give up —
+ * stop attempting and let the caller alert. The bot is never released.
+ *
+ * References: issue #345. Template for pane-driving with guards:
+ * `rate-limit-recovery.ts` (#270) and `econnreset-recovery.ts` (#337, sibling
+ * — a different failure mode, deliberately not merged with this detector).
+ */
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+// ── Thresholds ──
+
+/** Don't flag a session younger than this — the MCP server takes a few
+ * seconds to appear after spawn. */
+export const MCP_GRACE_PERIOD_MS = 60_000;
+
+/** Require the process-level check to fail this many consecutive ticks
+ * before acting — avoids racing a slow spawn. */
+export const MCP_MIN_CONSECUTIVE_FAILS = 2;
+
+/** At most one recovery action (Reconnect attempt or fallback) per bot in
+ * this window. */
+export const MCP_RECOVERY_COOLDOWN_MS = 10 * 60 * 1000;
+
+/** Number of scripted Reconnect attempts tried before falling back to
+ * kill + resume. Spec: "If Reconnect fails twice, kill the tmux session." */
+export const MCP_MAX_RECONNECT_ATTEMPTS = 2;
+
+/** Give up (stop attempting, escalate) after this many failed full recovery
+ * cycles within MCP_GIVEUP_WINDOW_MS. */
+export const MCP_GIVEUP_THRESHOLD = 3;
+export const MCP_GIVEUP_WINDOW_MS = 30 * 60 * 1000;
+
+/** Wait between each guarded keystroke of the reconnect driver, giving the
+ * TUI time to render before the next pane capture. */
+export const MCP_RECONNECT_STEP_WAIT_MS = 1_500;
+
+/** After sending the final Reconnect keystroke, wait this long before
+ * re-verifying the process-level signal (spec: "wait ~6s"). */
+export const MCP_RECONNECT_VERIFY_WAIT_MS = 6_000;
+
+/** Safety cap on Down-presses while hunting for the plugin:discord row —
+ * the server count varies per session; this just bounds a runaway loop. */
+export const MCP_MAX_DOWN_PRESSES = 20;
+
+// ── Process-level detection ──
+
+/** Get the pane PID of a tmux session's active pane. Returns null if the
+ * session doesn't exist or the pane PID can't be parsed. */
+export function get_pane_pid(tmux_session: string): number | null {
+  try {
+    const out = execFileSync("tmux", ["list-panes", "-t", tmux_session, "-F", "#{pane_pid}"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    })
+      .trim()
+      .split("\n")[0];
+    const pid = Number.parseInt(out ?? "", 10);
+    return Number.isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+/** Check whether the pane PID has any child processes (pgrep -P). Returns
+ * false on any error — `pgrep` exits non-zero with no output when there are
+ * no matching children, which is a legitimate "no MCP server" result, not a
+ * tool failure worth distinguishing. */
+export function has_children(pane_pid: number): boolean {
+  try {
+    const out = execFileSync("pgrep", ["-P", String(pane_pid)], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
+    return out.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Primary detection signal (spec: process-level, reliable, scriptable).
+ * A healthy session has a `bun` child process (the plugin MCP server) under
+ * the pane PID. Returns false if the pane can't be read or has no children
+ * — both mean "can't confirm a live MCP connection."
+ */
+export function has_mcp_child(
+  tmux_session: string,
+  pane_pid_fn: (session: string) => number | null = get_pane_pid,
+  has_children_fn: (pid: number) => boolean = has_children,
+): boolean {
+  const pane_pid = pane_pid_fn(tmux_session);
+  if (pane_pid === null) return false;
+  return has_children_fn(pane_pid);
+}
+
+// ── Corroborating signal (log-dir, diagnosis only — never gates recovery) ──
+
+/** Encode an absolute path into the claude-cli-nodejs cache slug format
+ * (replaces every `/` and `.` with `-`). Mirrors `encode_project_slug` in
+ * pool.ts — duplicated here rather than imported to avoid a pool.ts <->
+ * mcp-health.ts import cycle; both are one-line pure functions. */
+export function encode_cache_slug(abs_path: string): string {
+  return abs_path.replace(/[/.]/g, "-");
+}
+
+/** Absolute path to this session's Discord plugin MCP log directory. */
+export function mcp_log_dir(working_dir: string): string {
+  return join(
+    homedir(),
+    "Library",
+    "Caches",
+    "claude-cli-nodejs",
+    encode_cache_slug(working_dir),
+    "mcp-logs-plugin-discord-discord",
+  );
+}
+
+export type McpFailureMode = "never-spawned" | "died" | "unknown";
+
+/**
+ * Classify a detected MCP failure using the log-dir corroborating signal,
+ * for logging/diagnosis only — this NEVER gates detection or recovery
+ * (spec: "Do NOT rely on pane text" applies equally to log presence, which
+ * can be stale or missing for reasons unrelated to the current failure).
+ */
+export function classify_mcp_failure(
+  working_dir: string,
+  exists_fn: (path: string) => boolean = existsSync,
+): McpFailureMode {
+  const dir = mcp_log_dir(working_dir);
+  if (!exists_fn(dir)) return "never-spawned";
+  return "died";
+}
+
+// ── Tmux pane interaction (reconnect driver primitives) ──
+
+/** Capture the full content of a tmux pane. Returns null if unreadable. */
+export function capture_pane(tmux_session: string): string | null {
+  try {
+    return execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Send one or more keys/literal strings to a tmux session via send-keys.
+ * Best-effort — a dead/unreadable session throws from tmux itself; swallow
+ * it the same way `capture_pane` fails closed to null, so a stray failed
+ * keystroke can't crash the driver mid-sequence (the next pane capture will
+ * naturally see the unexpected state and abort). */
+export function send_keys(tmux_session: string, ...keys: string[]): void {
+  try {
+    execFileSync("tmux", ["send-keys", "-t", tmux_session, ...keys], {
+      stdio: "ignore",
+      timeout: 2000,
+    });
+  } catch {
+    /* best-effort — see doc comment above */
+  }
+}
+
+/** Find the line containing the `❯` selection cursor in a TUI list/panel. */
+export function selection_line(pane_output: string): string | null {
+  return pane_output.split("\n").find((line) => line.includes("❯")) ?? null;
+}
+
+// ── Reconnect driver (Step 1) ──
+
+export interface McpDriver {
+  capture: (session: string) => string | null;
+  send: (session: string, ...keys: string[]) => void;
+  sleep: (ms: number) => Promise<void>;
+  is_healthy: (session: string) => boolean;
+}
+
+export const default_mcp_driver: McpDriver = {
+  capture: capture_pane,
+  send: send_keys,
+  sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+  is_healthy: (session: string) => has_mcp_child(session),
+};
+
+export type ReconnectFailureReason =
+  | "panel_not_open"
+  | "server_not_found"
+  | "wrong_selection"
+  | "detail_menu_not_shown"
+  | "child_still_missing"
+  | "pane_unreadable";
+
+export type ReconnectResult = { ok: true } | { ok: false; reason: ReconnectFailureReason };
+
+/**
+ * Drive Claude Code's `/mcp` TUI to reconnect the Discord plugin server.
+ * Guards at every step (spec): stray keys go into the prompt if we don't
+ * verify pane state before each Enter — this fired an accidental `/compact`
+ * during manual recovery in the incident. Aborts with Escape on any
+ * unexpected pane state instead of pressing on blind.
+ *
+ * Sequence (measured 19/19 during the incident):
+ *   1. Send `/mcp` + Enter.
+ *   2. Confirm "Manage MCP servers" panel visible, else abort.
+ *   3. Press Down until the `❯` selection line contains "plugin:discord" —
+ *      never count keystrokes, the server list varies per session (e.g. a
+ *      "computer-use" built-in may appear first).
+ *   4. Re-confirm the selection line before Enter (guards against a stray
+ *      keystroke moving the cursor between capture and send).
+ *   5. Confirm the detail menu shows "❯ 1. Reconnect" selected, else abort.
+ *   6. Enter, wait ~6s, then re-verify the process-level signal.
+ */
+export async function attempt_mcp_reconnect(
+  tmux_session: string,
+  driver: McpDriver = default_mcp_driver,
+): Promise<ReconnectResult> {
+  driver.send(tmux_session, "/mcp", "Enter");
+  await driver.sleep(MCP_RECONNECT_STEP_WAIT_MS);
+
+  let pane = driver.capture(tmux_session);
+  if (pane === null) return { ok: false, reason: "pane_unreadable" };
+  if (!pane.includes("Manage MCP servers")) {
+    driver.send(tmux_session, "Escape");
+    return { ok: false, reason: "panel_not_open" };
+  }
+
+  let found = false;
+  for (let i = 0; i < MCP_MAX_DOWN_PRESSES; i++) {
+    pane = driver.capture(tmux_session);
+    if (pane === null) return { ok: false, reason: "pane_unreadable" };
+    if (selection_line(pane)?.includes("plugin:discord")) {
+      found = true;
+      break;
+    }
+    driver.send(tmux_session, "Down");
+    await driver.sleep(MCP_RECONNECT_STEP_WAIT_MS);
+  }
+  if (!found) {
+    driver.send(tmux_session, "Escape");
+    return { ok: false, reason: "server_not_found" };
+  }
+
+  // Re-confirm immediately before Enter — guards against a stray keystroke
+  // moving the selection between the last capture and now.
+  pane = driver.capture(tmux_session);
+  if (pane === null) return { ok: false, reason: "pane_unreadable" };
+  if (!selection_line(pane)?.includes("plugin:discord")) {
+    driver.send(tmux_session, "Escape");
+    return { ok: false, reason: "wrong_selection" };
+  }
+  driver.send(tmux_session, "Enter");
+  await driver.sleep(MCP_RECONNECT_STEP_WAIT_MS);
+
+  pane = driver.capture(tmux_session);
+  if (pane === null) return { ok: false, reason: "pane_unreadable" };
+  if (!selection_line(pane)?.includes("1. Reconnect")) {
+    driver.send(tmux_session, "Escape");
+    return { ok: false, reason: "detail_menu_not_shown" };
+  }
+  driver.send(tmux_session, "Enter");
+
+  await driver.sleep(MCP_RECONNECT_VERIFY_WAIT_MS);
+  if (!driver.is_healthy(tmux_session)) {
+    return { ok: false, reason: "child_still_missing" };
+  }
+
+  // Back to the prompt.
+  driver.send(tmux_session, "Escape");
+  return { ok: true };
+}
+
+// ── Recovery cycle orchestration (Step 1 x N, then Step 2 fallback) ──
+
+export type RecoveryCycleOutcome = "reconnected" | "fell_back";
+
+/**
+ * Run one full recovery cycle for a bot: up to MCP_MAX_RECONNECT_ATTEMPTS
+ * scripted `/mcp` Reconnect attempts (Step 1), falling back to `kill_fn()`
+ * (Step 2 — kills the tmux session; the caller's existing crash-recovery
+ * path picks up the respawn with `--resume` on its next tick) if all of
+ * them fail.
+ *
+ * Runs end-to-end inside a single health-tick invocation (each Reconnect
+ * attempt takes only a few seconds) so the caller's per-bot cooldown
+ * throttles whole cycles, not individual keystroke-level attempts — this is
+ * what makes "≤1 action/10min" and "≤3 failed cycles/30min" compatible
+ * (3 cycles x 10min cooldown = 30min, not 3 cycles x 2 attempts x 10min).
+ */
+export async function run_mcp_recovery_cycle(
+  tmux_session: string,
+  kill_fn: () => void,
+  driver: McpDriver = default_mcp_driver,
+): Promise<RecoveryCycleOutcome> {
+  for (let attempt = 0; attempt < MCP_MAX_RECONNECT_ATTEMPTS; attempt++) {
+    const result = await attempt_mcp_reconnect(tmux_session, driver);
+    if (result.ok) return "reconnected";
+  }
+  kill_fn();
+  return "fell_back";
+}
+
+// ── Continuous-monitoring state machine (grace + consecutive-fail gate,
+//    per-bot cooldown, give-up) ──
+
+export interface McpRecoveryState {
+  /** Consecutive health-tick failures since the last healthy reading. */
+  consecutive_fails: number;
+  /** epoch ms of the last recovery cycle — drives the 10-minute per-bot
+   * cooldown between cycles. */
+  last_action_ms: number | null;
+  /** epoch ms timestamps of failed cycles (recorded via
+   * `record_cycle_outcome` when a cycle ends in "fell_back") — drives the
+   * give-up count. */
+  cycle_fail_timestamps: number[];
+  /** Once true, stop acting entirely until the bot is observed healthy
+   * again (external recovery or manual intervention resets state). */
+  given_up: boolean;
+}
+
+function initial_state(): McpRecoveryState {
+  return {
+    consecutive_fails: 0,
+    last_action_ms: null,
+    cycle_fail_timestamps: [],
+    given_up: false,
+  };
+}
+
+export type McpHealthAction = { action: "none" } | { action: "recover" };
+
+/**
+ * Decide what (if anything) to do for one bot on one health tick.
+ *
+ * Mutates `state` in place — the caller owns the map and persists it across
+ * ticks. Pure w.r.t. its inputs otherwise (no I/O), so it's a plain unit to
+ * test against synthetic tick sequences.
+ *
+ * When this returns `{action: "recover"}`, the caller should run
+ * `run_mcp_recovery_cycle` and report the outcome back via
+ * `record_cycle_outcome` — this function only decides *whether* to act.
+ *
+ * @param bot_id - identifies the bot's entry in `state`
+ * @param is_healthy - result of has_mcp_child() this tick
+ * @param is_idle - whether the bot is idle at the prompt right now. Gates
+ *   "recover" — Step 1 drives the TUI, so it must not run mid-turn (spec:
+ *   "reuse the existing idle-detection used for injection draining... if
+ *   mid-turn, defer to the next health tick"). Deferring does NOT consume
+ *   the cooldown budget.
+ * @param age_ms - how long the current session has been assigned/spawned
+ * @param now_ms - current epoch ms (injectable for testing)
+ * @param state - mutable map: bot_id → McpRecoveryState (owned by caller)
+ */
+export function process_mcp_health_tick(
+  bot_id: number,
+  is_healthy: boolean,
+  is_idle: boolean,
+  age_ms: number,
+  now_ms: number,
+  state: Map<number, McpRecoveryState>,
+): McpHealthAction {
+  const s = state.get(bot_id) ?? initial_state();
+
+  if (age_ms < MCP_GRACE_PERIOD_MS) {
+    state.set(bot_id, { ...s, consecutive_fails: 0 });
+    return { action: "none" };
+  }
+
+  if (is_healthy) {
+    // Healthy — clear everything, including give-up. A bot that recovers
+    // (on its own or via our recovery) gets a fresh slate.
+    state.set(bot_id, initial_state());
+    return { action: "none" };
+  }
+
+  const fails = s.consecutive_fails + 1;
+
+  if (fails < MCP_MIN_CONSECUTIVE_FAILS) {
+    state.set(bot_id, { ...s, consecutive_fails: fails });
+    return { action: "none" };
+  }
+
+  if (s.given_up) {
+    state.set(bot_id, { ...s, consecutive_fails: fails });
+    return { action: "none" };
+  }
+
+  if (s.last_action_ms !== null && now_ms - s.last_action_ms < MCP_RECOVERY_COOLDOWN_MS) {
+    state.set(bot_id, { ...s, consecutive_fails: fails });
+    return { action: "none" };
+  }
+
+  if (!is_idle) {
+    // Mid-turn — defer to the next tick without spending cooldown budget.
+    state.set(bot_id, { ...s, consecutive_fails: fails });
+    return { action: "none" };
+  }
+
+  state.set(bot_id, { ...s, consecutive_fails: fails, last_action_ms: now_ms });
+  return { action: "recover" };
+}
+
+/**
+ * Report the outcome of a recovery cycle back into `state`. Call this after
+ * `run_mcp_recovery_cycle` resolves, following a `{action: "recover"}` tick.
+ *
+ * A "reconnected" outcome needs no bookkeeping here — the next health tick
+ * will observe `is_healthy: true` and clear the state naturally.
+ *
+ * A "fell_back" outcome records a failed-cycle timestamp and, once
+ * MCP_GIVEUP_THRESHOLD failed cycles land within MCP_GIVEUP_WINDOW_MS, sets
+ * `given_up` so future ticks stay silent instead of spamming recovery
+ * attempts (and #alerts) for a bot that isn't responding to any of them.
+ *
+ * Returns escalation info when this outcome crosses the give-up threshold,
+ * or null otherwise.
+ */
+export function record_cycle_outcome(
+  bot_id: number,
+  outcome: RecoveryCycleOutcome,
+  now_ms: number,
+  state: Map<number, McpRecoveryState>,
+): { cycle_fail_count: number } | null {
+  if (outcome === "reconnected") return null;
+
+  const s = state.get(bot_id) ?? initial_state();
+  const window_start = now_ms - MCP_GIVEUP_WINDOW_MS;
+  const recent_cycle_fails = [...s.cycle_fail_timestamps.filter((t) => t > window_start), now_ms];
+  const given_up = recent_cycle_fails.length >= MCP_GIVEUP_THRESHOLD;
+
+  state.set(bot_id, { ...s, cycle_fail_timestamps: recent_cycle_fails, given_up });
+
+  return given_up ? { cycle_fail_count: recent_cycle_fails.length } : null;
+}
+
+/** Remove state entries for bots no longer assigned (released, parked) so
+ * the map doesn't grow unbounded. Call periodically from the health loop. */
+export function prune_mcp_state(
+  state: Map<number, McpRecoveryState>,
+  assigned_bot_ids: Set<number>,
+): void {
+  for (const id of state.keys()) {
+    if (!assigned_bot_ids.has(id)) {
+      state.delete(id);
+    }
+  }
+}
+
+// ── Post-spawn verification (grace-period poll, no state machine) ──
+
+/**
+ * Poll for the MCP child to appear after a fresh spawn. Distinct from the
+ * continuous-monitoring tick machinery above — this is a one-shot wait used
+ * right after `start_tmux` + `wait_for_bot_ready`, mirroring the shape of
+ * `wait_for_bot_ready` itself (poll loop with a bounded timeout).
+ */
+export async function wait_for_mcp_child(
+  tmux_session: string,
+  opts?: { timeout_ms?: number; poll_ms?: number },
+  has_child_fn: (session: string) => boolean = has_mcp_child,
+): Promise<boolean> {
+  const timeout = opts?.timeout_ms ?? 15_000;
+  const poll = opts?.poll_ms ?? 1_000;
+  const start = Date.now();
+
+  if (has_child_fn(tmux_session)) return true;
+
+  while (Date.now() - start < timeout) {
+    await new Promise((resolve) => setTimeout(resolve, poll));
+    if (has_child_fn(tmux_session)) return true;
+  }
+  return false;
+}

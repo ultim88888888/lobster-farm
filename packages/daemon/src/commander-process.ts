@@ -6,7 +6,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
+import {
+  has_mcp_child,
+  process_mcp_health_tick,
+  record_cycle_outcome,
+  run_mcp_recovery_cycle,
+  wait_for_mcp_child,
+} from "./mcp-health.js";
+import type { McpRecoveryState } from "./mcp-health.js";
 import { resolve_model_id } from "./models.js";
+import { is_tmux_session_idle } from "./pool.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
 
@@ -25,6 +34,10 @@ const BACKOFF_RESET_MS = 10 * 60 * 1000; // 10 min stable → reset counter
 const MAX_RESTARTS = 5;
 const HEALTH_INTERVAL_MS = 10_000; // check every 10s
 
+/** Single-instance key into the mcp_state map — Pat has exactly one session,
+ * unlike the pool bots (indexed by numeric bot id in pool.ts). */
+const PAT_MCP_STATE_KEY = 0;
+
 /**
  * Manages a persistent Claude Code session connected to Discord via the
  * channel plugin, running inside a tmux session for proper TTY support.
@@ -37,6 +50,12 @@ export class CommanderProcess extends EventEmitter {
   private restart_timer: ReturnType<typeof setTimeout> | null = null;
   private backoff_reset_timer: ReturnType<typeof setTimeout> | null = null;
   private health_timer: ReturnType<typeof setInterval> | null = null;
+  /** MCP connection health state for Pat's session (issue #345). Keyed by
+   * PAT_MCP_STATE_KEY since there's only ever one Commander session. */
+  private mcp_state = new Map<number, McpRecoveryState>();
+  /** True while a check_mcp_health() cycle is in flight — prevents two
+   * overlapping recovery cycles if a health tick fires mid-cycle. */
+  private mcp_check_running = false;
 
   constructor(private config: LobsterFarmConfig) {
     super();
@@ -241,6 +260,12 @@ export class CommanderProcess extends EventEmitter {
         console.log(`[commander] ${agent_name} running in tmux (pane pid: ${String(pid)})`);
         this.emit("started", pid);
 
+        // Post-spawn MCP verification gate (issue #345), fire-and-forget —
+        // mirrors pool.ts's verify_mcp_post_spawn: wait for the MCP child,
+        // fall back to one scripted /mcp Reconnect attempt if it doesn't
+        // appear. Not awaited — start() shouldn't block server startup.
+        void this.verify_mcp_post_spawn();
+
         // Persist session_id so future restarts can resume the conversation
         void this.write_session_id(session_id).catch((err) => {
           console.error(`[commander] Failed to persist session_id: ${String(err)}`);
@@ -290,9 +315,15 @@ export class CommanderProcess extends EventEmitter {
           clearTimeout(this.backoff_reset_timer);
           this.backoff_reset_timer = null;
         }
+        this.mcp_state.delete(PAT_MCP_STATE_KEY);
         this.emit("crashed", 1);
         this.schedule_restart();
+        return;
       }
+
+      // Tmux alive — verify the Discord plugin MCP server is actually
+      // connected (issue #345). Pane text alone doesn't prove it.
+      void this.check_mcp_health();
     }, HEALTH_INTERVAL_MS);
   }
 
@@ -301,6 +332,103 @@ export class CommanderProcess extends EventEmitter {
       clearInterval(this.health_timer);
       this.health_timer = null;
     }
+  }
+
+  /** Check if Pat's tmux pane is idle at the prompt (reuses pool.ts's
+   * detector — same signal, no need for a second implementation). */
+  private is_idle(): boolean {
+    return is_tmux_session_idle(PAT_TMUX_SESSION);
+  }
+
+  /**
+   * Verify Pat's Discord plugin MCP connection and drive recovery if it's
+   * confirmed dead (issue #345). Mirrors pool.ts's check_mcp_health() —
+   * same detection/anti-thrash state machine, single-session key. Kill +
+   * resume fallback reuses the existing crash-restart path: killing the
+   * tmux session here is picked up by this same interval's next tick via
+   * the dead-tmux branch, which already calls schedule_restart() with its
+   * own backoff — Pat has no separate "crash-loop guard" to preserve.
+   */
+  private async check_mcp_health(): Promise<void> {
+    if (this.mcp_check_running) return;
+    this.mcp_check_running = true;
+
+    try {
+      const healthy = has_mcp_child(PAT_TMUX_SESSION);
+      const age_ms = this.last_started_at ? Date.now() - this.last_started_at.getTime() : 0;
+      const idle = this.is_idle();
+      const now = Date.now();
+
+      const tick = process_mcp_health_tick(
+        PAT_MCP_STATE_KEY,
+        healthy,
+        idle,
+        age_ms,
+        now,
+        this.mcp_state,
+      );
+      if (tick.action === "none") return;
+
+      console.warn("[commander] MCP connection dead — running recovery cycle");
+      sentry.addBreadcrumb({
+        category: "daemon.commander",
+        message: "Commander MCP recovery cycle starting",
+      });
+
+      const outcome = await run_mcp_recovery_cycle(PAT_TMUX_SESSION, () => {
+        console.warn(
+          "[commander] MCP Reconnect exhausted — killing tmux for crash-restart to pick up",
+        );
+        try {
+          execFileSync("tmux", ["kill-session", "-t", PAT_TMUX_SESSION], { stdio: "ignore" });
+        } catch {
+          /* already dead */
+        }
+      });
+
+      if (outcome === "reconnected") {
+        console.log("[commander] MCP reconnected via scripted /mcp Reconnect");
+        return;
+      }
+
+      const escalation = record_cycle_outcome(PAT_MCP_STATE_KEY, outcome, now, this.mcp_state);
+      if (!escalation) return;
+
+      console.error(
+        `[commander] MCP recovery gave up after ${String(escalation.cycle_fail_count)} failed cycles`,
+      );
+      sentry.captureMessage("Commander MCP recovery gave up", "error", {
+        tags: { module: "commander", action: "mcp_recovery_giveup" },
+        contexts: { mcp_recovery: { cycle_fail_count: escalation.cycle_fail_count } },
+      });
+    } finally {
+      this.mcp_check_running = false;
+    }
+  }
+
+  /**
+   * Post-spawn MCP verification gate (issue #345). Waits for the MCP child
+   * to appear after a fresh spawn/resume; if still absent, runs the
+   * scripted `/mcp` Reconnect inline. Does not kill on failure here — that
+   * escalation is owned by check_mcp_health() on the next health tick, same
+   * division of responsibility as pool.ts's verify_mcp_post_spawn().
+   */
+  private async verify_mcp_post_spawn(): Promise<boolean> {
+    if (await wait_for_mcp_child(PAT_TMUX_SESSION)) return true;
+
+    console.warn(
+      "[commander] Spawned but MCP child not detected within grace window — attempting scripted reconnect",
+    );
+    const result = await run_mcp_recovery_cycle(PAT_TMUX_SESSION, () => {
+      /* post-spawn recovery is reconnect-only; see check_mcp_health() for the kill+resume escalation */
+    });
+
+    if (result === "reconnected") {
+      console.log("[commander] MCP reconnected post-spawn via scripted /mcp Reconnect");
+      return true;
+    }
+    console.warn("[commander] MCP still unconfirmed post-spawn — health monitor will retry");
+    return false;
   }
 
   private schedule_restart(): void {
@@ -343,6 +471,7 @@ export class CommanderProcess extends EventEmitter {
       this.backoff_reset_timer = null;
     }
     this.stop_health_polling();
+    this.mcp_state.delete(PAT_MCP_STATE_KEY);
 
     this.state = "stopped";
 
