@@ -311,6 +311,54 @@ describe("check_mcp_health integration", () => {
     expect(bot.state).toBe("assigned"); // still never released
   });
 
+  it("alerts #alerts when the bot recovers after a kill+resume fallback", async () => {
+    mock_has_mcp_child.mockReturnValue(false);
+    mock_run_cycle.mockResolvedValue("fell_back");
+    const bot = old_bot({
+      id: 1,
+      entity_id: "test-entity",
+      channel_id: "ch-1",
+      archetype: "builder",
+    });
+    pool.inject_bots([bot]);
+    (pool as unknown as { registry: EntityRegistry }).registry = make_registry([
+      make_entity_config("test-entity", ["ch-1"]),
+    ]);
+
+    await pool.run_check_mcp_health(bot);
+    await pool.run_check_mcp_health(bot); // cycle runs, falls back to kill+resume
+    expect(mock_notify).not.toHaveBeenCalled(); // below give-up threshold — silent so far
+
+    // Crash-recovery respawned the session and the MCP child is back.
+    mock_has_mcp_child.mockReturnValue(true);
+    await pool.run_check_mcp_health(bot);
+
+    expect(mock_notify).toHaveBeenCalledTimes(1);
+    const [channel_type, message] = mock_notify.mock.calls[0] as [string, string];
+    expect(channel_type).toBe("alerts");
+    expect(message).toContain("Pool bot 1");
+    expect(message).toContain("recovered");
+
+    // Recovery is reported once, not on every subsequent healthy tick.
+    await pool.run_check_mcp_health(bot);
+    expect(mock_notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays silent when the bot recovers after a routine Step 1 reconnect", async () => {
+    mock_has_mcp_child.mockReturnValue(false);
+    mock_run_cycle.mockResolvedValue("reconnected");
+    const bot = old_bot({ id: 1, entity_id: "e1", channel_id: "ch-1" });
+    pool.inject_bots([bot]);
+
+    await pool.run_check_mcp_health(bot);
+    await pool.run_check_mcp_health(bot);
+
+    mock_has_mcp_child.mockReturnValue(true);
+    await pool.run_check_mcp_health(bot);
+
+    expect(mock_notify).not.toHaveBeenCalled();
+  });
+
   it("resets to a fresh anti-thrash slate once the bot is observed healthy again", async () => {
     mock_has_mcp_child.mockReturnValue(false);
     mock_run_cycle.mockResolvedValue("fell_back");

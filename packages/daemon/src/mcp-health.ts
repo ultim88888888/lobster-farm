@@ -345,6 +345,12 @@ export interface McpRecoveryState {
    * `record_cycle_outcome` when a cycle ends in "fell_back") — drives the
    * give-up count. */
   cycle_fail_timestamps: number[];
+  /** epoch ms of the most recent Step 2 (kill+resume) fallback, or null if
+   * the last cycle didn't fall back. Set by `record_cycle_outcome`, consumed
+   * and cleared by the first healthy tick afterwards — that transition is
+   * the "recovered after a fallback" signal the spec wants on #alerts.
+   * Routine Step 1 reconnects never set it, so they stay silent. */
+  last_fell_back_at: number | null;
   /** Once true, stop acting entirely until the bot is observed healthy
    * again (external recovery or manual intervention resets state). */
   given_up: boolean;
@@ -355,11 +361,19 @@ function initial_state(): McpRecoveryState {
     consecutive_fails: 0,
     last_action_ms: null,
     cycle_fail_timestamps: [],
+    last_fell_back_at: null,
     given_up: false,
   };
 }
 
-export type McpHealthAction = { action: "none" } | { action: "recover" };
+export type McpHealthAction =
+  | { action: "none" }
+  | { action: "recover" }
+  /** The bot is healthy again after a Step 2 kill+resume fallback — the
+   * caller should post the one-shot recovery notice (spec: #alerts on
+   * successful recovery after a fallback). Distinct from "recover", which
+   * asks the caller to *start* a recovery cycle. */
+  | { action: "notify_recovered" };
 
 /**
  * Decide what (if anything) to do for one bot on one health tick.
@@ -371,6 +385,10 @@ export type McpHealthAction = { action: "none" } | { action: "recover" };
  * When this returns `{action: "recover"}`, the caller should run
  * `run_mcp_recovery_cycle` and report the outcome back via
  * `record_cycle_outcome` — this function only decides *whether* to act.
+ *
+ * When it returns `{action: "notify_recovered"}`, the bot came back healthy
+ * after a Step 2 fallback and the caller should post the one-shot recovery
+ * notice; no recovery cycle is needed.
  *
  * @param bot_id - identifies the bot's entry in `state`
  * @param is_healthy - result of has_mcp_child() this tick
@@ -400,9 +418,12 @@ export function process_mcp_health_tick(
 
   if (is_healthy) {
     // Healthy — clear everything, including give-up. A bot that recovers
-    // (on its own or via our recovery) gets a fresh slate.
+    // (on its own or via our recovery) gets a fresh slate. Clearing also
+    // consumes `last_fell_back_at`, so the recovery notice fires exactly
+    // once rather than on every healthy tick that follows.
+    const recovered_after_fallback = s.last_fell_back_at !== null;
     state.set(bot_id, initial_state());
-    return { action: "none" };
+    return recovered_after_fallback ? { action: "notify_recovered" } : { action: "none" };
   }
 
   const fails = s.consecutive_fails + 1;
@@ -437,7 +458,12 @@ export function process_mcp_health_tick(
  * `run_mcp_recovery_cycle` resolves, following a `{action: "recover"}` tick.
  *
  * A "reconnected" outcome needs no bookkeeping here — the next health tick
- * will observe `is_healthy: true` and clear the state naturally.
+ * will observe `is_healthy: true` and clear the state naturally, silently
+ * (spec: routine Step 1 reconnects don't page anyone).
+ *
+ * A "fell_back" outcome additionally stamps `last_fell_back_at`, so the first
+ * healthy tick afterwards returns `{action: "notify_recovered"}` and the
+ * caller can post the "recovered after kill+resume" notice.
  *
  * A "fell_back" outcome records a failed-cycle timestamp and, once
  * MCP_GIVEUP_THRESHOLD failed cycles land within MCP_GIVEUP_WINDOW_MS, sets
@@ -460,7 +486,12 @@ export function record_cycle_outcome(
   const recent_cycle_fails = [...s.cycle_fail_timestamps.filter((t) => t > window_start), now_ms];
   const given_up = recent_cycle_fails.length >= MCP_GIVEUP_THRESHOLD;
 
-  state.set(bot_id, { ...s, cycle_fail_timestamps: recent_cycle_fails, given_up });
+  state.set(bot_id, {
+    ...s,
+    cycle_fail_timestamps: recent_cycle_fails,
+    last_fell_back_at: now_ms,
+    given_up,
+  });
 
   return given_up ? { cycle_fail_count: recent_cycle_fails.length } : null;
 }

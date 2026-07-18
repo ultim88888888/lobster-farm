@@ -367,6 +367,18 @@ export class CommanderProcess extends EventEmitter {
         now,
         this.mcp_state,
       );
+      if (tick.action === "notify_recovered") {
+        // One-shot recovery notice after a Step 2 fallback (spec: alert on
+        // give-up and on successful recovery after a fallback; silent for
+        // routine Step 1 reconnects). Pat is platform-level with no entity
+        // config, so this reports through sentry + console — the same
+        // channel its give-up escalation uses.
+        console.log("[commander] MCP recovered after kill+resume fallback");
+        sentry.captureMessage("Commander MCP recovered after kill+resume fallback", "info", {
+          tags: { module: "commander", action: "mcp_recovery_recovered" },
+        });
+        return;
+      }
       if (tick.action === "none") return;
 
       console.warn("[commander] MCP connection dead — running recovery cycle");

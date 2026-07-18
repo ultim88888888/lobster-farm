@@ -118,6 +118,7 @@ describe("process_mcp_health_tick", () => {
       consecutive_fails: 0,
       last_action_ms: null,
       cycle_fail_timestamps: [],
+      last_fell_back_at: null,
       given_up: false,
     });
   });
@@ -227,11 +228,95 @@ describe("record_cycle_outcome", () => {
       consecutive_fails: 5,
       last_action_ms: 1000,
       cycle_fail_timestamps: [100, 200, 300],
+      last_fell_back_at: null,
       given_up: true,
     });
     const result = process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 2000, state);
     expect(result).toEqual({ action: "none" });
     expect(state.get(1)?.given_up).toBe(false);
+  });
+
+  it("stamps last_fell_back_at on a fell_back outcome", () => {
+    const state = new Map<number, McpRecoveryState>();
+    record_cycle_outcome(1, "fell_back", 5000, state);
+    expect(state.get(1)?.last_fell_back_at).toBe(5000);
+  });
+
+  it("does not stamp last_fell_back_at on a reconnected outcome", () => {
+    const state = new Map<number, McpRecoveryState>();
+    record_cycle_outcome(1, "reconnected", 5000, state);
+    expect(state.get(1)?.last_fell_back_at ?? null).toBeNull();
+  });
+});
+
+// ── Post-Step-2 recovery signal (spec: #alerts on successful recovery after
+//    a fallback — silent for routine Step 1 reconnects) ──
+
+describe("process_mcp_health_tick post-fallback recovery signal", () => {
+  it("reports notify_recovered on the first healthy tick after a fell_back cycle", () => {
+    const state = new Map<number, McpRecoveryState>();
+    process_mcp_health_tick(1, false, true, MCP_GRACE_PERIOD_MS, 0, state); // 1st fail
+    process_mcp_health_tick(1, false, true, MCP_GRACE_PERIOD_MS, 1000, state); // fires recover
+    record_cycle_outcome(1, "fell_back", 1000, state);
+
+    const recovered = process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 2000, state);
+    expect(recovered).toEqual({ action: "notify_recovered" });
+  });
+
+  it("only reports the recovery once — later healthy ticks stay silent", () => {
+    const state = new Map<number, McpRecoveryState>();
+    record_cycle_outcome(1, "fell_back", 1000, state);
+
+    expect(process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 2000, state)).toEqual({
+      action: "notify_recovered",
+    });
+    expect(process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 3000, state)).toEqual({
+      action: "none",
+    });
+  });
+
+  it("stays silent on a healthy tick with no prior fallback (routine Step 1 reconnect)", () => {
+    const state = new Map<number, McpRecoveryState>();
+    process_mcp_health_tick(1, false, true, MCP_GRACE_PERIOD_MS, 0, state);
+    process_mcp_health_tick(1, false, true, MCP_GRACE_PERIOD_MS, 1000, state);
+    record_cycle_outcome(1, "reconnected", 1000, state);
+
+    const result = process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 2000, state);
+    expect(result).toEqual({ action: "none" });
+  });
+
+  it("survives the grace period of the respawned session (the real Step 2 path)", () => {
+    // Step 2 kills tmux; crash-recovery respawns with a fresh assigned_at, so
+    // the next ticks land inside the grace window before the bot reads healthy.
+    const state = new Map<number, McpRecoveryState>();
+    record_cycle_outcome(1, "fell_back", 1000, state);
+
+    process_mcp_health_tick(1, false, true, 0, 2000, state); // respawned, still warming
+    process_mcp_health_tick(1, true, true, 5_000, 3000, state); // healthy but in grace
+
+    const recovered = process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 70_000, state);
+    expect(recovered).toEqual({ action: "notify_recovered" });
+  });
+
+  it("clears the rest of the anti-thrash slate when reporting a recovery", () => {
+    const state = new Map<number, McpRecoveryState>();
+    state.set(1, {
+      consecutive_fails: 4,
+      last_action_ms: 500,
+      cycle_fail_timestamps: [100, 200],
+      last_fell_back_at: 200,
+      given_up: true,
+    });
+
+    process_mcp_health_tick(1, true, true, MCP_GRACE_PERIOD_MS, 2000, state);
+
+    expect(state.get(1)).toEqual({
+      consecutive_fails: 0,
+      last_action_ms: null,
+      cycle_fail_timestamps: [],
+      last_fell_back_at: null,
+      given_up: false,
+    });
   });
 });
 
@@ -242,6 +327,7 @@ describe("prune_mcp_state", () => {
       consecutive_fails: 1,
       last_action_ms: null,
       cycle_fail_timestamps: [],
+      last_fell_back_at: null,
       given_up: false,
     };
     state.set(1, { ...blank });

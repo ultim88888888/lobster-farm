@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { access, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
+import type { ArchetypeRole, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
@@ -2807,6 +2807,10 @@ export class BotPool extends EventEmitter {
    *      toward the crash-loop guard, as specified.
    *   3. After MCP_GIVEUP_THRESHOLD failed cycles in the give-up window,
    *      stop and alert #alerts. The bot is never released.
+   *
+   * Also posts a one-shot #alerts notice when a bot comes back healthy after
+   * a Step 2 fallback (spec: alert on give-up and on successful recovery
+   * after a fallback; silent for routine Step 1 reconnects).
    */
   protected async check_mcp_health(bot: PoolBot): Promise<void> {
     const healthy = has_mcp_child(bot.tmux_session);
@@ -2815,6 +2819,10 @@ export class BotPool extends EventEmitter {
     const now = Date.now();
 
     const tick = process_mcp_health_tick(bot.id, healthy, idle, age_ms, now, this.mcp_state);
+    if (tick.action === "notify_recovered") {
+      await this.alert_mcp_recovered(bot);
+      return;
+    }
     if (tick.action === "none") return;
 
     const working_dir = bot.entity_id ? entity_dir(this.config.paths, bot.entity_id) : null;
@@ -2847,12 +2855,7 @@ export class BotPool extends EventEmitter {
     const escalation = record_cycle_outcome(bot.id, outcome, now, this.mcp_state);
     if (!escalation) return;
 
-    const entity_config = bot.entity_id ? this.registry?.get(bot.entity_id) : undefined;
-    const channel_label =
-      entity_config?.entity.channels.list.find((ch) => ch.id === bot.channel_id)?.purpose ??
-      bot.channel_id ??
-      bot.entity_id ??
-      "unknown";
+    const { entity_config, channel_label } = this.mcp_alert_context(bot);
 
     console.error(
       `[pool] pool-${String(bot.id)} MCP recovery gave up after ${String(escalation.cycle_fail_count)} failed cycles — bot left assigned, needs manual attention`,
@@ -2875,6 +2878,55 @@ export class BotPool extends EventEmitter {
       );
     } catch (err) {
       console.warn(`[pool] Failed to alert MCP give-up for pool-${String(bot.id)}: ${String(err)}`);
+    }
+  }
+
+  /** Resolve the entity config and human-readable channel label used in MCP
+   * #alerts messages. Falls back through channel purpose → channel id →
+   * entity id so the alert always names *something* identifiable. */
+  private mcp_alert_context(bot: PoolBot): {
+    entity_config: EntityConfig | undefined;
+    channel_label: string;
+  } {
+    const entity_config = bot.entity_id ? this.registry?.get(bot.entity_id) : undefined;
+    const channel_label =
+      entity_config?.entity.channels.list.find((ch) => ch.id === bot.channel_id)?.purpose ??
+      bot.channel_id ??
+      bot.entity_id ??
+      "unknown";
+    return { entity_config, channel_label };
+  }
+
+  /**
+   * Post the one-shot "recovered after kill+resume" notice (issue #345).
+   * Fired when a bot reads healthy again after a Step 2 fallback — the
+   * fallback itself is silent, so without this the operator would see a
+   * bot go quiet and never learn it came back. Routine Step 1 reconnects
+   * never reach here (they don't stamp `last_fell_back_at`).
+   */
+  private async alert_mcp_recovered(bot: PoolBot): Promise<void> {
+    const { entity_config, channel_label } = this.mcp_alert_context(bot);
+
+    console.log(
+      `[pool] pool-${String(bot.id)} MCP recovered after kill+resume fallback ` +
+        `(entity: ${bot.entity_id ?? "unknown"}, channel: ${channel_label})`,
+    );
+    sentry.addBreadcrumb({
+      category: "daemon.pool",
+      message: `pool-${String(bot.id)} MCP recovered after fallback`,
+      data: { bot_id: bot.id, entity_id: bot.entity_id, channel_id: bot.channel_id },
+    });
+
+    try {
+      await notify(
+        "alerts",
+        `🟢 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) MCP connection recovered after kill+resume fallback — ${bot.entity_id ?? "unknown"}/${channel_label}. Back online, no action needed.`,
+        entity_config,
+      );
+    } catch (err) {
+      console.warn(
+        `[pool] Failed to alert MCP recovery for pool-${String(bot.id)}: ${String(err)}`,
+      );
     }
   }
 

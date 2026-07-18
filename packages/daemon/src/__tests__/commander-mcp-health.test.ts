@@ -199,6 +199,48 @@ describe("CommanderProcess MCP health (issue #345)", () => {
       await c.check_mcp_health();
       expect(mock_run_cycle).toHaveBeenCalledTimes(MCP_GIVEUP_THRESHOLD);
     });
+
+    it("reports recovery after a kill+resume fallback, once", async () => {
+      const c = make_commander();
+      c.last_started_at = new Date(Date.now() - MCP_GRACE_PERIOD_MS - 1000);
+      mock_has_mcp_child.mockReturnValue(false);
+      mock_run_cycle.mockResolvedValue("fell_back");
+
+      await c.check_mcp_health();
+      await c.check_mcp_health(); // cycle runs, falls back
+
+      const sentry = await import("../sentry.js");
+      expect(sentry.captureMessage).not.toHaveBeenCalled(); // below give-up threshold
+
+      // Crash-restart brought the session back with a live MCP child.
+      mock_has_mcp_child.mockReturnValue(true);
+      await c.check_mcp_health();
+
+      expect(sentry.captureMessage).toHaveBeenCalledWith(
+        "Commander MCP recovered after kill+resume fallback",
+        "info",
+        expect.anything(),
+      );
+
+      await c.check_mcp_health();
+      expect(sentry.captureMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("stays silent when recovery came from a routine Step 1 reconnect", async () => {
+      const c = make_commander();
+      c.last_started_at = new Date(Date.now() - MCP_GRACE_PERIOD_MS - 1000);
+      mock_has_mcp_child.mockReturnValue(false);
+      mock_run_cycle.mockResolvedValue("reconnected");
+
+      await c.check_mcp_health();
+      await c.check_mcp_health();
+
+      mock_has_mcp_child.mockReturnValue(true);
+      await c.check_mcp_health();
+
+      const sentry = await import("../sentry.js");
+      expect(sentry.captureMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe("verify_mcp_post_spawn", () => {
