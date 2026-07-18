@@ -399,6 +399,10 @@ describe("attempt_mcp_reconnect", () => {
     const result = await attempt_mcp_reconnect("pool-1", driver);
 
     expect(result).toEqual({ ok: false, reason: "child_still_missing" });
+    // The TUI stays open after the Reconnect action, so it must be dismissed
+    // even on failure — otherwise the next attempt's `/mcp` keystrokes land
+    // inside the still-open panel and can fire a stray menu action.
+    expect(driver.send).toHaveBeenCalledWith("pool-1", "Escape");
   });
 
   it("happy path: full sequence confirms reconnect and re-verifies the process signal", async () => {

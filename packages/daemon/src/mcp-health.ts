@@ -291,12 +291,14 @@ export async function attempt_mcp_reconnect(
   driver.send(tmux_session, "Enter");
 
   await driver.sleep(MCP_RECONNECT_VERIFY_WAIT_MS);
+  // The panel stays open after the Reconnect action, so dismiss it back to the
+  // prompt regardless of outcome. On failure the caller retries immediately,
+  // and a leftover panel would swallow the next attempt's `/mcp` keystrokes —
+  // firing whatever menu item happened to be selected instead.
+  driver.send(tmux_session, "Escape");
   if (!driver.is_healthy(tmux_session)) {
     return { ok: false, reason: "child_still_missing" };
   }
-
-  // Back to the prompt.
-  driver.send(tmux_session, "Escape");
   return { ok: true };
 }
 
