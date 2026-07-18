@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { access, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
+import type { ArchetypeRole, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
@@ -13,6 +13,16 @@ import {
   session_jsonl_exists_anywhere_in,
 } from "./claude-config-migration.js";
 import { resolve_binary } from "./env.js";
+import {
+  classify_mcp_failure,
+  has_mcp_child,
+  process_mcp_health_tick,
+  prune_mcp_state,
+  record_cycle_outcome,
+  run_mcp_recovery_cycle,
+  wait_for_mcp_child,
+} from "./mcp-health.js";
+import type { McpRecoveryState } from "./mcp-health.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
@@ -415,6 +425,10 @@ export class BotPool extends EventEmitter {
   private session_watchers = new Map<number, ReturnType<typeof setTimeout>>();
   /** Timer for the rate-limit modal recovery scan (60s interval, issue #270). */
   private rate_limit_timer: ReturnType<typeof setInterval> | null = null;
+  /** Per-bot MCP connection health state (issue #345). bot_id →
+   * McpRecoveryState. Cleared on release/park so a future assignment starts
+   * with a clean slate. */
+  private mcp_state = new Map<number, McpRecoveryState>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -903,6 +917,24 @@ export class BotPool extends EventEmitter {
           extra_env,
         );
 
+        // Boot-stagger gate (issue #345): the 2026-07-18 outage was caused by
+        // ~9 simultaneous cold starts racing the CLI's plugin-MCP startup.
+        // Gate this candidate's resume on its own post-spawn MCP
+        // verification before the loop moves to the next candidate — this
+        // serializes cold starts instead of firing them back-to-back. Capped
+        // (default 45s) so one stuck bot can't stall the whole resume queue.
+        const cap_ms = this.boot_stagger_cap_ms();
+        const mcp_verified = await Promise.race([
+          this.verify_mcp_post_spawn(bot),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), cap_ms)),
+        ]);
+        if (!mcp_verified) {
+          console.warn(
+            `[pool] pool-${String(bot.id)} MCP unconfirmed after boot-stagger cap ` +
+              `(${String(cap_ms)}ms) — moving to next candidate; continuous health monitor will retry`,
+          );
+        }
+
         // Update bot state to assigned. The resumed session is known to have
         // a JSONL on disk (pre-flight checked in initialize()), so mark it
         // confirmed — persist() will now write the session_id.
@@ -1186,6 +1218,13 @@ export class BotPool extends EventEmitter {
         extra_env,
       );
 
+      // Post-spawn MCP verification gate (issue #345), fire-and-forget —
+      // assign() is on the live-message path (a Discord user is waiting),
+      // so this runs in the background rather than blocking the response.
+      // No stagger needed here (spec: assign() spawns are naturally spread
+      // out already, unlike the boot-time resume_parked_bots() burst).
+      void this.verify_mcp_post_spawn(bot);
+
       // Update bot state
       const assigned_defaults = DEFAULT_ARCHETYPES[archetype];
       bot.state = "assigned";
@@ -1264,6 +1303,9 @@ export class BotPool extends EventEmitter {
       const bot_id = bot.id;
       this.kill_tmux(bot.tmux_session);
       this.cancel_session_watcher(bot_id);
+      // Clear MCP health state so a future assignment on this bot doesn't
+      // inherit a stale observation window or give-up flag (issue #345).
+      this.mcp_state.delete(bot_id);
 
       // Clear any orphaned pending file when releasing a bot — prevents stale
       // message content from a previous assignment leaking into a future one.
@@ -1303,6 +1345,9 @@ export class BotPool extends EventEmitter {
   /** Park a bot — preserve session ID for later resume, free the bot. */
   private async park_bot(bot: PoolBot): Promise<void> {
     this.kill_tmux(bot.tmux_session);
+    // The tmux session is being killed — any in-progress MCP observation
+    // window is moot (issue #345).
+    this.mcp_state.delete(bot.id);
     bot.state = "parked";
     // session_id, channel_id, entity_id, archetype preserved for resume in memory.
     // Clear access.json on disk so no stale channel config survives if the bot's
@@ -1622,6 +1667,10 @@ export class BotPool extends EventEmitter {
       // Clean up old crash history entries (>1 hour) to prevent memory growth
       this.cleanup_crash_history();
       this.cleanup_session_history();
+      prune_mcp_state(
+        this.mcp_state,
+        new Set(this.bots.filter((b) => b.state === "assigned").map((b) => b.id)),
+      );
 
       // Deliver any queued messages to bots that are now at the prompt
       this.drain_pending_injections();
@@ -1639,6 +1688,9 @@ export class BotPool extends EventEmitter {
         if (this.is_tmux_alive(bot.tmux_session)) {
           // Session alive — check for orphaned cwd (directory deleted out from under it)
           await this.check_cwd_health(bot);
+          // Verify the Discord plugin MCP server is actually connected —
+          // pane text alone doesn't prove it (issue #345).
+          await this.check_mcp_health(bot);
           continue;
         }
 
@@ -1801,6 +1853,13 @@ export class BotPool extends EventEmitter {
         is_resume,
         extra_env,
       );
+
+      // Post-spawn MCP verification gate (issue #345): spawn success in bad
+      // windows has been measured as low as ~25% — verify before declaring
+      // this crash-restart successful. Awaited (unlike assign()'s
+      // fire-and-forget) because this is a background health-monitor
+      // operation, not a live user-facing call.
+      await this.verify_mcp_post_spawn(bot);
 
       // Update state — bot stays assigned with refreshed timestamps.
       // `is_resume` is only true when we pre-flighted the JSONL on disk, so
@@ -2717,6 +2776,201 @@ export class BotPool extends EventEmitter {
       // Best-effort — tmux display-message or send-keys failed.
       // The existing liveness check handles truly dead sessions separately.
     }
+  }
+
+  // ── MCP connection verification & auto-reconnect (issue #345) ──
+
+  /** Per-candidate cap (ms) for the resume_parked_bots() boot-stagger gate —
+   * see the call site. A protected getter (rather than a bare literal) so
+   * tests can shrink it and exercise the cap path without real 45-second
+   * waits. */
+  protected boot_stagger_cap_ms(): number {
+    return 45_000;
+  }
+
+  /**
+   * Verify a single assigned bot's Discord plugin MCP connection and drive
+   * recovery if it's confirmed dead. Called from check_assigned_health() for
+   * every assigned bot whose tmux is alive — pane text is NOT a trustworthy
+   * proxy for a live MCP connection (deaf sessions still show the prompt).
+   *
+   * Detection: a `bun` child process under the pane PID. Confirmed dead
+   * after MCP_MIN_CONSECUTIVE_FAILS consecutive ticks past a grace period
+   * (`process_mcp_health_tick` in mcp-health.ts owns the anti-thrash state
+   * machine). When it fires:
+   *   1. Scripted `/mcp` Reconnect, up to MCP_MAX_RECONNECT_ATTEMPTS times —
+   *      silent on success (routine, no #alerts noise).
+   *   2. Fallback: kill the tmux session. The next tick's dead-tmux branch
+   *      picks it up via the existing restart_crashed_session() path (which
+   *      now carries its own post-spawn MCP verification, see
+   *      verify_mcp_post_spawn()) — this also means a fallback DOES count
+   *      toward the crash-loop guard, as specified.
+   *   3. After MCP_GIVEUP_THRESHOLD failed cycles in the give-up window,
+   *      stop and alert #alerts. The bot is never released.
+   *
+   * Also posts a one-shot #alerts notice when a bot comes back healthy after
+   * a Step 2 fallback (spec: alert on give-up and on successful recovery
+   * after a fallback; silent for routine Step 1 reconnects).
+   */
+  protected async check_mcp_health(bot: PoolBot): Promise<void> {
+    const healthy = has_mcp_child(bot.tmux_session);
+    const age_ms = bot.assigned_at ? Date.now() - bot.assigned_at.getTime() : 0;
+    const idle = this.is_bot_idle(bot);
+    const now = Date.now();
+
+    const tick = process_mcp_health_tick(bot.id, healthy, idle, age_ms, now, this.mcp_state);
+    if (tick.action === "notify_recovered") {
+      await this.alert_mcp_recovered(bot);
+      return;
+    }
+    if (tick.action === "none") return;
+
+    const working_dir = bot.entity_id ? entity_dir(this.config.paths, bot.entity_id) : null;
+    const failure_mode = working_dir ? classify_mcp_failure(working_dir) : "unknown";
+    console.warn(
+      `[pool] pool-${String(bot.id)} MCP connection dead (${failure_mode}) — running recovery cycle ` +
+        `(entity: ${bot.entity_id ?? "unknown"}, channel: ${bot.channel_id ?? "none"})`,
+    );
+    sentry.addBreadcrumb({
+      category: "daemon.pool",
+      message: `pool-${String(bot.id)} MCP recovery cycle starting`,
+      data: { bot_id: bot.id, entity_id: bot.entity_id, channel_id: bot.channel_id, failure_mode },
+    });
+
+    const outcome = await run_mcp_recovery_cycle(bot.tmux_session, () =>
+      this.kill_tmux(bot.tmux_session),
+    );
+
+    if (outcome === "reconnected") {
+      // Silent per spec — routine Step 1 success shouldn't page anyone.
+      console.log(`[pool] pool-${String(bot.id)} MCP reconnected via scripted /mcp Reconnect`);
+      return;
+    }
+
+    console.warn(
+      `[pool] pool-${String(bot.id)} MCP Reconnect exhausted — fell back to kill+resume ` +
+        `(channel: ${bot.channel_id ?? "none"})`,
+    );
+
+    const escalation = record_cycle_outcome(bot.id, outcome, now, this.mcp_state);
+    if (!escalation) return;
+
+    const { entity_config, channel_label } = this.mcp_alert_context(bot);
+
+    console.error(
+      `[pool] pool-${String(bot.id)} MCP recovery gave up after ${String(escalation.cycle_fail_count)} failed cycles — bot left assigned, needs manual attention`,
+    );
+    sentry.captureMessage(`MCP recovery gave up for pool-${String(bot.id)}`, "error", {
+      tags: { module: "pool", bot_id: String(bot.id), action: "mcp_recovery_giveup" },
+      contexts: {
+        mcp_recovery: {
+          entity_id: bot.entity_id,
+          channel_id: bot.channel_id,
+          cycle_fail_count: escalation.cycle_fail_count,
+        },
+      },
+    });
+    try {
+      await notify(
+        "alerts",
+        `🔴 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) MCP connection dead — ${String(escalation.cycle_fail_count)} recovery cycles failed in 30 min for ${bot.entity_id ?? "unknown"}/${channel_label}. Reconnect script and kill+resume both exhausted. Bot NOT released — needs manual intervention.`,
+        entity_config,
+      );
+    } catch (err) {
+      console.warn(`[pool] Failed to alert MCP give-up for pool-${String(bot.id)}: ${String(err)}`);
+    }
+  }
+
+  /** Resolve the entity config and human-readable channel label used in MCP
+   * #alerts messages. Falls back through channel purpose → channel id →
+   * entity id so the alert always names *something* identifiable. */
+  private mcp_alert_context(bot: PoolBot): {
+    entity_config: EntityConfig | undefined;
+    channel_label: string;
+  } {
+    const entity_config = bot.entity_id ? this.registry?.get(bot.entity_id) : undefined;
+    const channel_label =
+      entity_config?.entity.channels.list.find((ch) => ch.id === bot.channel_id)?.purpose ??
+      bot.channel_id ??
+      bot.entity_id ??
+      "unknown";
+    return { entity_config, channel_label };
+  }
+
+  /**
+   * Post the one-shot "recovered after kill+resume" notice (issue #345).
+   * Fired when a bot reads healthy again after a Step 2 fallback — the
+   * fallback itself is silent, so without this the operator would see a
+   * bot go quiet and never learn it came back. Routine Step 1 reconnects
+   * never reach here (they don't stamp `last_fell_back_at`).
+   */
+  private async alert_mcp_recovered(bot: PoolBot): Promise<void> {
+    const { entity_config, channel_label } = this.mcp_alert_context(bot);
+
+    console.log(
+      `[pool] pool-${String(bot.id)} MCP recovered after kill+resume fallback ` +
+        `(entity: ${bot.entity_id ?? "unknown"}, channel: ${channel_label})`,
+    );
+    sentry.addBreadcrumb({
+      category: "daemon.pool",
+      message: `pool-${String(bot.id)} MCP recovered after fallback`,
+      data: { bot_id: bot.id, entity_id: bot.entity_id, channel_id: bot.channel_id },
+    });
+
+    try {
+      await notify(
+        "alerts",
+        `🟢 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) MCP connection recovered after kill+resume fallback — ${bot.entity_id ?? "unknown"}/${channel_label}. Back online, no action needed.`,
+        entity_config,
+      );
+    } catch (err) {
+      console.warn(
+        `[pool] Failed to alert MCP recovery for pool-${String(bot.id)}: ${String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Post-spawn MCP verification gate (issue #345). Waits for the MCP child
+   * to appear after a fresh spawn/respawn/resume; if it's still absent,
+   * runs the scripted `/mcp` Reconnect (up to MCP_MAX_RECONNECT_ATTEMPTS
+   * tries) inline.
+   *
+   * Deliberately does NOT loop into a kill+resume fallback here — that
+   * escalation path is owned by the continuous health-tick monitor
+   * (check_mcp_health), which check_assigned_health() will pick up on its
+   * next tick using this bot's fresh `assigned_at` timestamp. Looping a
+   * full respawn cycle synchronously inside assign()/restart/resume would
+   * risk long blocking calls and duplicate the anti-thrash bookkeeping that
+   * already lives in the continuous monitor.
+   *
+   * Returns whether the MCP connection was confirmed by the time this call
+   * returns — callers use this only for logging; they still declare the
+   * bot assigned either way, matching the codebase's existing pattern of
+   * never blocking bot readiness on best-effort verification.
+   */
+  protected async verify_mcp_post_spawn(bot: PoolBot): Promise<boolean> {
+    if (await wait_for_mcp_child(bot.tmux_session)) return true;
+
+    console.warn(
+      `[pool] pool-${String(bot.id)} spawned but MCP child not detected within grace window — attempting scripted reconnect`,
+    );
+    const result = await run_mcp_recovery_cycle(bot.tmux_session, () => {
+      // No kill here — the bot was *just* spawned; killing it again would
+      // just repeat the spawn we already attempted. Post-spawn recovery is
+      // reconnect-only; the continuous monitor owns the kill+resume escalation.
+    });
+
+    if (result === "reconnected") {
+      console.log(
+        `[pool] pool-${String(bot.id)} MCP reconnected post-spawn via scripted /mcp Reconnect`,
+      );
+      return true;
+    }
+    console.warn(
+      `[pool] pool-${String(bot.id)} MCP still unconfirmed post-spawn — continuous health monitor will retry`,
+    );
+    return false;
   }
 
   private is_tmux_alive(session_name: string): boolean {
