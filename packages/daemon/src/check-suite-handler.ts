@@ -133,7 +133,7 @@ export interface SpawnSessionOptions {
   feature_id: string;
   archetype: ArchetypeRole;
   dna: string[];
-  model: { model: "opus" | "sonnet" | "haiku"; think: "none" | "standard" | "high" };
+  model: { model: "fable" | "opus" | "sonnet" | "haiku"; think: "none" | "standard" | "high" };
   worktree_path: string;
   prompt: string;
   gh_token: string;
@@ -553,7 +553,7 @@ async function dispatch_failure(
       feature_id: `ci-fix-${String(pr.number)}`,
       archetype: "builder",
       dna: ["coding-dna"],
-      model: { model: "opus", think: "high" },
+      model: { model: "fable", think: "high" },
       worktree_path: repo_path,
       prompt,
       gh_token,

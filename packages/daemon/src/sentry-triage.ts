@@ -907,7 +907,7 @@ async function spawn_sentry_fix(
       feature_id: `sentry-fix-${sentry_issue_id}`,
       archetype: "builder",
       dna: ["coding-dna"],
-      model: { model: "opus", think: "high" },
+      model: { model: "fable", think: "high" },
       worktree_path: repo_path,
       prompt,
       interactive: false,
