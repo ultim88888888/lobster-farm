@@ -7,41 +7,185 @@ import {
   attempt_mcp_reconnect,
   classify_mcp_failure,
   encode_cache_slug,
+  has_bun_descendant,
   has_mcp_child,
+  is_discord_mcp_bun_process,
   process_mcp_health_tick,
   prune_mcp_state,
   record_cycle_outcome,
   run_mcp_recovery_cycle,
   selection_line,
+  snapshot_processes,
   wait_for_mcp_child,
 } from "../mcp-health.js";
-import type { McpDriver, McpRecoveryState } from "../mcp-health.js";
+import type { McpDriver, McpRecoveryState, ProcessNode } from "../mcp-health.js";
 
-// ── has_mcp_child (process-level detection) ──
+// ── has_mcp_child (process-level detection, delegates to has_bun_descendant) ──
 
 describe("has_mcp_child", () => {
-  it("returns true when the pane PID has a bun child process", () => {
+  it("returns true when a discord-plugin bun descendant is found under the pane PID", () => {
     const pane_pid_fn = vi.fn().mockReturnValue(4242);
-    const has_children_fn = vi.fn().mockReturnValue(true);
+    const has_bun_descendant_fn = vi.fn().mockReturnValue(true);
 
-    expect(has_mcp_child("pool-1", pane_pid_fn, has_children_fn)).toBe(true);
+    expect(has_mcp_child("pool-1", pane_pid_fn, has_bun_descendant_fn)).toBe(true);
     expect(pane_pid_fn).toHaveBeenCalledWith("pool-1");
-    expect(has_children_fn).toHaveBeenCalledWith(4242);
+    expect(has_bun_descendant_fn).toHaveBeenCalledWith(4242);
   });
 
-  it("returns false when the pane has no children", () => {
+  it("returns false when no bun descendant is found", () => {
     const pane_pid_fn = vi.fn().mockReturnValue(4242);
-    const has_children_fn = vi.fn().mockReturnValue(false);
+    const has_bun_descendant_fn = vi.fn().mockReturnValue(false);
 
-    expect(has_mcp_child("pool-1", pane_pid_fn, has_children_fn)).toBe(false);
+    expect(has_mcp_child("pool-1", pane_pid_fn, has_bun_descendant_fn)).toBe(false);
   });
 
   it("returns false when the pane PID can't be resolved (dead/unreadable session)", () => {
     const pane_pid_fn = vi.fn().mockReturnValue(null);
-    const has_children_fn = vi.fn();
+    const has_bun_descendant_fn = vi.fn();
 
-    expect(has_mcp_child("pool-1", pane_pid_fn, has_children_fn)).toBe(false);
-    expect(has_children_fn).not.toHaveBeenCalled();
+    expect(has_mcp_child("pool-1", pane_pid_fn, has_bun_descendant_fn)).toBe(false);
+    expect(has_bun_descendant_fn).not.toHaveBeenCalled();
+  });
+});
+
+// ── is_discord_mcp_bun_process (comm + plugin-path disambiguation) ──
+
+describe("is_discord_mcp_bun_process", () => {
+  it("matches the real discord plugin launch command", () => {
+    expect(
+      is_discord_mcp_bun_process(
+        "bun run --cwd /Users/farm/.claude/plugins/cache/claude-plugins-official/discord/0.0.4 --shell=bun --silent start",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches a full-path bun executable, not just a bare argv0", () => {
+    expect(
+      is_discord_mcp_bun_process(
+        "/opt/homebrew/bin/bun run --cwd /Users/farm/.claude/plugins/cache/claude-plugins-official/discord/0.0.4 start",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a non-discord bun MCP server (the inverse hazard)", () => {
+    expect(
+      is_discord_mcp_bun_process(
+        "bun run --cwd /Users/beacon/.claude/plugins/cache/claude-plugins-official/imessage/0.1.0 --shell=bun --silent start",
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a non-bun process even if its args mention discord", () => {
+    expect(is_discord_mcp_bun_process("node /some/discord/script.js")).toBe(false);
+  });
+
+  it("rejects an empty command", () => {
+    expect(is_discord_mcp_bun_process("")).toBe(false);
+  });
+});
+
+// ── snapshot_processes (real `ps` call — smoke test only, OS-dependent) ──
+
+describe("snapshot_processes", () => {
+  it("returns a non-empty list of well-formed process nodes for the current machine", () => {
+    const processes = snapshot_processes();
+    expect(processes.length).toBeGreaterThan(0);
+    for (const p of processes.slice(0, 20)) {
+      expect(Number.isInteger(p.pid)).toBe(true);
+      expect(Number.isInteger(p.ppid)).toBe(true);
+      expect(typeof p.command).toBe("string");
+    }
+    // pid 1 (init/launchd) should always be present.
+    expect(processes.some((p) => p.pid === 1)).toBe(true);
+  });
+});
+
+// ── has_bun_descendant (full descendant-tree walk — the #347 fix) ──
+
+describe("has_bun_descendant", () => {
+  const DISCORD_BUN_CMD =
+    "bun run --cwd /Users/farm/.claude/plugins/cache/claude-plugins-official/discord/0.0.4 --shell=bun --silent start";
+
+  function node(pid: number, ppid: number, command: string): ProcessNode {
+    return { pid, ppid, command };
+  }
+
+  it("regression: pane -> shell -> claude, no bun anywhere -> unhealthy", () => {
+    // This is the exact shape that produced the #347 false positive: pane_pid
+    // is the resumed session's original login shell, claude is its direct
+    // child, and no MCP server ever spawned. The pre-#347 direct-children-only
+    // check (`pgrep -P pane_pid` non-empty) would have reported this healthy
+    // because `claude` itself counts as "a child."
+    const pane_pid = 100;
+    const processes = [node(200, pane_pid, "/bin/zsh"), node(300, 200, "claude --resume")];
+
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(false);
+  });
+
+  it("pane -> shell -> claude -> bun (discord) -> healthy", () => {
+    const pane_pid = 100;
+    const processes = [
+      node(200, pane_pid, "/bin/zsh"),
+      node(300, 200, "claude --resume"),
+      node(400, 300, DISCORD_BUN_CMD),
+    ];
+
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(true);
+  });
+
+  it("fresh spawn: pane PID is claude itself (exec'd shell), bun as direct child -> healthy", () => {
+    const pane_pid = 300;
+    const processes = [node(300, 1, "claude"), node(400, 300, DISCORD_BUN_CMD)];
+
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(true);
+  });
+
+  it("fresh spawn with no MCP server at all -> unhealthy", () => {
+    const pane_pid = 300;
+    const processes = [node(300, 1, "claude")];
+
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(false);
+  });
+
+  it("inverse hazard: a live sibling non-discord bun MCP server does not mask a dead discord one", () => {
+    const pane_pid = 100;
+    const processes = [
+      node(200, pane_pid, "/bin/zsh"),
+      node(300, 200, "claude --resume"),
+      node(
+        500,
+        300,
+        "bun run --cwd /Users/beacon/.claude/plugins/cache/claude-plugins-official/imessage/0.1.0 --shell=bun --silent start",
+      ),
+    ];
+
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(false);
+  });
+
+  it("finds the discord bun descendant regardless of tree traversal order (siblings, multi-level)", () => {
+    const pane_pid = 100;
+    const processes = [
+      node(999, pane_pid, "some-unrelated-sibling"),
+      node(200, pane_pid, "/bin/zsh"),
+      node(250, 200, "some-other-child"),
+      node(300, 200, "claude --resume"),
+      node(400, 300, DISCORD_BUN_CMD),
+    ];
+
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(true);
+  });
+
+  it("returns false when the process snapshot is empty (ps failed)", () => {
+    expect(has_bun_descendant(100, () => [])).toBe(false);
+  });
+
+  it("does not infinite-loop on cyclical/duplicate ppid data", () => {
+    const pane_pid = 100;
+    // Pathological input: 200's ppid points back to itself.
+    const processes = [node(200, pane_pid, "/bin/zsh"), node(200, 200, "/bin/zsh")];
+
+    expect(() => has_bun_descendant(pane_pid, () => processes)).not.toThrow();
+    expect(has_bun_descendant(pane_pid, () => processes)).toBe(false);
   });
 });
 
