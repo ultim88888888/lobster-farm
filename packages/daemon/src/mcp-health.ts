@@ -9,8 +9,20 @@
  * connection — `wait_for_bot_ready` already requires "Listening for channel
  * messages" in the pane, and deaf sessions passed that check anyway.
  *
- * Detection is process-level: a healthy session has a `bun` child process
- * (the plugin MCP server) under the pane PID.
+ * Detection is process-level: a healthy session has a `bun` process (the
+ * plugin MCP server) somewhere in the pane PID's descendant tree.
+ *
+ * 2026-07-22 false-positive (#347): the original detector only checked
+ * whether the pane PID had ANY direct child (`pgrep -P`), not specifically a
+ * `bun` descendant. That's correct when the pane PID is `claude` itself
+ * (fresh spawn, the login shell execs into `claude` in place), but when a bot
+ * is respawned inside an EXISTING tmux pane (the resume path after a daemon
+ * restart), the pane PID is the original login shell, `claude` is its child,
+ * and `bun` — if it spawned at all — is a grandchild. A deaf `claude` with no
+ * MCP server still has a child ("claude" itself), so it read healthy. Fix:
+ * `has_bun_descendant` walks the full descendant tree from one `ps` snapshot
+ * and requires finding a `bun` process specifically (further disambiguated
+ * to the discord plugin's `bun`, see `is_discord_mcp_bun_process`).
  *
  * Recovery is ordered:
  *   1. Scripted in-session `/mcp` Reconnect (primary) — driven via tmux
@@ -28,7 +40,7 @@
  * (Reconnect x2 + fallback, still unhealthy) within 30 minutes, give up —
  * stop attempting and let the caller alert. The bot is never released.
  *
- * References: issue #345. Template for pane-driving with guards:
+ * References: issue #345, #347. Template for pane-driving with guards:
  * `rate-limit-recovery.ts` (#270) and `econnreset-recovery.ts` (#337, sibling
  * — a different failure mode, deliberately not merged with this detector).
  */
@@ -91,36 +103,119 @@ export function get_pane_pid(tmux_session: string): number | null {
   }
 }
 
-/** Check whether the pane PID has any child processes (pgrep -P). Returns
- * false on any error — `pgrep` exits non-zero with no output when there are
- * no matching children, which is a legitimate "no MCP server" result, not a
- * tool failure worth distinguishing. */
-export function has_children(pane_pid: number): boolean {
+export interface ProcessNode {
+  pid: number;
+  ppid: number;
+  /** Full command line (argv0 + args), not just the truncated `comm` name —
+   * needed to disambiguate the discord plugin's `bun` process from any other
+   * bun-based MCP server a session might also be running (see
+   * `is_discord_mcp_bun_process`). */
+  command: string;
+}
+
+/**
+ * Snapshot every process on the system as {pid, ppid, command} via a single
+ * `ps` call (spec: "one `ps` snapshot per check, no per-process spawning in
+ * a loop" — `has_bun_descendant` below builds a full parent→children map
+ * from one of these and walks it in memory, rather than shelling out per
+ * process). Returns `[]` on any error — fails closed, same posture as
+ * `get_pane_pid` / `capture_pane`: no process data means "can't confirm a
+ * live MCP connection."
+ */
+export function snapshot_processes(): ProcessNode[] {
   try {
-    const out = execFileSync("pgrep", ["-P", String(pane_pid)], {
+    const out = execFileSync("ps", ["-axo", "pid=,ppid=,command="], {
       encoding: "utf-8",
       timeout: 2000,
     });
-    return out.trim().length > 0;
+    const nodes: ProcessNode[] = [];
+    for (const line of out.split("\n")) {
+      // pid/ppid are whitespace-padded fixed columns; command is the
+      // remainder of the line and may itself contain arbitrary whitespace,
+      // so it's captured greedily rather than split on whitespace.
+      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!match) continue;
+      nodes.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] ?? "" });
+    }
+    return nodes;
   } catch {
-    return false;
+    return [];
   }
 }
 
 /**
+ * True when `command` is the discord plugin's bun MCP server, launched per
+ * the plugin's `.mcp.json` as `bun run --cwd <plugin_root> --shell=bun
+ * --silent start`. Two checks:
+ *   1. The executable's basename is `bun` — matches whether argv0 is a bare
+ *      `bun` (the common case; ps resolves it via PATH lookup at spawn time)
+ *      or a full path.
+ *   2. The command line references a `discord` plugin path — cheap
+ *      disambiguation against other bun-based MCP servers a session might
+ *      also be running (e.g. an imessage plugin) so a live sibling can't
+ *      mask a dead discord server (the "inverse hazard" noted in #347).
+ *      This is a substring match on the plugin install path, not a strict
+ *      argument parse; acceptable here because every known install layout
+ *      (`.claude/plugins/cache/.../discord/...`,
+ *      `shared/claude-config-rengen/plugins/.../discord/...`) contains
+ *      "discord" in the path, confirmed against live process snapshots.
+ */
+export function is_discord_mcp_bun_process(command: string): boolean {
+  const exe = command.trim().split(/\s+/)[0] ?? "";
+  const basename = exe.split("/").pop() ?? "";
+  if (basename !== "bun") return false;
+  return /discord/i.test(command);
+}
+
+/**
+ * Walk the FULL descendant tree of `pane_pid` and return true iff a discord
+ * plugin `bun` process (see `is_discord_mcp_bun_process`) is found anywhere
+ * in it — not just among direct children. This is the fix for #347: when a
+ * bot is respawned inside an existing tmux pane (the resume path), the pane
+ * PID is the original login shell, `claude` is its direct child, and `bun`
+ * is a grandchild — a direct-children-only check (the pre-#347 bug) sees
+ * `claude` and reports healthy even when `claude` is deaf with no MCP server
+ * spawned at all.
+ */
+export function has_bun_descendant(
+  pane_pid: number,
+  processes_fn: () => ProcessNode[] = snapshot_processes,
+): boolean {
+  const processes = processes_fn();
+  const children_of = new Map<number, ProcessNode[]>();
+  for (const p of processes) {
+    const siblings = children_of.get(p.ppid);
+    if (siblings) siblings.push(p);
+    else children_of.set(p.ppid, [p]);
+  }
+
+  const stack = [...(children_of.get(pane_pid) ?? [])];
+  const visited = new Set<number>();
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || visited.has(node.pid)) continue; // guard against cyclical/duplicate ppid data
+    visited.add(node.pid);
+    if (is_discord_mcp_bun_process(node.command)) return true;
+    for (const child of children_of.get(node.pid) ?? []) stack.push(child);
+  }
+  return false;
+}
+
+/**
  * Primary detection signal (spec: process-level, reliable, scriptable).
- * A healthy session has a `bun` child process (the plugin MCP server) under
- * the pane PID. Returns false if the pane can't be read or has no children
- * — both mean "can't confirm a live MCP connection."
+ * A healthy session has a discord-plugin `bun` process (the MCP server)
+ * anywhere in the pane PID's descendant tree — see `has_bun_descendant`.
+ * Returns false if the pane can't be read or no such descendant is found —
+ * both mean "can't confirm a live MCP connection."
  */
 export function has_mcp_child(
   tmux_session: string,
   pane_pid_fn: (session: string) => number | null = get_pane_pid,
-  has_children_fn: (pid: number) => boolean = has_children,
+  has_bun_descendant_fn: (pid: number) => boolean = has_bun_descendant,
 ): boolean {
   const pane_pid = pane_pid_fn(tmux_session);
   if (pane_pid === null) return false;
-  return has_children_fn(pane_pid);
+  return has_bun_descendant_fn(pane_pid);
 }
 
 // ── Corroborating signal (log-dir, diagnosis only — never gates recovery) ──
