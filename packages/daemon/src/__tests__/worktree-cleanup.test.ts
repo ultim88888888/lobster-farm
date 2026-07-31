@@ -58,6 +58,8 @@ function make_porcelain(
     head?: string;
     branch?: string;
     bare?: boolean;
+    locked?: boolean;
+    locked_reason?: string;
   }>
 ): string {
   return entries
@@ -66,14 +68,38 @@ function make_porcelain(
       lines.push(`HEAD ${e.head ?? "abc1234567890"}`);
       if (e.branch) lines.push(`branch ${e.branch}`);
       if (e.bare) lines.push("bare");
+      if (e.locked_reason) lines.push(`locked ${e.locked_reason}`);
+      else if (e.locked) lines.push("locked");
       return lines.join("\n");
     })
     .join("\n\n");
 }
 
 /**
+ * State of an individual worktree directory, keyed by path in `trees`.
+ * Drives the git commands the protection guard runs with `cwd: <worktree>`.
+ */
+interface TreeState {
+  /** `git status --porcelain` output. Non-empty means a dirty working tree. */
+  status?: string;
+  /** Upstream ref name, or undefined for "no upstream configured". */
+  upstream?: string;
+  /** Count returned by `git rev-list --count <base>..HEAD`. */
+  unpushed?: number;
+  /** `git rev-parse --show-prefix` output. Non-empty means not a worktree root. */
+  prefix?: string;
+  /** If set, every git command run inside this worktree throws it. */
+  error?: Error;
+  /** If set, only `git status --porcelain` throws it. */
+  status_error?: Error;
+}
+
+/**
  * Configure mock_exec_file to handle specific git commands.
- * Returns a chainable builder for easy test setup.
+ *
+ * Commands are dispatched on the subcommand plus `opts.cwd` — the guard runs
+ * its checks inside the worktree directory, so per-worktree state comes from
+ * `trees[cwd]`. Defaults describe a clean, fully-pushed worktree.
  */
 function setup_git_mocks(
   opts: {
@@ -83,11 +109,19 @@ function setup_git_mocks(
     merged_branches?: string;
     fetch_error?: Error;
     rev_parse_missing?: string[]; // branches whose remote ref is gone
+    /** Refs that resolve for the `origin/main` / `main` base-ref probe. */
+    existing_refs?: string[];
+    /** Per-worktree state, keyed by absolute worktree path. */
+    trees?: Record<string, TreeState>;
   } = {},
 ): void {
-  mock_exec_file.mockImplementation((cmd: string, args: string[], _opts: unknown) => {
+  const existing_refs = opts.existing_refs ?? ["origin/main", "main"];
+
+  mock_exec_file.mockImplementation((cmd: string, args: string[], exec_opts: unknown) => {
     if (cmd !== "git") return "";
 
+    const cwd = (exec_opts as { cwd?: string } | undefined)?.cwd ?? "";
+    const tree = opts.trees?.[cwd];
     const subcmd = args[0];
 
     if (subcmd === "worktree") {
@@ -118,8 +152,40 @@ function setup_git_mocks(
       return "";
     }
 
+    // ── Guard checks: always run with cwd set to the worktree directory ──
+
+    if (subcmd === "status") {
+      if (tree?.error) throw tree.error;
+      if (tree?.status_error) throw tree.status_error;
+      return tree?.status ?? "";
+    }
+
+    if (subcmd === "rev-list") {
+      if (tree?.error) throw tree.error;
+      return `${String(tree?.unpushed ?? 0)}\n`;
+    }
+
     if (subcmd === "rev-parse") {
-      // args: ["rev-parse", "--verify", "refs/remotes/origin/<branch>"]
+      if (args.includes("--show-prefix")) {
+        if (tree?.error) throw tree.error;
+        return tree?.prefix ?? "";
+      }
+
+      if (args.includes("@{u}")) {
+        if (tree?.error) throw tree.error;
+        if (!tree?.upstream) throw new Error("fatal: no upstream configured for branch");
+        return `${tree.upstream}\n`;
+      }
+
+      // Base-ref probe: ["rev-parse", "--verify", "--quiet", "<ref>^{commit}"]
+      if (args[1] === "--verify" && args[2] === "--quiet") {
+        if (tree?.error) throw tree.error;
+        const ref = (args[3] ?? "").replace("^{commit}", "");
+        if (!existing_refs.includes(ref)) throw new Error("exit code 1");
+        return "abc123";
+      }
+
+      // Remote-branch probe: ["rev-parse", "--verify", "refs/remotes/origin/<branch>"]
       const ref = args[2] ?? "";
       const branch = ref.replace("refs/remotes/origin/", "");
       if (opts.rev_parse_missing?.includes(branch)) {
@@ -130,6 +196,32 @@ function setup_git_mocks(
 
     return "";
   });
+}
+
+/** Paths passed to `git worktree remove` across all mock calls. */
+function removed_worktree_paths(): string[] {
+  return mock_exec_file.mock.calls
+    .filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "worktree" &&
+        (c[1] as string[])[1] === "remove",
+    )
+    .map((c: unknown[]) => (c[1] as string[])[2] as string);
+}
+
+/** A registry stub exposing a single repo at `/repo`. */
+function single_repo_registry() {
+  return {
+    get_active: vi.fn().mockReturnValue([
+      {
+        entity: {
+          id: "test-entity",
+          repos: [{ path: "/repo", url: "https://github.com/test/repo.git" }],
+        },
+      },
+    ]),
+  };
 }
 
 // ── Tests ──
@@ -263,7 +355,35 @@ describe("parse_worktree_list", () => {
       head: "abc123",
       branch: "refs/heads/main",
       bare: false,
+      locked: false,
+      locked_reason: null,
     });
+  });
+
+  it("parses a bare `locked` line with no reason", () => {
+    const output = [
+      "worktree /repo/worktrees/held",
+      "HEAD abc123",
+      "branch refs/heads/feature/held",
+      "locked",
+    ].join("\n");
+
+    const entries = parse_worktree_list(output);
+    expect(entries[0]!.locked).toBe(true);
+    expect(entries[0]!.locked_reason).toBeNull();
+  });
+
+  it("parses a `locked <reason>` line and keeps the reason", () => {
+    const output = [
+      "worktree /repo/worktrees/held",
+      "HEAD abc123",
+      "branch refs/heads/feature/held",
+      "locked agent session running",
+    ].join("\n");
+
+    const entries = parse_worktree_list(output);
+    expect(entries[0]!.locked).toBe(true);
+    expect(entries[0]!.locked_reason).toBe("agent session running");
   });
 
   it("parses multiple worktrees including a detached head", () => {
@@ -641,5 +761,341 @@ describe("sweep_stale_worktrees", () => {
     };
 
     await expect(sweep_stale_worktrees(registry as any)).resolves.toBeUndefined();
+  });
+});
+
+// ── Issue #351: the sweep must never delete a worktree that still holds work ──
+
+describe("sweep_stale_worktrees — unpushed/dirty guard", () => {
+  const WT = "/repo/worktrees/active";
+  let log_spy: ReturnType<typeof vi.spyOn>;
+
+  /** Porcelain listing with main plus one feature worktree at `WT`. */
+  function listing(extra?: { locked?: boolean; locked_reason?: string }): string {
+    return make_porcelain(
+      { path: "/repo", branch: "refs/heads/main" },
+      { path: WT, branch: "refs/heads/feature/active", ...extra },
+    );
+  }
+
+  /** All `[worktree-cleanup] Skipping ...` lines emitted during the test. */
+  function skip_logs(): string[] {
+    return log_spy.mock.calls.map((c) => String(c[0])).filter((line) => line.includes("Skipping"));
+  }
+
+  beforeEach(() => {
+    log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  it("does not remove a worktree with uncommitted changes", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "",
+      rev_parse_missing: ["feature/active"], // remote gone → old code would delete
+      trees: { [WT]: { status: "?? new-file.ts\n M src/index.ts" } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("uncommitted changes");
+  });
+
+  it("does not remove a never-pushed worktree holding commits not in main", async () => {
+    // The exact reported bug: builder creates a worktree, commits, has not
+    // pushed yet, so there is no refs/remotes/origin/<branch>.
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "",
+      rev_parse_missing: ["feature/active"],
+      trees: { [WT]: { status: "", upstream: undefined, unpushed: 3 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("3 unpushed commit(s)");
+  });
+
+  it("does not remove a merged branch carrying newer unpushed commits", async () => {
+    // Case 1 needs the guard too — `git branch --merged` is a snapshot, and a
+    // commit can land on top of a merged branch at any time.
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      rev_parse_missing: [],
+      trees: { [WT]: { status: "", upstream: "origin/feature/active", unpushed: 1 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("1 unpushed commit(s)");
+  });
+
+  it("skips a locked worktree without ever attempting removal", async () => {
+    // Previously this produced a `Failed to remove worktree` error line.
+    setup_git_mocks({
+      worktree_list: listing({ locked_reason: "agent session running" }),
+      merged_branches: "  feature/active\n",
+      rev_parse_missing: [],
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).toHaveLength(0);
+    expect(skip_logs().join("\n")).toContain("agent session running");
+  });
+
+  it("still removes a genuinely stale worktree: merged, clean, nothing unpushed", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      rev_parse_missing: [],
+      trees: { [WT]: { status: "", upstream: "origin/feature/active", unpushed: 0 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).toContain(WT);
+  });
+
+  it("still removes a stale worktree whose remote branch is gone and work is pushed", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "",
+      rev_parse_missing: ["feature/active"],
+      trees: { [WT]: { status: "", upstream: undefined, unpushed: 0 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).toContain(WT);
+  });
+
+  it("prefers the branch upstream over main, so a pushed branch ahead of main is still cleaned", async () => {
+    // Without upstream preference every feature branch looks "ahead of main"
+    // and the sweep would never clean anything again.
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      rev_parse_missing: [],
+      // Ahead of main, but fully pushed to its own upstream.
+      trees: { [WT]: { status: "", upstream: "origin/feature/active", unpushed: 0 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).toContain(WT);
+    // The count must have been taken against the upstream, not main.
+    const rev_list = mock_exec_file.mock.calls.find(
+      (c: unknown[]) => (c[1] as string[])[0] === "rev-list",
+    );
+    expect((rev_list?.[1] as string[])[2]).toBe("origin/feature/active..HEAD");
+  });
+
+  it("skips the worktree when a git check errors (fail-safe)", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      trees: { [WT]: { error: new Error("fatal: unable to read tree") } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("check failed");
+  });
+
+  it("skips the worktree when the dirty-tree check times out (fail-safe)", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      trees: { [WT]: { status_error: new Error("Command failed: ETIMEDOUT") } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("ETIMEDOUT");
+  });
+
+  it("skips when there is no upstream and no base ref to compare against (fail-safe)", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      existing_refs: [], // neither origin/main nor main resolves
+      trees: { [WT]: { status: "", upstream: undefined } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("no upstream");
+  });
+
+  it("skips a path git does not resolve as a worktree root (fail-safe)", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+      trees: { [WT]: { prefix: "worktrees/active/\n" } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(WT);
+    expect(skip_logs().join("\n")).toContain("not a worktree root");
+  });
+
+  it("logs the skip with the worktree path and branch so the sweep is auditable", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "",
+      rev_parse_missing: ["feature/active"],
+      trees: { [WT]: { status: "?? scratch.md" } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    const line = skip_logs()[0] ?? "";
+    expect(line).toContain(WT);
+    expect(line).toContain("feature/active");
+    expect(line).toContain("uncommitted changes");
+  });
+
+  it("still removes a worktree whose directory no longer exists on disk", async () => {
+    // Nothing to lose, and leaving it registered leaks a stale entry forever.
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "  feature/active\n",
+    });
+    mock_stat.mockImplementation(async (path: string) => {
+      if (path === WT) throw new Error("ENOENT");
+      return { isDirectory: () => true };
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).toContain(WT);
+  });
+
+  it("does not emit a stale-worktree removal log line for a protected worktree", async () => {
+    setup_git_mocks({
+      worktree_list: listing(),
+      merged_branches: "",
+      rev_parse_missing: ["feature/active"],
+      trees: { [WT]: { status: "?? scratch.md" } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    const stale_lines = log_spy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((line) => line.includes("Stale worktree"));
+    expect(stale_lines).toHaveLength(0);
+  });
+});
+
+describe("sweep_stale_worktrees — .claude/worktrees/ guard", () => {
+  const CLAUDE_WT = "/repo/.claude/worktrees/agent-done";
+  let log_spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "agent-done", isDirectory: () => true }];
+      }
+      return [];
+    });
+  });
+
+  it("does not remove a .claude/ worktree with uncommitted changes", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      merged_branches: "  feature/done\n",
+      trees: { [CLAUDE_WT]: { status: "?? in-progress.ts" } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(CLAUDE_WT);
+    expect(
+      log_spy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.includes("Skipping"))
+        .join("\n"),
+    ).toContain("uncommitted changes");
+  });
+
+  it("does not remove a .claude/ worktree with unpushed commits", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      merged_branches: "  feature/done\n",
+      trees: { [CLAUDE_WT]: { status: "", upstream: undefined, unpushed: 2 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(CLAUDE_WT);
+  });
+
+  it("still removes a clean, fully-pushed .claude/ worktree", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      merged_branches: "  feature/done\n",
+      trees: { [CLAUDE_WT]: { status: "", upstream: "origin/feature/done", unpushed: 0 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).toContain(CLAUDE_WT);
+  });
+
+  it("skips a locked .claude/ worktree instead of failing to remove it", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main" },
+        {
+          path: CLAUDE_WT,
+          branch: "refs/heads/feature/done",
+          locked_reason: "builder running",
+        },
+      ),
+      // Not merged and remote still present, so the entry loop leaves it alone;
+      // the .claude/ sweep is what must respect the lock.
+      merged_branches: "  feature/done\n",
+      trees: { [CLAUDE_WT]: { status: "", upstream: "origin/feature/done", unpushed: 0 } },
+    });
+
+    await sweep_stale_worktrees(single_repo_registry() as any);
+
+    expect(removed_worktree_paths()).not.toContain(CLAUDE_WT);
+    expect(
+      log_spy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.includes("Skipping"))
+        .join("\n"),
+    ).toContain("builder running");
+  });
+});
+
+describe("cleanup_after_merge — guard does not apply", () => {
+  it("removes the worktree even when dirty and ahead of main", async () => {
+    // A merge event is positive evidence the work landed. Squash merges always
+    // leave the local branch ahead of main, so guarding here would disable
+    // post-merge cleanup entirely.
+    const WT = "/repo/worktrees/merged";
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main" },
+        { path: WT, branch: "refs/heads/feature/merged" },
+      ),
+      trees: { [WT]: { status: "?? build-artifact.log", upstream: undefined, unpushed: 4 } },
+    });
+
+    await cleanup_after_merge("/repo", "feature/merged");
+
+    expect(removed_worktree_paths()).toContain(WT);
   });
 });
