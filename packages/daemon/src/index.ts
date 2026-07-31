@@ -4,11 +4,16 @@ import { AlertRouter } from "./alert-router.js";
 import { AuthWatchdog } from "./auth-watchdog.js";
 import { CommanderProcess } from "./commander-process.js";
 import { load_config } from "./config.js";
+import {
+  CONTEXT_SWEEP_INTERVAL_MS,
+  context_bots_from_pool,
+  sweep_context_thresholds,
+} from "./context-alerts.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { prune_daily_logs } from "./memory-pruning.js";
-import { append_session_log } from "./persistence.js";
+import { append_session_log, load_context_alerts, save_context_alerts } from "./persistence.js";
 import { remove_pid, write_pid } from "./pid.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
@@ -19,6 +24,7 @@ import * as sentry from "./sentry.js";
 import { start_server } from "./server.js";
 import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
+import { query_context_usage } from "./tmux-query.js";
 import { sweep_stale_worktrees } from "./worktree-cleanup.js";
 
 async function main(): Promise<void> {
@@ -313,6 +319,25 @@ async function main(): Promise<void> {
   }, WORKTREE_SWEEP_INTERVAL_MS);
   console.log("[worktree-cleanup] Stale worktree sweep scheduled (every 60 min)");
 
+  // Start periodic context-size sweep (#353) — alerts when a pool session's
+  // context crosses 200k/500k/800k tokens, so a runaway session can be
+  // compacted before it dominates the weekly subscription burn.
+  const context_sweep_timer = setInterval(() => {
+    void sweep_context_thresholds({
+      list_bots: () => context_bots_from_pool(pool.get_assigned_bots()),
+      query_usage: query_context_usage,
+      post_alert: (payload) => alert_router.post_alert(payload),
+      load_state: () => load_context_alerts(config),
+      save_state: (state) => save_context_alerts(state, config),
+    }).catch((err) => {
+      console.error(`[context-alerts] Sweep failed: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "context-alerts", action: "sweep" },
+      });
+    });
+  }, CONTEXT_SWEEP_INTERVAL_MS);
+  console.log("[context-alerts] Context threshold sweep scheduled (every 15 min)");
+
   // Start weekly memory pruning — archives daily logs older than 30 days.
   // Runs once on startup (catches up if daemon was down) then weekly.
   const MEMORY_PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 1 week
@@ -387,6 +412,7 @@ async function main(): Promise<void> {
     pr_cron.stop();
     auth_watchdog.stop();
     clearInterval(worktree_sweep_timer);
+    clearInterval(context_sweep_timer);
     clearInterval(memory_prune_timer);
 
     // Check for active work
