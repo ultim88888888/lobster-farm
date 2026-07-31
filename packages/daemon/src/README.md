@@ -18,7 +18,8 @@ The LobsterFarm daemon process. Manages entities, spawns Claude Code agent sessi
 - `review-utils.ts` -- Utility functions for PR review feedback: fetch review comments from GitHub and build fix prompts for the auto-fix loop.
 - `hooks.ts` -- Post-session hooks. Extracts session learnings via Haiku and appends them to daily logs. Also manages the global learnings file.
 - `models.ts` -- Maps abstract model tiers (opus/sonnet/haiku + think level) to Claude CLI flags.
-- `persistence.ts` -- JSON file persistence for PR review state and pool state. Saves to and loads from `~/.lobsterfarm/state/`.
+- `persistence.ts` -- JSON file persistence for PR review state, pool state, PR watches, deploy triage, and context alert state. Saves to and loads from `~/.lobsterfarm/state/`.
+- `context-alerts.ts` -- Periodic context-size sweep. Every 15 min, reads each assigned pool session's context via `/context` and alerts when it crosses 200k/500k/800k tokens. Fires once per breach with hysteresis (re-arms when usage drops below a threshold, so a session that regrows after `/compact` alerts again). Dedupe state is keyed by `session_id` and persisted to `state/context-alerts.json`.
 - `pid.ts` -- PID file management. Write, read, remove, and check if the daemon is already running.
 - `pr-cron.ts` -- `PRReviewCron`. Polls entity repos for open PRs, spawns headless reviewer sessions, and routes outcomes (approve/merge, fix, escalate).
 - `auth-watchdog.ts` -- `AuthWatchdog`. Per shared Claude credential (config dir), runs a periodic fresh-process canary probe + best-effort keychain expiry check. On a logged-out/invalid-grant credential it quarantines poisoned session transcripts, generates a re-login URL, and alerts the owner in the configured channel; the owner pastes the OAuth code back (owner-only security boundary), which completes the login and recycles the affected pool bots. Network/rate failures are never treated as auth incidents.

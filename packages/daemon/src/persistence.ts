@@ -9,6 +9,7 @@ const PR_REVIEWS_FILE = "pr-reviews.json";
 const POOL_STATE_FILE = "pool-state.json";
 const PR_WATCHES_FILE = "pr-watches.json";
 const DEPLOY_TRIAGE_FILE = "deploy-triage.json";
+const CONTEXT_ALERTS_FILE = "context-alerts.json";
 
 function state_dir(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), STATE_DIR);
@@ -28,6 +29,10 @@ function pr_watches_path(config: LobsterFarmConfig): string {
 
 function deploy_triage_path(config: LobsterFarmConfig): string {
   return join(state_dir(config), DEPLOY_TRIAGE_FILE);
+}
+
+function context_alerts_path(config: LobsterFarmConfig): string {
+  return join(state_dir(config), CONTEXT_ALERTS_FILE);
 }
 
 // ── PR Review State ──
@@ -368,6 +373,53 @@ export async function load_deploy_triage(config: LobsterFarmConfig): Promise<Dep
     const data: unknown = JSON.parse(content);
     if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
     return data as DeployTriageState;
+  } catch {
+    return {};
+  }
+}
+
+// ── Context Threshold Alerts (#353) ──
+
+/**
+ * Dedupe state for one session's context-size alerts.
+ *
+ * `fired` holds the thresholds (in tokens) that have alerted and have *not*
+ * been re-armed — a threshold is re-armed the moment usage drops back below
+ * it, which is what lets a session alert again if it regrows after a
+ * `/compact`. Everything not in `fired` is armed.
+ */
+export interface ContextAlertSession {
+  /** Breached thresholds, in tokens, ascending. */
+  fired: number[];
+  /** Last successfully read context size. Null when never read. */
+  last_used_tokens: number | null;
+  /** ISO timestamp of the last sweep that saw this session in the pool. */
+  last_seen_at: string;
+}
+
+/** Keyed by Claude session_id — a recycled session gets a fresh, fully armed entry. */
+export type ContextAlertState = Record<string, ContextAlertSession>;
+
+/** Save context alert state to disk. Uses atomic write-to-temp-then-rename. */
+export async function save_context_alerts(
+  state: ContextAlertState,
+  config: LobsterFarmConfig,
+): Promise<void> {
+  const path = context_alerts_path(config);
+  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
+  await rename(tmp_path, path);
+}
+
+/** Load context alert state from disk. Returns empty object if file doesn't exist. */
+export async function load_context_alerts(config: LobsterFarmConfig): Promise<ContextAlertState> {
+  const path = context_alerts_path(config);
+  try {
+    const content = await readFile(path, "utf-8");
+    const data: unknown = JSON.parse(content);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+    return data as ContextAlertState;
   } catch {
     return {};
   }
