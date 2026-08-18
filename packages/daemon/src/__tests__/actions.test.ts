@@ -286,6 +286,58 @@ describe("create_worktree", () => {
 
     await expect(create_worktree(feature, config)).rejects.toThrow("permission denied");
   });
+
+  it("locks the new worktree with a reason naming the owning issue", async () => {
+    exec_mock_impl = async () => ({ stdout: "", stderr: "" });
+
+    await create_worktree(make_feature({ githubIssue: 570 }), make_entity_config());
+
+    const git_args = exec_calls.filter((c) => c.command === "git").map((c) => c.args);
+    const add_at = git_args.findIndex((a) => a[0] === "worktree" && a[1] === "add");
+    const lock_at = git_args.findIndex((a) => a[0] === "worktree" && a[1] === "lock");
+
+    expect(git_args[lock_at]).toEqual([
+      "worktree",
+      "lock",
+      "/repos/test-repo/worktrees/42-widget",
+      "--reason",
+      "issue-570 active build",
+    ]);
+    // The window between creating and locking is exactly the window #357
+    // destroyed work in, so the order is part of the contract.
+    expect(lock_at).toBeGreaterThan(add_at);
+  });
+
+  it("still returns the worktree path when locking fails", async () => {
+    // Best-effort: a repo on a git old enough to reject the flag, or a tree
+    // already locked, must not abort the build the worktree was created for.
+    exec_mock_impl = async (_cmd, args) => {
+      if (args[0] === "worktree" && args[1] === "lock") {
+        throw new Error("fatal: '/repos/test-repo/worktrees/42-widget' is already locked");
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    const result = await create_worktree(make_feature(), make_entity_config());
+
+    expect(result).toBe("/repos/test-repo/worktrees/42-widget");
+  });
+
+  it("locks the worktree even when it already existed", async () => {
+    exec_mock_impl = async (_cmd, args) => {
+      if (args[0] === "worktree" && args[1] === "add") {
+        throw new Error("fatal: '/repos/test-repo/worktrees/42-widget' already exists");
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await create_worktree(make_feature(), make_entity_config());
+
+    const lock_call = exec_calls.find(
+      (c) => c.command === "git" && c.args[0] === "worktree" && c.args[1] === "lock",
+    );
+    expect(lock_call).toBeDefined();
+  });
 });
 
 describe("cleanup_worktree", () => {
@@ -373,6 +425,50 @@ describe("cleanup_worktree", () => {
         tags: { module: "actions", action: "cleanup_worktree" },
       }),
     );
+  });
+
+  it("unlocks before removing, so a locked worktree is still removable", async () => {
+    exec_mock_impl = async () => ({ stdout: "", stderr: "" });
+
+    await cleanup_worktree(
+      make_feature({ worktreePath: "/repos/test-repo/worktrees/42-widget" }),
+      make_entity_config(),
+    );
+
+    const git_args = exec_calls.filter((c) => c.command === "git").map((c) => c.args);
+    const unlock_at = git_args.findIndex((a) => a[0] === "worktree" && a[1] === "unlock");
+    const remove_at = git_args.findIndex((a) => a[0] === "worktree" && a[1] === "remove");
+
+    expect(git_args[unlock_at]).toEqual([
+      "worktree",
+      "unlock",
+      "/repos/test-repo/worktrees/42-widget",
+    ]);
+    expect(unlock_at).toBeGreaterThanOrEqual(0);
+    expect(unlock_at).toBeLessThan(remove_at);
+  });
+
+  it("removes the worktree even when the unlock fails", async () => {
+    // `git worktree unlock` errors on a tree that was never locked. That is
+    // the common case for worktrees created before this change shipped.
+    exec_mock_impl = async (_cmd, args) => {
+      if (args[0] === "worktree" && args[1] === "unlock") {
+        throw new Error("fatal: '/repos/test-repo/worktrees/42-widget' is not locked");
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await cleanup_worktree(
+      make_feature({ worktreePath: "/repos/test-repo/worktrees/42-widget" }),
+      make_entity_config(),
+    );
+
+    const remove_call = exec_calls.find(
+      (c) => c.command === "git" && c.args[0] === "worktree" && c.args[1] === "remove",
+    );
+    expect(remove_call).toBeDefined();
+    // git did the removal, so the rm -rf fallback must not have been reached.
+    expect(rm_calls).toHaveLength(0);
   });
 });
 

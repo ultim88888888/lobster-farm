@@ -35,6 +35,7 @@ import { expand_home } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
+import { is_agent_lock } from "./worktree-lock.js";
 
 const exec = promisify(execFile);
 
@@ -620,9 +621,12 @@ async function load_worktree_index(repo_path: string): Promise<WorktreeIndex> {
 
 /**
  * A lock is an explicit "do not touch" from whoever created the worktree, and
- * it outranks every reason either cleanup path has for removing it — including
- * a confirmed merge, which says the *work* landed but nothing about whether a
- * session is still living in the directory.
+ * it outranks every reason the sweep has for removing it — a merged branch
+ * says the *work* landed but nothing about whether a session is still living
+ * in the directory.
+ *
+ * The one exception is our own lock on the post-merge path; see
+ * `clear_lock_for_intended_removal`.
  *
  * Returns a skip reason, or null when the worktree is not locked.
  */
@@ -630,6 +634,41 @@ function lock_reason(index: WorktreeIndex, worktree_path: string): string | null
   if (!index.locks.has(worktree_path)) return null;
   const reason = index.locks.get(worktree_path);
   return reason ? `worktree is locked (${reason})` : "worktree is locked";
+}
+
+/**
+ * The lock check for an *intended* removal — the post-merge path, which has
+ * positive evidence the PR landed.
+ *
+ * Since #359 every agent worktree is locked from the moment it is created, so
+ * honouring locks unconditionally here would mean nothing is ever cleaned up.
+ * Our own lock is a note-to-self that expires when the work lands, and this is
+ * the one place entitled to release it. Anyone else's lock still wins.
+ *
+ * Returns a skip reason, or null once the worktree is clear to remove.
+ */
+async function clear_lock_for_intended_removal(
+  repo_path: string,
+  worktree_path: string,
+  index: WorktreeIndex,
+): Promise<string | null> {
+  const locked = lock_reason(index, worktree_path);
+  if (locked === null) return null;
+  if (!is_agent_lock(index.locks.get(worktree_path))) return locked;
+
+  // Best-effort: if the unlock fails, git refuses the removal below and
+  // remove_worktree reports it — which is the correct outcome, not a reason
+  // to bypass git with an rm.
+  try {
+    await exec("git", ["worktree", "unlock", worktree_path], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    console.log(`[worktree-cleanup] Released our own lock on ${worktree_path}`);
+  } catch (err) {
+    console.log(`[worktree-cleanup] Could not unlock ${worktree_path}: ${err_msg(err)}`);
+  }
+  return null;
 }
 
 // ── Find worktree for a specific branch ──
@@ -662,7 +701,7 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
   // 1. Check git worktree list for a worktree on this branch
   const worktree_path = index.path_by_branch.get(branch);
   if (worktree_path !== undefined) {
-    const locked = lock_reason(index, worktree_path);
+    const locked = await clear_lock_for_intended_removal(repo_path, worktree_path, index);
     if (locked !== null) {
       // Leave the branch alone too: it is the handle on whatever the lock
       // holder is still doing in that directory.
@@ -711,8 +750,11 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
  *   The post-merge path deliberately omits it: a merge event is positive
  *   evidence the work landed, whereas the sweep is only guessing. A squash
  *   merge also always leaves the local branch ahead of main, so guarding the
- *   post-merge path would disable it entirely. Locks are honoured either way —
- *   they say something about the directory, not about the work.
+ *   post-merge path would disable it entirely.
+ *
+ *   Locks are honoured either way, with one exception: the post-merge path
+ *   releases the lock `create_worktree` placed on its own worktrees (#359),
+ *   which would otherwise make every agent worktree permanent.
  */
 async function cleanup_claude_worktrees(
   repo_path: string,
@@ -742,7 +784,11 @@ async function cleanup_claude_worktrees(
       if (entry.name.includes(branch_slug)) {
         const wt_path = join(claude_wt_dir, entry.name);
 
-        const locked = lock_reason(index, wt_path);
+        // The sweep is only guessing at staleness, so it honours every lock,
+        // including our own. Only the post-merge path may release one.
+        const locked = sweep
+          ? lock_reason(index, wt_path)
+          : await clear_lock_for_intended_removal(repo_path, wt_path, index);
         if (locked !== null) {
           console.log(`[worktree-cleanup] Skipping ${wt_path} [${branch}]: ${locked}`);
           continue;

@@ -30,6 +30,7 @@ import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
 import * as sentry from "./sentry.js";
+import { agent_lock_reason } from "./worktree-lock.js";
 
 const exec = promisify(execFile);
 const exec_shell = promisify(execCb);
@@ -51,6 +52,19 @@ async function run(
 }
 
 // ── Git operations ──
+
+/**
+ * The lock reason recorded against a feature's worktree.
+ *
+ * Names the owning feature so `git worktree list` is self-explanatory to
+ * whoever finds a locked tree. Falls back to the branch when there is no
+ * issue number to name — an anonymous lock protects the directory but tells
+ * nobody who to ask about it.
+ */
+function worktree_lock_reason(feature: FeatureData): string {
+  const owner = feature.githubIssue > 0 ? `issue-${String(feature.githubIssue)}` : feature.branch;
+  return agent_lock_reason(owner);
+}
 
 /** Create a git worktree for a feature branch. */
 export async function create_worktree(
@@ -78,6 +92,23 @@ export async function create_worktree(
     console.log(`[actions] Worktree already exists at ${worktree_path}`);
   }
 
+  // Lock it. `git worktree remove` refuses a locked tree even with --force,
+  // so this is what stands between an active build and anything that decides
+  // the worktree looks stale (#357). Applied on the already-exists path too:
+  // a re-entered build should get its protection back.
+  //
+  // Best-effort by design — a build that could not be locked is still a build
+  // worth running, and failing here would abort the very work being protected.
+  const reason = worktree_lock_reason(feature);
+  try {
+    await run("git", ["worktree", "lock", worktree_path, "--reason", reason], repo_path);
+    console.log(`[actions] Locked worktree at ${worktree_path} (${reason})`);
+  } catch (err) {
+    console.warn(
+      `[actions] Could not lock worktree at ${worktree_path}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   return worktree_path;
 }
 
@@ -89,6 +120,18 @@ export async function cleanup_worktree(
   if (!feature.worktreePath) return;
 
   const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
+
+  // This removal was asked for, so release the lock create_worktree placed.
+  // Without it git refuses the removal below and the rm -rf fallback takes
+  // over, leaving a stale worktree registration behind.
+  try {
+    await run("git", ["worktree", "unlock", feature.worktreePath], repo_path);
+    console.log(`[actions] Unlocked worktree at ${feature.worktreePath}`);
+  } catch {
+    // git errors when a worktree was never locked, which is the normal case
+    // for trees created before this shipped. The removal below is the step
+    // whose success actually matters.
+  }
 
   try {
     await run("git", ["worktree", "remove", feature.worktreePath, "--force"], repo_path);
