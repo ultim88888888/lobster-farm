@@ -97,6 +97,7 @@ vi.mock("../persistence.js", () => ({
 
 import type { DiscordBot } from "../discord.js";
 import type { GitHubAppAuth } from "../github-app.js";
+import { save_pr_reviews } from "../persistence.js";
 import type { EntityRegistry } from "../registry.js";
 // Import after mocks are registered
 import { check_ci_status } from "../review-utils.js";
@@ -562,6 +563,9 @@ describe("webhook handler — workflow_run events", () => {
 
 // ── Integration tests: review-completion → CI gating ──
 
+/** Head SHA carried by the PR webhook payload in these tests. */
+const HEAD_SHA = "abc1230000000000000000000000000000000000";
+
 describe("webhook handler — CI gating on review completion", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -596,7 +600,7 @@ describe("webhook handler — CI gating on review completion", () => {
       pull_request: {
         number: 42,
         title: "feat: test feature",
-        head: { ref: "feature/test" },
+        head: { ref: "feature/test", sha: HEAD_SHA },
         body: "Test body",
         user: { login: "test-user" },
       },
@@ -649,15 +653,20 @@ describe("webhook handler — CI gating on review completion", () => {
     );
   });
 
-  it("skips merge when CI checks are pending (no alert, retries on next cycle)", async () => {
-    const { discord } = await trigger_review_completion(() => ({
-      stdout: JSON.stringify([
-        { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
-        { name: "Build", state: "IN_PROGRESS", conclusion: "" },
-      ]),
-    }));
+  it("parks instead of merging when CI checks are still pending", async () => {
+    const merge_route = vi.fn(() => ({ stdout: "merged" }));
+    const { discord } = await trigger_review_completion(
+      () => ({
+        stdout: JSON.stringify([
+          { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
+        ]),
+      }),
+      {},
+      { "gh pr merge": merge_route },
+    );
 
-    // Should not send any alerts — pending is a silent skip
+    expect(merge_route).not.toHaveBeenCalled();
     expect(discord.send_to_entity).not.toHaveBeenCalled();
   });
 
@@ -668,7 +677,7 @@ describe("webhook handler — CI gating on review completion", () => {
     expect(discord.send_to_entity).not.toHaveBeenCalled();
   });
 
-  it("attempts merge when CI pending and pr-cron is disabled (#233)", async () => {
+  it("does NOT merge past pending CI even when pr-cron is disabled (#355)", async () => {
     const config_with_cron_disabled = {
       paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
       pr_cron: { enabled: false },
@@ -682,51 +691,59 @@ describe("webhook handler — CI gating on review completion", () => {
       }),
       { config: config_with_cron_disabled },
       {
-        // attempt_auto_merge will call gh pr merge, then fall through to
-        // update-branch → repo view → local rebase. We only need merge to succeed.
         "gh pr merge": merge_route,
         "gh repo view": () => ({ stdout: "test-org/lobster-farm" }),
       },
     );
 
-    // Verify merge was actually attempted, not just that an alert was sent
-    expect(merge_route).toHaveBeenCalled();
-
-    // Assert on success-specific text ("CI pending bypassed" only appears in the
-    // success alert, not the failure one which says "Merge failed")
-    expect(alert_router.post_alert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        entity_id: "test-entity",
-        body: expect.stringContaining("CI pending bypassed"),
-      }),
+    // The pr_cron setting is irrelevant — running CI is never bypassed.
+    expect(merge_route).not.toHaveBeenCalled();
+    expect(alert_router.post_alert).not.toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.stringContaining("CI pending bypassed") }),
     );
   });
 
-  it("alerts when CI pending, pr-cron disabled, and merge fails (#233)", async () => {
+  it("persists the approval pinned to the reviewed SHA so check_suite can finish it (#355)", async () => {
     const config_with_cron_disabled = {
       paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
       pr_cron: { enabled: false },
     } as WebhookContext["config"];
 
-    const { alert_router } = await trigger_review_completion(
+    await trigger_review_completion(
       () => ({
         stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
       }),
       { config: config_with_cron_disabled },
+    );
+
+    const saved = vi.mocked(save_pr_reviews).mock.calls[0]?.[0];
+    expect(saved?.["test-entity:42"]).toMatchObject({
+      entity_id: "test-entity",
+      pr_number: 42,
+      outcome: "approved",
+      v1_approved_sha: HEAD_SHA,
+    });
+  });
+
+  it("still merges immediately when the repo has no checks configured (#355)", async () => {
+    const merge_route = vi.fn(() => ({ stdout: "merged" }));
+
+    // `gh pr checks --required` exits non-zero with "no required checks
+    // reported" when nothing is configured — the docs-only path.
+    const { alert_router } = await trigger_review_completion(
+      () => new Error("no required checks reported on the 'feature/test' branch"),
+      {},
       {
-        "gh pr merge": () => new Error("merge blocked by branch protection"),
+        "gh pr merge": merge_route,
         "gh repo view": () => ({ stdout: "test-org/lobster-farm" }),
-        // update-branch and local rebase will also fail
-        "gh api": () => new Error("update-branch failed"),
-        "git remote": () => new Error("no remote"),
       },
     );
 
-    // Should alert about the failed merge with pr-cron disabled context
+    expect(merge_route).toHaveBeenCalled();
     expect(alert_router.post_alert).toHaveBeenCalledWith(
       expect.objectContaining({
         entity_id: "test-entity",
-        body: expect.stringContaining("pr-cron disabled"),
+        title: expect.stringContaining("merged"),
       }),
     );
   });

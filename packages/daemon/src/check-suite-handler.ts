@@ -14,8 +14,11 @@
  *   Builder pushes  → fresh check_suite fires → loop
  *
  * The handler is gated per-entity by `entity.pr_lifecycle === "v2"`. Entities
- * still on v1 fall through the legacy `pull_request.opened` reviewer spawn in
- * `webhook-handler.ts`.
+ * still on v1 drive review from the legacy `pull_request.opened` spawn in
+ * `webhook-handler.ts` and take one narrow branch here (#355): merging a PR
+ * that was approved while its CI was still running. See
+ * `handle_v1_check_suite` — it merges or does nothing, never spawning a
+ * reviewer, ci-fixer, or flake rerun.
  *
  * Architecture: every external side effect (gh CLI, session spawn, alert) goes
  * through a `CheckSuiteDeps` seam so tests can stub them precisely. Production
@@ -36,7 +39,13 @@ import {
 } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
 import { find_entity_for_repo } from "./repo-utils.js";
-import { MAX_CI_FIX_ATTEMPTS, build_ci_fix_prompt, fetch_ci_failure_logs } from "./review-utils.js";
+import {
+  type AutoMergeResult,
+  MAX_CI_FIX_ATTEMPTS,
+  attempt_auto_merge,
+  build_ci_fix_prompt,
+  fetch_ci_failure_logs,
+} from "./review-utils.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
 
@@ -126,6 +135,14 @@ export interface CheckSuiteDeps {
     check_suite_id: number,
     gh_token: string,
   ) => Promise<void>;
+  /** Merge an approved PR. Only used by the v1 re-entry path (#355); v2 goes
+   * through the merge-gate in webhook-handler instead. */
+  attempt_merge: (
+    pr_number: number,
+    branch: string,
+    repo_path: string,
+    gh_token: string,
+  ) => Promise<AutoMergeResult>;
 }
 
 export interface SpawnSessionOptions {
@@ -161,6 +178,7 @@ export type CheckSuiteOutcome =
   | { kind: "spawned_ci_fixer"; pr_number: number; head_sha: string; attempt: number }
   | { kind: "rerequested"; check_suite_id: number; pr_number: number }
   | { kind: "ci_fix_exhausted"; pr_number: number; attempts: number }
+  | { kind: "merged"; pr_number: number; head_sha: string; method?: AutoMergeResult["method"] }
   | { kind: "alerted"; pr_number: number; reason: string };
 
 export type NoopReason =
@@ -171,7 +189,8 @@ export type NoopReason =
   | "pr_fetch_failed"
   | "fork_pr"
   | "no_pull_requests"
-  | "v1_entity"
+  | "v1_not_approved"
+  | "v1_sha_moved"
   | "draft_pr"
   | "duplicate_sha"
   | "unhandled_conclusion"
@@ -213,9 +232,11 @@ export async function handle_check_suite(
     return { kind: "noop", reason: "unknown_repo" };
   }
 
-  // v2 gating — entities still on v1 fall through legacy webhook-handler.
+  // v2 gating — entities still on v1 drive review from `pull_request.*` in
+  // webhook-handler. They get one narrow behaviour here: merging a PR that was
+  // approved while CI was still running (#355). Nothing else.
   if (match.entity.entity.pr_lifecycle !== "v2") {
-    return { kind: "noop", reason: "v1_entity" };
+    return await handle_v1_check_suite(suite, match.entity, match.repo_path, payload, ctx, deps);
   }
 
   // No associated PRs — this check_suite ran against `main` (push to main) or
@@ -363,6 +384,224 @@ export async function handle_check_suite(
       // Exhaustiveness — TypeScript will flag if we add a conclusion above.
       return { kind: "noop", reason: "unhandled_conclusion" };
   }
+}
+
+// ── v1 merge re-entry (#355) ──
+
+/**
+ * The only thing `check_suite.completed` does for a v1 entity: finish a merge
+ * that was deliberately parked.
+ *
+ * A v1 reviewer that approves while CI is still running used to be merged
+ * immediately — past red-to-be checks. webhook-handler now parks the PR
+ * (`outcome: "approved"` + `v1_approved_sha`) and returns. CI completing fires
+ * no `pull_request` event, so without this branch the PR would sit unmerged
+ * with nothing to wake it.
+ *
+ * Deliberately narrow: this merges or it does nothing. No reviewers, no
+ * ci-fixers, no flake reruns — v1 already has its own loops for those, driven
+ * by `pull_request.synchronize`.
+ */
+async function handle_v1_check_suite(
+  suite: CheckSuiteData,
+  entity: EntityConfig,
+  repo_path: string,
+  payload: CheckSuiteWebhookPayload,
+  ctx: CheckSuiteContext,
+  deps: CheckSuiteDeps,
+): Promise<CheckSuiteOutcome> {
+  if (suite.pull_requests.length === 0) {
+    return { kind: "noop", reason: "no_pull_requests" };
+  }
+
+  const pr_ref = suite.pull_requests[0]!;
+  const entity_id = entity.entity.id;
+  const state_key = pr_state_key(entity_id, pr_ref.number);
+
+  // Local state first — no GitHub round-trips for the overwhelming majority of
+  // v1 check_suite events, which belong to PRs nobody has approved yet.
+  const state = await deps.load_pr_reviews(ctx.config);
+  const existing = state[state_key];
+
+  if (!existing || existing.outcome !== "approved" || existing.v1_approved_sha !== suite.head_sha) {
+    return { kind: "noop", reason: "v1_not_approved" };
+  }
+
+  switch (suite.conclusion) {
+    case "success":
+      return await v1_merge_parked_pr(
+        suite,
+        entity_id,
+        repo_path,
+        payload,
+        existing,
+        state,
+        ctx,
+        deps,
+      );
+
+    case "failure":
+    case "timed_out":
+    case "cancelled":
+      return await v1_alert_ci_failure(suite, entity_id, existing, state, ctx, deps);
+
+    default:
+      // neutral / stale / skipped / action_required / null. None of these mean
+      // "CI is green", and none warrant an alert of their own — the PR stays
+      // parked until a conclusive suite arrives.
+      return { kind: "noop", reason: "unhandled_conclusion" };
+  }
+}
+
+/** Merge a parked-approved v1 PR now that its CI is green. */
+async function v1_merge_parked_pr(
+  suite: CheckSuiteData,
+  entity_id: string,
+  repo_path: string,
+  payload: CheckSuiteWebhookPayload,
+  existing: ProcessedPR,
+  state: PRReviewState,
+  ctx: CheckSuiteContext,
+  deps: CheckSuiteDeps,
+): Promise<CheckSuiteOutcome> {
+  const pr_number = suite.pull_requests[0]!.number;
+  const state_key = pr_state_key(entity_id, pr_number);
+
+  // One SHA fires one check_suite.completed per workflow — merge at most once.
+  if (existing.v1_merge_attempted_sha === suite.head_sha) {
+    return { kind: "noop", reason: "duplicate_sha" };
+  }
+
+  const installation_id =
+    payload.installation?.id != null ? String(payload.installation.id) : undefined;
+
+  let gh_token: string;
+  try {
+    gh_token = await deps.resolve_token(installation_id);
+  } catch (err) {
+    console.error(`[check-suite:v1] Failed to resolve token: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "check-suite", entity: entity_id, action: "v1_resolve_token" },
+      contexts: { pr: { number: pr_number } },
+    });
+    await deps.notify_alerts(
+      entity_id,
+      `PR #${String(pr_number)} is approved and its CI is green, but the GitHub token could not be resolved to merge it: ${error_message(err)}`,
+    );
+    return { kind: "alerted", pr_number, reason: "token_failed" };
+  }
+
+  let pr: PRDetail;
+  try {
+    pr = await deps.fetch_pr_detail(pr_number, repo_path, gh_token);
+  } catch (err) {
+    console.error(`[check-suite:v1] Failed to fetch PR #${String(pr_number)}: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "check-suite", entity: entity_id, action: "v1_fetch_pr" },
+      contexts: { pr: { number: pr_number } },
+    });
+    return { kind: "noop", reason: "pr_fetch_failed" };
+  }
+
+  if (pr.is_fork) return { kind: "noop", reason: "fork_pr" };
+  if (pr.is_draft) return { kind: "noop", reason: "draft_pr" };
+  if (pr.base_ref !== "main" && pr.base_ref !== "master") {
+    return { kind: "noop", reason: "non_default_base" };
+  }
+
+  // The PR head moved after the approval was parked. Those commits went
+  // through `pull_request.synchronize` and are being reviewed on their own —
+  // merging here would land code nobody approved.
+  if (pr.head_sha !== suite.head_sha) {
+    console.log(
+      `[check-suite:v1] PR #${String(pr_number)} head moved (${pr.head_sha.slice(0, 8)} != approved ${suite.head_sha.slice(0, 8)}) — leaving to the fresh review`,
+    );
+    return { kind: "noop", reason: "v1_sha_moved" };
+  }
+
+  // Stamp the dedup key BEFORE merging so a concurrent duplicate event — or a
+  // merge that throws — can't drive a second attempt.
+  const updated = { ...state };
+  updated[state_key] = { ...existing, v1_merge_attempted_sha: suite.head_sha };
+  await deps.save_pr_reviews(updated, ctx.config);
+
+  let result: AutoMergeResult;
+  try {
+    result = await deps.attempt_merge(pr_number, pr.branch, repo_path, gh_token);
+  } catch (err) {
+    console.error(`[check-suite:v1] Merge threw for PR #${String(pr_number)}: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "check-suite", entity: entity_id, action: "v1_merge" },
+      contexts: { pr: { number: pr_number, title: pr.title, head_sha: pr.head_sha } },
+    });
+    await deps.notify_alerts(
+      entity_id,
+      `PR #${String(pr_number)}: "${pr.title}" — CI went green but the merge failed: ${error_message(err)}`,
+    );
+    return { kind: "alerted", pr_number, reason: "merge_failed" };
+  }
+
+  if (!result.merged) {
+    const failure_tag = result.failure ? ` [${result.failure}]` : "";
+    await deps.notify_alerts(
+      entity_id,
+      `PR #${String(pr_number)}: "${pr.title}" — CI went green but the merge failed${failure_tag}: ${result.error ?? "manual intervention needed."}`,
+    );
+    return { kind: "alerted", pr_number, reason: "merge_failed" };
+  }
+
+  console.log(
+    `[check-suite:v1] Merged parked PR #${String(pr_number)} on ${suite.head_sha.slice(0, 8)} (${result.method ?? "direct"})`,
+  );
+  // Post-merge cleanup (closing linked issues, worktree removal, notifying the
+  // watching bot) is driven by the `pull_request.closed` webhook this merge
+  // fires — see handle_pr_merged in webhook-handler.ts.
+  await deps.notify_alerts(
+    entity_id,
+    `PR #${String(pr_number)}: "${pr.title}" — CI completed green, approved PR merged (${result.method ?? "direct"}).`,
+  );
+
+  return { kind: "merged", pr_number, head_sha: suite.head_sha, method: result.method };
+}
+
+/**
+ * A parked PR whose CI ended red. Do not merge; alert once so the parked state
+ * is visible, then leave it to the existing v1 fix loop (which reacts to the
+ * builder's next push, not to this event).
+ */
+async function v1_alert_ci_failure(
+  suite: CheckSuiteData,
+  entity_id: string,
+  existing: ProcessedPR,
+  state: PRReviewState,
+  ctx: CheckSuiteContext,
+  deps: CheckSuiteDeps,
+): Promise<CheckSuiteOutcome> {
+  const pr_number = suite.pull_requests[0]!.number;
+  const state_key = pr_state_key(entity_id, pr_number);
+  const conclusion = suite.conclusion ?? "failure";
+  const alert_key = v1_ci_failure_key(conclusion, suite.head_sha);
+
+  if (existing.ci_failure_alerted === alert_key) {
+    return { kind: "noop", reason: "duplicate_sha" };
+  }
+
+  const updated = { ...state };
+  updated[state_key] = { ...existing, ci_failure_alerted: alert_key };
+  await deps.save_pr_reviews(updated, ctx.config);
+
+  await deps.notify_alerts(
+    entity_id,
+    `PR #${String(pr_number)} was approved but CI ${conclusion} on ${suite.head_sha.slice(0, 8)} — not merging. The fix loop takes it from here.`,
+  );
+
+  return { kind: "alerted", pr_number, reason: conclusion };
+}
+
+/** Dedup key for the v1 parked-PR CI failure alert. Scoped to the SHA so a
+ * re-parked PR that fails again on a new commit alerts again. */
+function v1_ci_failure_key(conclusion: string, head_sha: string): string {
+  return `v1_check_suite:${conclusion}:${head_sha}`;
 }
 
 // ── Success path: spawn reviewer ──
@@ -763,6 +1002,9 @@ export function make_default_deps(ctx: CheckSuiteContext): CheckSuiteDeps {
     },
 
     rerequest_check_suite: default_rerequest_check_suite,
+
+    attempt_merge: (pr_number, branch, repo_path, gh_token) =>
+      attempt_auto_merge(pr_number, branch, repo_path, undefined, gh_token),
   };
 }
 
