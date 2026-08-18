@@ -23,7 +23,8 @@ The LobsterFarm daemon process. Manages entities, spawns Claude Code agent sessi
 - `pid.ts` -- PID file management. Write, read, remove, and check if the daemon is already running.
 - `pr-cron.ts` -- `PRReviewCron`. Polls entity repos for open PRs, spawns headless reviewer sessions, and routes outcomes (approve/merge, fix, escalate).
 - `auth-watchdog.ts` -- `AuthWatchdog`. Per shared Claude credential (config dir), runs a periodic fresh-process canary probe + best-effort keychain expiry check. On a logged-out/invalid-grant credential it quarantines poisoned session transcripts, generates a re-login URL, and alerts the owner in the configured channel; the owner pastes the OAuth code back (owner-only security boundary), which completes the login and recycles the affected pool bots. Network/rate failures are never treated as auth incidents.
-- `webhook-handler.ts` -- GitHub webhook handler. Receives PR events, verifies signatures, maps repos to entities, and spawns reviewer/fixer sessions.
+- `webhook-handler.ts` -- GitHub webhook handler. Receives PR events, verifies signatures, maps repos to entities, and spawns reviewer/fixer sessions. On v1 entities an approval that lands while CI is still running is *parked* (persisted as `approved` + `v1_approved_sha`), never merged past the running checks.
+- `check-suite-handler.ts` -- `check_suite.completed` dispatch. Drives the whole review/merge/fix loop for `pr_lifecycle: v2` entities; for v1 entities it does exactly one thing — merge a parked approval once its CI completes green (#355).
 
 ## Key Concepts
 

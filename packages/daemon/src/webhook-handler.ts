@@ -763,53 +763,26 @@ async function handle_review_completion(
       const ci = await check_ci_status(pr.number, repo_path, gh_token);
 
       if (ci.pending) {
-        const pr_cron_enabled = ctx.config.pr_cron?.enabled !== false;
-
-        if (pr_cron_enabled) {
-          console.log(
-            `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge, pr-cron retry pass will handle`,
-          );
-        } else {
-          // pr-cron is disabled — no retry will happen. Attempt the merge now even
-          // though CI is still running: without a cron, approved PRs would otherwise
-          // be stuck indefinitely. The alert makes this bypass explicit.
-          console.log(
-            `[webhook] CI checks pending for PR #${String(pr.number)} but pr-cron is disabled — attempting merge`,
-          );
-
-          const result = await attempt_auto_merge(
-            pr.number,
-            pr.head.ref,
-            repo_path,
-            undefined,
-            gh_token,
-          );
-
-          if (result.merged) {
-            await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
-            await ctx.alert_router?.post_alert({
-              entity_id,
-              tier: "routine",
-              title: `PR #${String(pr.number)} merged`,
-              body: `${pr.title} — approved and merged (CI pending bypassed)`,
-            });
-            await notify_pr_watcher(
-              repo_full_name,
-              pr.number,
-              `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
-              ctx,
-            );
-          } else {
-            const failure_tag = result.failure ? ` [${result.failure}]` : "";
-            await ctx.alert_router?.post_alert({
-              entity_id,
-              tier: "action_required",
-              title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
-              body: `${pr.title} — CI pending, pr-cron disabled. Merge failed${failure_tag}: ${result.error ?? "manual intervention needed."}`,
-              embed_color: ALERT_COLOR_AMBER,
-            });
-          }
-        }
+        // Never merge past running CI (#355). The v1 reviewer is told it may
+        // approve-and-wait because "the daemon gates the actual merge on CI
+        // completion" — this is that gate. Park the approval instead, pinned to
+        // the reviewed SHA; the `check_suite.completed` event for that SHA
+        // re-enters through check-suite-handler's v1 branch and merges once CI
+        // is green.
+        //
+        // Unconditional on purpose. pr_cron has been disabled since 2026-04-24
+        // (webhooks-only architecture), and its state says nothing about whether
+        // bypassing a running check is safe — it never was.
+        console.log(
+          `[webhook] CI checks pending for PR #${String(pr.number)} — parking approval, check_suite.completed will drive the merge`,
+        );
+        await park_approved_pr(entity_id, pr, ctx);
+        await ctx.alert_router?.post_alert({
+          entity_id,
+          tier: "routine",
+          title: `PR #${String(pr.number)} approved — awaiting CI`,
+          body: `${pr.title} — approved while checks are still running. Merge is parked until CI completes.`,
+        });
       } else if (ci.failures.length > 0) {
         // Spawn builder to fix CI failures (#196)
         await spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, ctx, installation_id);
@@ -1202,6 +1175,49 @@ async function spawn_fixer(
     console.error(`[webhook] Failed to spawn builder for PR #${String(pr.number)}: ${String(err)}`);
     sentry.captureException(err, {
       tags: { module: "webhook", entity: entity_id, action: "spawn_fixer" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
+  }
+}
+
+// ── Parking an approval until CI finishes (#355) ──
+
+/**
+ * Persist that a v1 reviewer approved this PR at this exact head SHA, without
+ * merging it.
+ *
+ * The SHA pin is what makes the parked state safe to act on later: the CI fix
+ * loop also writes `outcome: "approved"` entries, and merging on that alone
+ * would land commits no reviewer has seen. check-suite-handler's v1 branch
+ * merges only when the completed suite's SHA equals `v1_approved_sha`.
+ *
+ * Best-effort: a persistence failure means the PR stays unmerged and a human
+ * picks it up from the #alerts message — strictly better than merging blind.
+ */
+async function park_approved_pr(
+  entity_id: string,
+  pr: WebhookPR,
+  ctx: WebhookContext,
+): Promise<void> {
+  const key = ci_retry_key(entity_id, pr.number);
+  try {
+    const state = await load_pr_reviews(ctx.config);
+    const existing = state[key];
+    state[key] = {
+      ...existing,
+      entity_id,
+      pr_number: pr.number,
+      reviewed_at: new Date().toISOString(),
+      outcome: "approved",
+      v1_approved_sha: pr.head.sha,
+    };
+    await save_pr_reviews(state, ctx.config);
+  } catch (err) {
+    console.error(
+      `[webhook] Failed to persist parked approval for PR #${String(pr.number)}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "park_approved_pr" },
       contexts: { pr: { number: pr.number, title: pr.title } },
     });
   }
@@ -1679,9 +1695,10 @@ export function build_reviewer_prompt(
     "   review is orthogonal to CI execution time. Review the code on its merits",
     "   and either:",
     "     - Approve (if the code is clean). The daemon gates the actual merge on",
-    "       CI completion — pr-cron retries the merge once checks finish, so an",
-    "       approve-and-wait is safe. Note in your review body that merge will",
-    "       happen after CI clears.",
+    "       CI completion — it parks your approval and merges when the",
+    "       check_suite for this commit completes green, so an approve-and-wait",
+    "       is safe. Note in your review body that merge will happen after CI",
+    "       clears.",
     "     - Request changes (only if the code itself has issues, independent of",
     "       CI status).",
     "   Do NOT request changes just because checks haven't finished yet — that",

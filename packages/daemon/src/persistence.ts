@@ -50,6 +50,19 @@ export interface ProcessedPR {
    * Reset when new commits arrive from a non-builder source. (#196) */
   ci_fix_attempts?: number;
 
+  // ── v1 PR lifecycle (#355) ──
+  /** Head SHA a v1 reviewer approved while CI was still running.
+   * The daemon parks such a PR instead of merging past pending checks; the
+   * `check_suite.completed` event for this exact SHA re-attempts the merge.
+   * Pinning the SHA matters: `outcome: "approved"` alone is also set by the CI
+   * fix loop, and merging on that would land commits no reviewer has seen. */
+  v1_approved_sha?: string;
+  /** Head SHA the v1 check-suite merge re-entry has already acted on.
+   * One SHA produces one `check_suite.completed` per workflow, so without this
+   * the merge would be attempted several times. Deliberately distinct from
+   * `v2_last_dispatched_sha` — the two lifecycles never share a dedup key. */
+  v1_merge_attempted_sha?: string;
+
   // ── v2 PR lifecycle (#257) ──
   /** Last head SHA the v2 check-suite-handler dispatched on.
    * Used to deduplicate `check_suite.completed` events that fire multiple

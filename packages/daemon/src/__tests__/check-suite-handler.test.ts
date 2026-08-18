@@ -27,6 +27,7 @@ import {
   handle_check_suite,
 } from "../check-suite-handler.js";
 import type { PRReviewState, ProcessedPR } from "../persistence.js";
+import type { AutoMergeResult } from "../review-utils.js";
 
 // ── Fixtures ──
 
@@ -131,6 +132,8 @@ interface DepFixtures {
   rerequest_error?: Error;
   spawn_error?: Error;
   ci_failure_logs?: Array<{ check_name: string; log_tail: string; workflow_url: string }>;
+  merge_result?: AutoMergeResult;
+  merge_error?: Error;
 }
 
 interface DepStubs extends CheckSuiteDeps {
@@ -166,8 +169,29 @@ function make_deps(fixtures: DepFixtures = {}): DepStubs {
     rerequest_check_suite: vi.fn(async () => {
       if (fixtures.rerequest_error) throw fixtures.rerequest_error;
     }),
+    attempt_merge: vi.fn(async () => {
+      if (fixtures.merge_error) throw fixtures.merge_error;
+      return fixtures.merge_result ?? { merged: true, method: "direct" as const };
+    }),
   };
   return deps;
+}
+
+/** Persisted state for a PR the v1 reviewer approved while CI was still running. */
+function parked_approved(
+  overrides: Partial<ProcessedPR> = {},
+  approved_sha: string = SHA_A,
+): PRReviewState {
+  return {
+    [`${ENTITY_ID}:42`]: {
+      entity_id: ENTITY_ID,
+      pr_number: 42,
+      reviewed_at: "2026-08-13T10:00:00Z",
+      outcome: "approved",
+      v1_approved_sha: approved_sha,
+      ...overrides,
+    },
+  };
 }
 
 function make_ctx(entity: EntityConfig = make_entity()): CheckSuiteContext {
@@ -232,12 +256,14 @@ describe("handle_check_suite — gating", () => {
     expect(deps.resolve_token).not.toHaveBeenCalled();
   });
 
-  it("no-ops on entities still on v1 (feature flag gate)", async () => {
+  it("never spawns a reviewer for entities still on v1 (feature flag gate)", async () => {
     const deps = make_deps();
     const ctx = make_ctx(make_entity({ pr_lifecycle: "v1" }));
     const result = await handle_check_suite(make_payload(), ctx, deps);
-    expect(result).toEqual({ kind: "noop", reason: "v1_entity" });
+    // No persisted approval → the v1 branch has nothing to merge.
+    expect(result).toEqual({ kind: "noop", reason: "v1_not_approved" });
     expect(deps.spawn_session).not.toHaveBeenCalled();
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
   });
 
   it("no-ops when check_suite has no associated PRs", async () => {
@@ -685,6 +711,248 @@ describe("handle_check_suite — resilience", () => {
 
     expect(result).toEqual({ kind: "noop", reason: "pr_fetch_failed" });
     expect(deps.spawn_session).not.toHaveBeenCalled();
+  });
+});
+
+// ── v1 merge re-entry (#355) ──
+
+/**
+ * v1 entities never had a CI-completion trigger: the only merge path was
+ * `pull_request.opened/synchronize`. Now that the v1 approved path parks a PR
+ * whose CI is still running (instead of merging past it), `check_suite.completed`
+ * is what wakes it back up.
+ *
+ * The branch is deliberately narrow — it merges or it does nothing. It must
+ * never spawn a reviewer, a ci-fixer, or a flake rerun.
+ */
+describe("handle_check_suite — v1 merge re-entry (#355)", () => {
+  const v1_ctx = () => make_ctx(make_entity({ pr_lifecycle: "v1" }));
+
+  it("merges an approved-and-parked PR when CI completes green", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({
+      kind: "merged",
+      pr_number: 42,
+      head_sha: SHA_A,
+      method: "direct",
+    });
+    expect(deps.attempt_merge).toHaveBeenCalledWith(
+      42,
+      "feature/thing",
+      REPO_PATH,
+      "ghs_test_token",
+    );
+    // Merge or nothing — no reviewer, no ci-fixer, no flake rerun.
+    expect(deps.spawn_session).not.toHaveBeenCalled();
+    expect(deps.rerequest_check_suite).not.toHaveBeenCalled();
+  });
+
+  it("merges at most once for repeated completed events on the same SHA", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const ctx = v1_ctx();
+
+    const first = await handle_check_suite(make_payload(), ctx, deps);
+    const second = await handle_check_suite(make_payload(), ctx, deps);
+
+    expect(first.kind).toBe("merged");
+    expect(second).toEqual({ kind: "noop", reason: "duplicate_sha" });
+    expect(deps.attempt_merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a v1-specific dedup key, not the v2 one", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    const saved = vi.mocked(deps.save_pr_reviews).mock.calls[0]?.[0];
+    const entry = saved?.[`${ENTITY_ID}:42`];
+    expect(entry?.v1_merge_attempted_sha).toBe(SHA_A);
+    expect(entry?.v2_last_dispatched_sha).toBeUndefined();
+  });
+
+  it("persists the dedup key BEFORE attempting the merge", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const order: string[] = [];
+    vi.mocked(deps.save_pr_reviews).mockImplementation(async () => {
+      order.push("save");
+    });
+    vi.mocked(deps.attempt_merge).mockImplementation(async () => {
+      order.push("merge");
+      return { merged: true, method: "direct" };
+    });
+
+    await handle_check_suite(make_payload(), v1_ctx(), deps);
+    expect(order).toEqual(["save", "merge"]);
+  });
+
+  it("ignores a v1 PR with no persisted review state", async () => {
+    const deps = make_deps();
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "v1_not_approved" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+    // Cheap local state check comes first — no GitHub round-trips for the
+    // overwhelming majority of v1 check_suite events.
+    expect(deps.resolve_token).not.toHaveBeenCalled();
+    expect(deps.fetch_pr_detail).not.toHaveBeenCalled();
+  });
+
+  it("ignores a v1 PR whose last outcome was changes_requested", async () => {
+    const deps = make_deps({ state: parked_approved({ outcome: "changes_requested" }) });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "v1_not_approved" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("ignores a stale approval pinned to a different SHA", async () => {
+    // The v1 CI fix loop seeds entries with outcome=approved. Without the SHA
+    // pin, a green check_suite on the builder's new commit would merge code no
+    // reviewer has seen.
+    const deps = make_deps({
+      state: parked_approved({ ci_fix_attempts: 1 }, SHA_B),
+    });
+    const result = await handle_check_suite(make_payload({ head_sha: SHA_A }), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "v1_not_approved" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("does not merge when the PR head moved past the completed suite", async () => {
+    const deps = make_deps({
+      state: parked_approved(),
+      pr_detail: make_pr_detail({ head_sha: SHA_B }),
+    });
+    const result = await handle_check_suite(make_payload({ head_sha: SHA_A }), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "v1_sha_moved" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("does not merge a PR that went back to draft", async () => {
+    const deps = make_deps({
+      state: parked_approved(),
+      pr_detail: make_pr_detail({ is_draft: true }),
+    });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "draft_pr" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("ignores non-completed actions", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const result = await handle_check_suite(make_payload({ action: "requested" }), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "wrong_action" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  for (const conclusion of ["failure", "timed_out", "cancelled"] as const) {
+    it(`does not merge on conclusion=${conclusion} and alerts once`, async () => {
+      const deps = make_deps({ state: parked_approved() });
+      const ctx = v1_ctx();
+
+      const first = await handle_check_suite(make_payload({ conclusion }), ctx, deps);
+      const second = await handle_check_suite(make_payload({ conclusion }), ctx, deps);
+
+      expect(first).toEqual({ kind: "alerted", pr_number: 42, reason: conclusion });
+      expect(second.kind).toBe("noop");
+      expect(deps.notify_alerts).toHaveBeenCalledTimes(1);
+      expect(deps.attempt_merge).not.toHaveBeenCalled();
+      // v1 keeps its existing fix loop — this branch must not duplicate it.
+      expect(deps.spawn_session).not.toHaveBeenCalled();
+      expect(deps.rerequest_check_suite).not.toHaveBeenCalled();
+    });
+  }
+
+  it("re-alerts when CI fails again on a new SHA", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const ctx = v1_ctx();
+
+    await handle_check_suite(make_payload({ conclusion: "failure" }), ctx, deps);
+    // A new push re-parks the PR at SHA_B (webhook-handler's job); simulate it.
+    deps._state[`${ENTITY_ID}:42`] = {
+      ...deps._state[`${ENTITY_ID}:42`]!,
+      v1_approved_sha: SHA_B,
+    };
+    const second = await handle_check_suite(
+      make_payload({ conclusion: "failure", head_sha: SHA_B }),
+      ctx,
+      deps,
+    );
+
+    expect(second).toEqual({ kind: "alerted", pr_number: 42, reason: "failure" });
+    expect(deps.notify_alerts).toHaveBeenCalledTimes(2);
+  });
+
+  it("no-ops on non-actionable conclusions", async () => {
+    for (const conclusion of ["neutral", "stale", "skipped", "action_required"] as const) {
+      const deps = make_deps({ state: parked_approved() });
+      const result = await handle_check_suite(make_payload({ conclusion }), v1_ctx(), deps);
+
+      expect(result).toEqual({ kind: "noop", reason: "unhandled_conclusion" });
+      expect(deps.attempt_merge).not.toHaveBeenCalled();
+      expect(deps.notify_alerts).not.toHaveBeenCalled();
+    }
+  });
+
+  it("alerts when the merge attempt is rejected", async () => {
+    const deps = make_deps({
+      state: parked_approved(),
+      merge_result: { merged: false, failure: "CONFLICT", error: "rebase conflicts" },
+    });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "alerted", pr_number: 42, reason: "merge_failed" });
+    expect(vi.mocked(deps.notify_alerts).mock.calls[0]?.[1]).toContain("rebase conflicts");
+  });
+
+  it("alerts when the merge attempt throws", async () => {
+    const deps = make_deps({
+      state: parked_approved(),
+      merge_error: new Error("gh exploded"),
+    });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "alerted", pr_number: 42, reason: "merge_failed" });
+    expect(vi.mocked(deps.notify_alerts).mock.calls[0]?.[1]).toContain("gh exploded");
+  });
+
+  it("alerts if token resolution fails on the merge path", async () => {
+    const deps = make_deps({ state: parked_approved(), token_error: new Error("app auth failed") });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "alerted", pr_number: 42, reason: "token_failed" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("no-ops when the PR detail fetch fails", async () => {
+    const deps = make_deps({
+      state: parked_approved(),
+      pr_detail_error: new Error("pr not found"),
+    });
+    const result = await handle_check_suite(make_payload(), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "pr_fetch_failed" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("no-ops when the check suite has no associated PRs", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const result = await handle_check_suite(make_payload({ pull_requests: [] }), v1_ctx(), deps);
+
+    expect(result).toEqual({ kind: "noop", reason: "no_pull_requests" });
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
+  });
+
+  it("leaves v2 entities on the reviewer path even with parked-approved state", async () => {
+    const deps = make_deps({ state: parked_approved() });
+    const result = await handle_check_suite(make_payload(), make_ctx(), deps);
+
+    expect(result.kind).toBe("spawned_reviewer");
+    expect(deps.attempt_merge).not.toHaveBeenCalled();
   });
 });
 
