@@ -786,13 +786,89 @@ export interface CICheckStatus {
   failures: string[];
 }
 
+interface GhCheck {
+  name: string;
+  state: string;
+  conclusion: string;
+}
+
+/**
+ * Outcome of a single `gh pr checks` query.
+ *
+ * `none` means gh answered "nothing matches this query" — either an empty JSON
+ * array or the non-zero exit carrying "no [required] checks reported on the
+ * 'x' branch". `error` means we never got an answer (auth, rate limit, network).
+ */
+type ChecksQuery = { kind: "checks"; checks: GhCheck[] } | { kind: "none" } | { kind: "error" };
+
+async function query_pr_checks(
+  pr_number: number,
+  repo_path: string,
+  env: NodeJS.ProcessEnv,
+  gh_bin: string,
+  required: boolean,
+): Promise<ChecksQuery> {
+  const args = ["pr", "checks", String(pr_number)];
+  if (required) args.push("--required");
+  args.push("--json", "name,state,conclusion");
+
+  try {
+    const { stdout } = await exec_async(gh_bin, args, {
+      cwd: repo_path,
+      env,
+      timeout: 15_000,
+    });
+    const checks = JSON.parse(stdout) as GhCheck[];
+    return checks.length === 0 ? { kind: "none" } : { kind: "checks", checks };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/no.*checks?\s+reported/i.test(msg)) return { kind: "none" };
+    return { kind: "error" };
+  }
+}
+
+/**
+ * Classify a non-empty list of checks into pass / pending / failures.
+ *
+ * SUCCESS, NEUTRAL and SKIPPED all count as passing — our workflows use change
+ * detection, so a frontend-only PR legitimately skips the backend job. Treating
+ * skipped as pending would wedge every partial-CI PR forever.
+ */
+function classify_checks(checks: GhCheck[]): CICheckStatus {
+  const failures: string[] = [];
+  let has_pending = false;
+
+  for (const check of checks) {
+    if (check.state === "PENDING" || check.state === "QUEUED" || check.state === "IN_PROGRESS") {
+      has_pending = true;
+    } else if (
+      check.conclusion !== "SUCCESS" &&
+      check.conclusion !== "NEUTRAL" &&
+      check.conclusion !== "SKIPPED"
+    ) {
+      failures.push(check.name);
+    }
+  }
+
+  return {
+    passed: failures.length === 0 && !has_pending,
+    pending: has_pending,
+    failures,
+  };
+}
+
 /**
  * Query the CI check status for a PR.
  *
- * Uses `gh pr checks` to get the current state of all status checks.
- * Returns whether all checks passed, any are pending, or which ones failed.
- * When no checks are configured, returns { passed: true, pending: false, failures: [] }
- * so the merge flow proceeds normally.
+ * Asks `gh pr checks --required` first — required checks are the authoritative
+ * merge gate where branch protection exists. When that reports nothing, falls
+ * back to the unfiltered list (#361): `--required` only sees checks pinned by
+ * branch protection, and private repos without GitHub Pro cannot configure
+ * branch protection at all (the API 403s), so it comes back empty on repos whose
+ * CI is running right now. Only an empty *unfiltered* list means "no CI".
+ *
+ * Fails closed on infrastructure errors — an unanswered query reports pending,
+ * never mergeable, so a rate limit or auth blip can't wave a PR through.
  */
 export async function check_ci_status(
   pr_number: number,
@@ -802,57 +878,15 @@ export async function check_ci_status(
 ): Promise<CICheckStatus> {
   const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
 
-  try {
-    const { stdout } = await exec_async(
-      gh_bin,
-      ["pr", "checks", String(pr_number), "--required", "--json", "name,state,conclusion"],
-      { cwd: repo_path, env, timeout: 15_000 },
-    );
+  const required = await query_pr_checks(pr_number, repo_path, env, gh_bin, true);
+  if (required.kind === "error") return { passed: false, pending: true, failures: [] };
+  if (required.kind === "checks") return classify_checks(required.checks);
 
-    const checks = JSON.parse(stdout) as Array<{
-      name: string;
-      state: string;
-      conclusion: string;
-    }>;
-
-    // No checks configured — proceed with merge normally
-    if (checks.length === 0) {
-      return { passed: true, pending: false, failures: [] };
-    }
-
-    const failures: string[] = [];
-    let has_pending = false;
-
-    for (const check of checks) {
-      if (check.state === "PENDING" || check.state === "QUEUED" || check.state === "IN_PROGRESS") {
-        has_pending = true;
-      } else if (
-        check.conclusion !== "SUCCESS" &&
-        check.conclusion !== "NEUTRAL" &&
-        check.conclusion !== "SKIPPED"
-      ) {
-        failures.push(check.name);
-      }
-    }
-
-    return {
-      passed: failures.length === 0 && !has_pending,
-      pending: has_pending,
-      failures,
-    };
-  } catch (err: unknown) {
-    // `gh pr checks --required` exits non-zero when no required checks exist,
-    // with stderr like "no required checks reported". That's not an error — it
-    // means the repo has no CI configured, so the PR is mergeable.
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/no.*checks?\s+reported/i.test(msg)) {
-      return { passed: true, pending: false, failures: [] };
-    }
-
-    // Genuine failure (rate limit, auth, network) — treat as pending so we
-    // don't bypass CI gates on infrastructure errors. pr-cron will retry.
-    return { passed: false, pending: true, failures: [] };
-  }
+  const all = await query_pr_checks(pr_number, repo_path, env, gh_bin, false);
+  if (all.kind === "error") return { passed: false, pending: true, failures: [] };
+  // Nothing required *and* nothing at all — the repo really has no CI.
+  if (all.kind === "none") return { passed: true, pending: false, failures: [] };
+  return classify_checks(all.checks);
 }
 
 /** Maximum number of CI fix attempts before escalating to a human (#196). */
