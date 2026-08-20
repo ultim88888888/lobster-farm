@@ -6,9 +6,10 @@
  * account. This watchdog collapses the previously-manual recovery into an
  * automated loop:
  *
- *   detect (canary probe + keychain expiry) → quarantine poisoned sessions →
- *   alert the owner with a re-login URL → accept the pasted code via Discord →
- *   complete the login → recycle the affected bots → resolve.
+ *   detect (canary probe + re-login deadline) → quarantine poisoned sessions →
+ *   alert the owner with a re-login URL (or the exact command to run) →
+ *   accept the pasted code via Discord → complete the login → recycle the
+ *   affected bots → resolve.
  *
  * Detection patterns are ported from `~/.lobsterfarm/bin/auth-probe.sh`.
  *
@@ -20,16 +21,34 @@
  *   - The OAuth code and token values are NEVER logged.
  *   - The code-submission handler only accepts the code from the configured
  *     Discord owner (`config.discord.user_id`) — a hard security boundary.
+ *
+ * Alarm invariants (#363 — three defects that made this thing cry wolf):
+ *   - Only the *re-login deadline* (`refreshTokenExpiresAt`) opens a proactive
+ *     incident. `expiresAt` is the access token; the CLI refreshes it silently
+ *     every few hours and no human can act on it.
+ *   - One open incident per credential, held until the credential recovers.
+ *     Every path through `open_incident` persists, so a failure downstream can
+ *     never re-alert on the next tick.
+ *   - An incident always carries an actionable instruction: the authorize URL
+ *     when we captured one, otherwise the exact `CLAUDE_CONFIG_DIR=… claude`
+ *     command. Never a bare "will retry".
  */
 
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import { claude_dir, entity_dir, expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
+import {
+  claude_dir,
+  entity_config_path,
+  entity_dir,
+  expand_home,
+  lobsterfarm_dir,
+} from "@lobster-farm/shared";
 import { EmbedBuilder } from "discord.js";
 import { ALERT_COLOR_AMBER, ALERT_COLOR_GREEN, ALERT_COLOR_RED } from "./alert-router.js";
 import { resolve_binary } from "./env.js";
@@ -53,6 +72,15 @@ const CANARY_TIMEOUT_MS = 50_000;
 
 /** Sentinel key for the default account (no CLAUDE_CONFIG_DIR override). */
 const DEFAULT_KEY = "default";
+
+/**
+ * Width of the detached tmux pane the `/login` flow is driven in.
+ *
+ * We fix it here (rather than letting tmux pick) because `extract_authorize_url`
+ * uses it to tell a hard-wrapped URL row from a row that simply ended: an
+ * authorize URL is ~450 chars, so it renders across three rows of this width.
+ */
+export const TMUX_PANE_WIDTH = 220;
 
 // ── Types ──
 
@@ -103,11 +131,15 @@ export interface AuthIncident {
   config_dir: string | null;
   entity_ids: string[];
   entity_names: string[];
-  /** OAuth state param — matches an inbound pasted code to this incident. */
+  /** OAuth state param — matches an inbound pasted code to this incident.
+   * Empty when no URL was captured (the alert carries a manual command instead,
+   * and `matches_state` never matches an empty state). */
   state: string;
-  /** tmux session driving the /login flow, awaiting the code. */
-  tmux_session: string;
-  url: string;
+  /** tmux session driving the /login flow, awaiting the code. Null when the
+   * incident is manual-command only. */
+  tmux_session: string | null;
+  /** Authorize URL, or null when it could not be captured. */
+  url: string | null;
   /** Alert channel the incident embed was posted to. */
   channel_id: string;
   /** Top-level embed message id (for editing to resolved). */
@@ -272,11 +304,26 @@ const default_keychain_reader: KeychainReader = async (service) => {
 };
 
 /**
- * Minutes until the credential's OAuth token expires, or null if unresolvable
- * (keychain miss, unparseable, hash mismatch). Best-effort — the canary probe is
- * the definitive auth signal; expiry only drives the proactive warning.
+ * Minutes until this credential genuinely needs a human at a keyboard, or null
+ * when that is unresolvable (keychain miss, unparseable, older credential
+ * format). Best-effort — the canary probe is the definitive auth signal; this
+ * only drives the proactive warning.
+ *
+ * Reads `refreshTokenExpiresAt`, NOT `expiresAt`. That distinction is the whole
+ * point (#363): a stored credential carries two clocks.
+ *
+ *   expiresAt             — the access token. Hours. The CLI silently swaps in
+ *                           a new one via the refresh token. Nobody can act on
+ *                           it, and alarming on it produced a permanent siren
+ *                           over two healthy accounts.
+ *   refreshTokenExpiresAt — the session. Weeks. When this lapses, refreshing is
+ *                           no longer possible and only `/login` fixes it.
+ *
+ * A credential exposing only `expiresAt` yields null: there is nothing here a
+ * human could act on, so it must not open an incident. Only `expiresAt`-style
+ * numbers are read; no token material is returned, logged, or persisted.
  */
-export async function read_token_expiry_minutes(
+export async function read_relogin_deadline_minutes(
   config_dir: string | null,
   reader: KeychainReader = default_keychain_reader,
   now: () => number = Date.now,
@@ -285,13 +332,13 @@ export async function read_token_expiry_minutes(
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as {
-      claudeAiOauth?: { expiresAt?: number };
-      expiresAt?: number;
+      claudeAiOauth?: { refreshTokenExpiresAt?: number };
+      refreshTokenExpiresAt?: number;
     };
     const oauth = parsed.claudeAiOauth ?? parsed;
-    const expires_at = oauth.expiresAt;
-    if (typeof expires_at !== "number") return null;
-    return Math.round((expires_at - now()) / 60_000);
+    const deadline = oauth.refreshTokenExpiresAt;
+    if (typeof deadline !== "number") return null;
+    return Math.round((deadline - now()) / 60_000);
   } catch {
     // Never surface token bytes in a log line.
     return null;
@@ -369,14 +416,24 @@ export async function quarantine_poisoned_sessions(config_dir: string | null): P
 
 // ── Config-dir enumeration ──
 
+/** Whether an entity still exists on disk. The daemon's in-memory registry is
+ * only refreshed on `POST /reload`, so it can name entities deleted days ago —
+ * which is how incident alerts ended up citing entities that were gone (#363). */
+export type EntityExists = (entity_id: string) => boolean;
+
 /**
  * Distinct credentials to monitor: every entity's `subscription.claude_config_dir`
  * plus the default account. Entities are grouped per credential so the incident
  * flow knows which bots to recycle and how to word the alert.
+ *
+ * Entities whose config file no longer exists are skipped, so alert copy names
+ * only entities that are live right now — never a name cached in the registry
+ * (or in an already-open incident) from before a deletion.
  */
 export function enumerate_monitored_config_dirs(
   registry: EntityRegistry,
   config: LobsterFarmConfig,
+  entity_exists: EntityExists = (id) => existsSync(entity_config_path(config.paths, id)),
 ): MonitoredConfigDir[] {
   const by_key = new Map<string, MonitoredConfigDir>();
 
@@ -390,6 +447,7 @@ export function enumerate_monitored_config_dirs(
   });
 
   for (const entity of registry.get_active()) {
+    if (!entity_exists(entity.entity.id)) continue;
     const raw = entity.entity.subscription?.claude_config_dir;
     const config_dir = raw ? expand_home(raw) : null;
     const key = config_dir ?? DEFAULT_KEY;
@@ -424,7 +482,9 @@ function tmux(args: string[]): void {
 
 function tmux_capture(session: string): string {
   try {
-    return execFileSync("tmux", ["capture-pane", "-t", session, "-p"], {
+    // -J joins rows tmux itself wrapped. It does NOT join rows the TUI rendered
+    // as separate rows, which is why `extract_authorize_url` still has to stitch.
+    return execFileSync("tmux", ["capture-pane", "-t", session, "-p", "-J"], {
       encoding: "utf-8",
       timeout: 5_000,
     });
@@ -456,7 +516,74 @@ async function wait_for<T>(
   return fn();
 }
 
-const AUTHORIZE_URL_RE = /(https:\/\/claude\.com\/[^\s"'`]*oauth\/authorize\?[^\s"'`]+)/;
+/** Start of the authorize URL as the Claude CLI prints it. */
+const AUTHORIZE_URL_START = /https:\/\/claude\.com\/[^\s"'`]*oauth\/authorize\?/;
+
+/** Characters legal in a URL. A pane row made only of these, immediately after a
+ * row that filled the pane, is a continuation of that row's URL. */
+const URL_ROW_CHARS = /^[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+$/;
+
+/**
+ * Pull the OAuth authorize URL out of a captured `/login` pane, rejoining the
+ * rows tmux split it across.
+ *
+ * This is the fix for the defect that made the watchdog useless (#363): the
+ * authorize URL is ~450 characters, so Claude Code renders it as three
+ * consecutive `TMUX_PANE_WIDTH`-column rows. The previous single-line regex
+ * matched only the first row — which ends mid-`scope` parameter, long before
+ * `state=` — so the handle was discarded and every one of 745 attempts logged
+ * "Could not capture the OAuth authorize URL".
+ *
+ * A row is treated as continuing only when it exactly fills the pane (so the
+ * text really was cut off) and the next row is URL-legal throughout (so we
+ * never swallow the "Paste code here" prompt that follows). The result must
+ * parse and carry a `state` param, or we report failure rather than hand the
+ * owner a truncated link.
+ */
+export function extract_authorize_url(pane: string, pane_width = TMUX_PANE_WIDTH): string | null {
+  const rows = pane.split("\n").map((row) => row.replace(/\s+$/, ""));
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] ?? "";
+    const start = AUTHORIZE_URL_START.exec(row);
+    if (!start) continue;
+
+    let url = row.slice(start.index);
+    // Walk forward while the row we just consumed filled the pane exactly —
+    // that is the only case where the text really was cut off mid-URL.
+    for (let j = i; (rows[j] ?? "").length === pane_width; j++) {
+      const next = rows[j + 1];
+      if (next === undefined || !URL_ROW_CHARS.test(next)) break;
+      url += next;
+    }
+
+    try {
+      if (new URL(url).searchParams.get("state")) return url;
+    } catch {
+      // Not a usable URL — keep scanning the rest of the pane.
+    }
+  }
+  return null;
+}
+
+/**
+ * The exact command a human runs to re-authenticate this credential. Non-default
+ * accounts need the `CLAUDE_CONFIG_DIR` prefix or the login lands on the wrong
+ * keychain entry and the alarm never clears.
+ */
+export function relogin_command(config_dir: string | null): string {
+  return config_dir ? `CLAUDE_CONFIG_DIR=${config_dir} claude` : "claude";
+}
+
+/** Manual re-auth instructions, used whenever no authorize URL was captured. */
+function manual_instruction(config_dir: string | null): string {
+  return [
+    "**Re-auth manually** — run this on the farm host, then `/login` inside the session:",
+    "```",
+    relogin_command(config_dir),
+    "```",
+  ].join("\n");
+}
 
 /**
  * Drive a dedicated tmux `claude` session through the trust prompt → `/login` →
@@ -485,7 +612,19 @@ export async function generate_relogin_url(
     : `exec ${claude_bin}`;
 
   try {
-    tmux(["new-session", "-d", "-s", session, "-x", "220", "-y", "50", "-c", cwd, cmd]);
+    tmux([
+      "new-session",
+      "-d",
+      "-s",
+      session,
+      "-x",
+      String(TMUX_PANE_WIDTH),
+      "-y",
+      "50",
+      "-c",
+      cwd,
+      cmd,
+    ]);
   } catch (err) {
     console.error(`[auth-watchdog] Failed to start login session: ${String(err)}`);
     return null;
@@ -509,27 +648,22 @@ export async function generate_relogin_url(
   // Select method 1 (Claude subscription) when the menu appears, then read URL.
   const handle = await wait_for<ReloginHandle>(() => {
     const pane = tmux_capture(session);
-    if (/subscription|Claude account|Log in with/i.test(pane) && !AUTHORIZE_URL_RE.test(pane)) {
+    const url = extract_authorize_url(pane);
+    if (url) {
+      // extract_authorize_url only returns a URL that parses and carries `state`.
+      const state = new URL(url).searchParams.get("state") as string;
+      return { url, state, tmux_session: session };
+    }
+    // Still on the method menu (never re-send once a URL has been printed).
+    if (!AUTHORIZE_URL_START.test(pane) && /subscription|Claude account|Log in with/i.test(pane)) {
       tmux(["send-keys", "-t", session, "-l", "1"]);
       tmux(["send-keys", "-t", session, "Enter"]);
-      return null;
-    }
-    const m = pane.match(AUTHORIZE_URL_RE);
-    if (m?.[1]) {
-      const url = m[1];
-      let state = "";
-      try {
-        state = new URL(url).searchParams.get("state") ?? "";
-      } catch {
-        /* leave empty */
-      }
-      if (state) return { url, state, tmux_session: session };
     }
     return null;
   }, 30_000);
 
   if (!handle) {
-    console.error("[auth-watchdog] Could not capture the OAuth authorize URL");
+    console.warn("[auth-watchdog] Could not capture the OAuth authorize URL from the login pane");
     try {
       tmux(["kill-session", "-t", session]);
     } catch {
@@ -601,7 +735,8 @@ export interface AuthWatchdogDeps {
   discord: WatchdogDiscord | null;
   /** Overridable side effects (default to the real implementations). */
   probe?: (config_dir: string | null, cwd: string) => Promise<ProbeResult>;
-  token_expiry?: (config_dir: string | null) => Promise<number | null>;
+  /** Minutes until a human must re-login (refresh-token expiry), or null. */
+  relogin_deadline?: (config_dir: string | null) => Promise<number | null>;
   quarantine?: (config_dir: string | null) => Promise<number>;
   gen_url?: (config_dir: string | null, cwd: string) => Promise<ReloginHandle | null>;
   submit?: (tmux_session: string, code: string) => Promise<boolean>;
@@ -609,7 +744,44 @@ export interface AuthWatchdogDeps {
   session_alive?: (tmux_session: string) => boolean;
   /** Best-effort teardown of a held login session (default: real tmux kill-session). */
   kill_session?: (tmux_session: string) => void;
+  /** Whether an entity still exists on disk (default: real fs check). */
+  entity_exists?: EntityExists;
   now?: () => number;
+}
+
+/**
+ * What a credential currently needs.
+ *
+ *   healthy   — authenticating, and no human-actionable deadline in sight.
+ *   transient — the probe failed for a network/rate reason. Says nothing about
+ *               auth: never opens an incident, never resolves one.
+ *   expiring  — authenticating, but the re-login deadline is inside the warning
+ *               window. A refresh cannot extend it.
+ *   outage    — logged out or the grant was rejected. Bots on it are down.
+ */
+export type CredentialAssessment =
+  | { state: "healthy" }
+  | { state: "transient" }
+  | { state: "expiring"; minutes: number }
+  | { state: "outage" };
+
+/** Human label for a credential in log lines (never the credential itself). */
+function credential_label(config_dir: string | null): string {
+  return config_dir ?? "default account";
+}
+
+/** Alert copy for the entities riding on a credential. */
+function entities_label(entity_names: string[]): string {
+  return entity_names.length > 0 ? entity_names.join(", ") : "shared/default bots";
+}
+
+/** Compact, human-readable duration for alert copy. */
+function format_minutes(minutes: number): string {
+  if (minutes <= 0) return "less than a minute";
+  if (minutes < 60) return `${String(minutes)} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${String(hours)}h ${String(minutes % 60)}m`;
+  return `${String(Math.floor(hours / 24))}d ${String(hours % 24)}h`;
 }
 
 export class AuthWatchdog {
@@ -619,12 +791,14 @@ export class AuthWatchdog {
   private readonly discord: WatchdogDiscord | null;
 
   private readonly probe: NonNullable<AuthWatchdogDeps["probe"]>;
-  private readonly token_expiry: NonNullable<AuthWatchdogDeps["token_expiry"]>;
+  private readonly relogin_deadline: NonNullable<AuthWatchdogDeps["relogin_deadline"]>;
   private readonly quarantine: NonNullable<AuthWatchdogDeps["quarantine"]>;
   private readonly gen_url: NonNullable<AuthWatchdogDeps["gen_url"]>;
   private readonly submit: NonNullable<AuthWatchdogDeps["submit"]>;
   private readonly session_alive: NonNullable<AuthWatchdogDeps["session_alive"]>;
   private readonly kill_session: NonNullable<AuthWatchdogDeps["kill_session"]>;
+  private readonly entity_exists: EntityExists;
+  private readonly now: () => number;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Guards against overlapping ticks (a probe can take ~50s). */
@@ -636,11 +810,14 @@ export class AuthWatchdog {
     this.pool = deps.pool;
     this.discord = deps.discord;
     this.probe = deps.probe ?? probe_credential;
-    this.token_expiry = deps.token_expiry ?? ((dir) => read_token_expiry_minutes(dir));
+    this.relogin_deadline = deps.relogin_deadline ?? ((dir) => read_relogin_deadline_minutes(dir));
     this.quarantine = deps.quarantine ?? quarantine_poisoned_sessions;
     this.gen_url = deps.gen_url ?? generate_relogin_url;
     this.submit = deps.submit ?? submit_code;
     this.session_alive = deps.session_alive ?? tmux_alive;
+    this.entity_exists =
+      deps.entity_exists ?? ((id) => existsSync(entity_config_path(deps.config.paths, id)));
+    this.now = deps.now ?? Date.now;
     this.kill_session =
       deps.kill_session ??
       ((s) => {
@@ -662,7 +839,7 @@ export class AuthWatchdog {
     const interval_ms = cfg.interval_minutes * 60_000;
     console.log(
       `[auth-watchdog] Started (every ${String(cfg.interval_minutes)}m, ` +
-        `warn < ${String(cfg.expiry_warn_minutes)}m to expiry)`,
+        `warn < ${format_minutes(cfg.expiry_warn_minutes)} to re-login deadline)`,
     );
     // Kick one tick shortly after boot, then on the interval.
     this.timer = setInterval(() => void this.tick(), interval_ms);
@@ -681,32 +858,22 @@ export class AuthWatchdog {
     if (this.ticking) return;
     this.ticking = true;
     try {
-      const monitored = enumerate_monitored_config_dirs(this.registry, this.config);
-      const incidents = await load_auth_incidents(this.config);
-
+      const monitored = enumerate_monitored_config_dirs(
+        this.registry,
+        this.config,
+        this.entity_exists,
+      );
       for (const m of monitored) {
-        const open = incidents[m.key];
-        if (open) {
-          // Dedup: an incident is already open for this credential. Recover from
-          // a daemon restart that lost the login tmux by regenerating the URL.
-          await this.recover_incident_if_stale(open, m);
-          continue;
-        }
-
-        const probe = await this.probe(m.config_dir, m.probe_cwd);
-
-        if (!probe.ok && (probe.signal === "logged_out" || probe.signal === "invalid_grant")) {
-          await this.open_incident(m, "outage");
-          continue;
-        }
-
-        // Only consider proactive expiry when auth currently works — never
-        // re-login on a transient network/rate failure.
-        if (probe.ok) {
-          const minutes = await this.token_expiry(m.config_dir);
-          if (minutes !== null && minutes < this.config.auth_watchdog.expiry_warn_minutes) {
-            await this.open_incident(m, "expiring", minutes);
-          }
+        try {
+          await this.evaluate(m);
+        } catch (err) {
+          // One bad credential must not stop the others from being checked.
+          console.error(
+            `[auth-watchdog] Evaluation failed for ${credential_label(m.config_dir)}: ${String(err)}`,
+          );
+          sentry.captureException(err, {
+            tags: { module: "auth-watchdog", action: "evaluate" },
+          });
         }
       }
     } catch (err) {
@@ -717,19 +884,133 @@ export class AuthWatchdog {
     }
   }
 
-  /** If an open incident's login session has vanished (daemon restart), drop it
-   * so the next tick re-opens cleanly with a fresh URL. */
-  private async recover_incident_if_stale(
-    incident: AuthIncident,
-    _m: MonitoredConfigDir,
-  ): Promise<void> {
-    if (this.session_alive(incident.tmux_session)) return;
-    console.warn(
-      `[auth-watchdog] Login session for ${incident.key} is gone — clearing incident to regenerate`,
-    );
+  /**
+   * Decide what this credential needs right now.
+   *
+   * The probe is the authority on whether auth works. The re-login deadline is
+   * only consulted when it does — a network blip must never be read as expiry,
+   * and an access token about to roll over must never be read as anything.
+   */
+  private async assess(m: MonitoredConfigDir): Promise<CredentialAssessment> {
+    const probe = await this.probe(m.config_dir, m.probe_cwd);
+    if (!probe.ok) {
+      return probe.signal === "logged_out" || probe.signal === "invalid_grant"
+        ? { state: "outage" }
+        : { state: "transient" };
+    }
+    const minutes = await this.relogin_deadline(m.config_dir);
+    if (minutes !== null && minutes < this.config.auth_watchdog.expiry_warn_minutes) {
+      return { state: "expiring", minutes };
+    }
+    return { state: "healthy" };
+  }
+
+  /**
+   * Reconcile one credential against its open incident, if any. Exactly one of:
+   * open, resolve, update in place, or do nothing. Never re-alert.
+   */
+  private async evaluate(m: MonitoredConfigDir): Promise<void> {
+    const assessment = await this.assess(m);
     const incidents = await load_auth_incidents(this.config);
-    delete incidents[incident.key];
-    await save_auth_incidents(incidents, this.config);
+    const open = incidents[m.key];
+
+    if (!open) {
+      if (assessment.state === "outage" || assessment.state === "expiring") {
+        await this.open_incident(m, assessment);
+      }
+      return;
+    }
+
+    if (assessment.state === "healthy") {
+      await this.auto_resolve(open, m);
+      return;
+    }
+    // Transient: the credential's auth state is unknown this pass. Hold the
+    // incident exactly as it is — neither escalate nor falsely resolve.
+    if (assessment.state === "transient") return;
+
+    await this.update_open_incident(open, m, assessment);
+  }
+
+  /** The credential recovered — close the incident and bring its bots back. */
+  private async auto_resolve(incident: AuthIncident, m: MonitoredConfigDir): Promise<void> {
+    console.log(
+      `[auth-watchdog] ${credential_label(m.config_dir)} is authenticating again — resolving incident`,
+    );
+    const recycled = this.pool.recycle_stale_oauth_on_config_dir(m.config_dir);
+    const suffix = recycled > 0 ? ` (recycled ${String(recycled)} bot(s))` : "";
+    await this.resolve_incident(
+      incident,
+      `✅ Claude auth healthy again — **${entities_label(m.entity_names)}** back online${suffix}.`,
+    );
+    if (incident.tmux_session) this.kill_session(incident.tmux_session);
+  }
+
+  /**
+   * The credential is still unhealthy. Keep the single open incident, but keep
+   * it *truthful*: re-word it from the live registry, escalate a warning that
+   * became an outage, and swap a dead one-time link for the manual command.
+   */
+  private async update_open_incident(
+    incident: AuthIncident,
+    m: MonitoredConfigDir,
+    assessment: { state: "outage" } | { state: "expiring"; minutes: number },
+  ): Promise<void> {
+    const updated: AuthIncident = {
+      ...incident,
+      entity_ids: m.entity_ids,
+      entity_names: m.entity_names,
+    };
+    const notes: string[] = [];
+    let changed = incident.entity_names.join(" ") !== m.entity_names.join(" ");
+
+    if (assessment.state !== incident.kind) {
+      updated.kind = assessment.state;
+      changed = true;
+      if (assessment.state === "outage") {
+        const quarantined = await this.quarantine(m.config_dir);
+        notes.push(
+          `🚨 Escalated — the credential is now logged out and every bot on it is down. Quarantined **${String(quarantined)}** poisoned session(s).`,
+        );
+      } else {
+        notes.push(
+          "The credential is authenticating again, but a re-login is still due before the deadline below.",
+        );
+      }
+    }
+
+    // A captured authorize URL is bound to its login process (PKCE). Once that
+    // tmux session dies the link is dead, so replace it in place rather than
+    // dropping the incident and re-alerting on the next tick.
+    if (updated.tmux_session && !this.session_alive(updated.tmux_session)) {
+      console.warn(
+        `[auth-watchdog] Login session for ${incident.key} is gone — falling back to the manual command`,
+      );
+      updated.tmux_session = null;
+      updated.url = null;
+      updated.state = "";
+      changed = true;
+      notes.push(
+        `The one-time re-auth link has expired along with its login session.\n\n${manual_instruction(m.config_dir)}`,
+      );
+    }
+
+    if (changed) {
+      const incidents = await load_auth_incidents(this.config);
+      incidents[incident.key] = updated;
+      await save_auth_incidents(incidents, this.config);
+    }
+    for (const note of notes) await this.post_incident_update(updated, note);
+  }
+
+  /** Post a follow-up into an incident's thread (or its channel as a fallback). */
+  private async post_incident_update(incident: AuthIncident, content: string): Promise<void> {
+    if (!this.discord) return;
+    if (incident.thread_id) {
+      await this.discord.send_to_thread(incident.thread_id, content);
+      return;
+    }
+    await this.discord.send(incident.channel_id, content);
   }
 
   private async resolve_alert_channel(): Promise<string | null> {
@@ -739,57 +1020,65 @@ export class AuthWatchdog {
     return null;
   }
 
-  /** Open (or upgrade to) a re-login incident for a credential: quarantine
-   * poisoned sessions (outage only), generate the URL, alert the owner, persist. */
+  /**
+   * Open the one re-login incident for a credential: quarantine poisoned
+   * sessions (outage only), capture an authorize URL, alert the owner, persist.
+   *
+   * Persisting is unconditional once the alert is posted — including when no URL
+   * could be captured. The old code returned early on that path without writing
+   * state, so every 5-minute tick re-opened the same incident and re-alerted;
+   * that is the loop #363 is about. The alert stays actionable either way: a URL
+   * the owner can click, or the exact command they can run.
+   */
   private async open_incident(
     m: MonitoredConfigDir,
-    kind: "outage" | "expiring",
-    minutes_to_expiry?: number,
+    assessment: { state: "outage" } | { state: "expiring"; minutes: number },
   ): Promise<void> {
-    const label = m.config_dir ?? "default account";
+    const kind = assessment.state;
+    const label = credential_label(m.config_dir);
     console.warn(
       `[auth-watchdog] Opening ${kind} incident for ${label} ` +
         `(entities: ${m.entity_names.join(", ") || "none"})`,
     );
 
-    let quarantined = 0;
-    if (kind === "outage") {
-      quarantined = await this.quarantine(m.config_dir);
-    }
-
-    const handle = await this.gen_url(m.config_dir, m.probe_cwd);
-    if (!handle) {
-      console.error(`[auth-watchdog] Could not generate a re-login URL for ${label} — will retry`);
-      return;
-    }
-
+    // Resolve the destination before doing anything with side effects — an
+    // unreachable Discord shouldn't leave an orphaned login session behind.
     const channel_id = await this.resolve_alert_channel();
     if (!channel_id) {
       console.error("[auth-watchdog] No alert channel resolved — cannot post incident");
-      // Tear down the held login session; next tick regenerates.
-      this.kill_session(handle.tmux_session);
       return;
+    }
+
+    const quarantined = kind === "outage" ? await this.quarantine(m.config_dir) : 0;
+    const handle = await this.gen_url(m.config_dir, m.probe_cwd);
+    if (!handle) {
+      console.warn(
+        `[auth-watchdog] No authorize URL for ${label} — alerting with the manual re-login command`,
+      );
     }
 
     const owner = this.config.discord?.user_id;
     const mention = owner ? `<@${owner}> ` : "";
-    const entities_line =
-      m.entity_names.length > 0 ? m.entity_names.join(", ") : "shared/default bots";
+    const entities_line = entities_label(m.entity_names);
 
     const title =
       kind === "outage"
         ? `\u{1f6a8} Claude auth down — ${label}`
-        : `⚠️ Claude auth expiring — ${label}`;
+        : `⚠️ Claude re-login due — ${label}`;
 
-    const body =
+    const action = handle
+      ? `**Re-auth now:** ${handle.url}\n\nThen **reply in this channel with the code** you get after authorizing.`
+      : manual_instruction(m.config_dir);
+
+    const lead =
       kind === "outage"
-        ? `${mention}The shared Claude credential for **${entities_line}** is logged out — every bot on it is down.\n\nQuarantined **${String(quarantined)}** poisoned session(s).\n\n**Re-auth now:** ${handle.url}\n\nThen **reply in this channel with the code** you get after authorizing.`
-        : `${mention}The shared Claude credential for **${entities_line}** expires in ~${String(minutes_to_expiry ?? "?")} min. Re-auth now to avoid an outage.\n\n**Re-auth:** ${handle.url}\n\nThen **reply in this channel with the code** you get after authorizing.`;
+        ? `${mention}The shared Claude credential for **${entities_line}** is logged out — every bot on it is down.\n\nQuarantined **${String(quarantined)}** poisoned session(s).`
+        : `${mention}The shared Claude credential for **${entities_line}** needs a human re-login within **${format_minutes(assessment.minutes)}** — a token refresh cannot extend it.`;
 
     const embed = new EmbedBuilder()
       .setColor(kind === "outage" ? ALERT_COLOR_RED : ALERT_COLOR_AMBER)
       .setTitle(title)
-      .setDescription(body)
+      .setDescription(`${lead}\n\n${action}`)
       .setTimestamp();
 
     let message_id: string | null = null;
@@ -810,14 +1099,14 @@ export class AuthWatchdog {
       config_dir: m.config_dir,
       entity_ids: m.entity_ids,
       entity_names: m.entity_names,
-      state: handle.state,
-      tmux_session: handle.tmux_session,
-      url: handle.url,
+      state: handle?.state ?? "",
+      tmux_session: handle?.tmux_session ?? null,
+      url: handle?.url ?? null,
       channel_id,
       message_id,
       thread_id,
       kind,
-      created_at: new Date().toISOString(),
+      created_at: new Date(this.now()).toISOString(),
     };
 
     const incidents = await load_auth_incidents(this.config);
@@ -847,10 +1136,13 @@ export class AuthWatchdog {
     if (open.length === 0) return false;
 
     const trimmed = content.trim();
+    // A manual-command incident carries an empty state, and `matches_state`
+    // never matches one — so a chat message can't be mistaken for its code.
     const incident = open.find(
-      (i) => i.channel_id === channel_id && matches_state(trimmed, i.state),
+      (i) =>
+        i.channel_id === channel_id && i.tmux_session !== null && matches_state(trimmed, i.state),
     );
-    if (!incident) return false;
+    if (!incident?.tmux_session) return false;
 
     console.log(`[auth-watchdog] Received a code submission for ${incident.key}`);
 
@@ -862,9 +1154,7 @@ export class AuthWatchdog {
     }
 
     // Confirm the credential is actually healthy again before declaring victory.
-    const m = enumerate_monitored_config_dirs(this.registry, this.config).find(
-      (x) => x.key === incident.key,
-    );
+    const m = this.monitored_for(incident.key);
     const reprobe = await this.probe(incident.config_dir, m?.probe_cwd ?? homedir());
     if (!reprobe.ok) {
       await this.reply(
@@ -876,8 +1166,8 @@ export class AuthWatchdog {
     }
 
     const recycled = this.pool.recycle_stale_oauth_on_config_dir(incident.config_dir);
-    const entities_line =
-      incident.entity_names.length > 0 ? incident.entity_names.join(", ") : "shared/default bots";
+    // Name entities from the live registry, never from the incident's snapshot.
+    const entities_line = entities_label(m?.entity_names ?? []);
 
     await this.resolve_incident(
       incident,
@@ -889,29 +1179,41 @@ export class AuthWatchdog {
     return true;
   }
 
-  private async regenerate(incident: AuthIncident): Promise<void> {
-    const m = enumerate_monitored_config_dirs(this.registry, this.config).find(
-      (x) => x.key === incident.key,
+  /** The live monitoring entry for a credential key, if it is still monitored. */
+  private monitored_for(key: string): MonitoredConfigDir | undefined {
+    return enumerate_monitored_config_dirs(this.registry, this.config, this.entity_exists).find(
+      (x) => x.key === key,
     );
+  }
+
+  /**
+   * Replace a spent authorize URL on an incident that stays open. When a fresh
+   * URL can't be captured the incident is downgraded to the manual command —
+   * never deleted, which would re-alert on the next tick.
+   */
+  private async regenerate(incident: AuthIncident): Promise<void> {
+    const m = this.monitored_for(incident.key);
     const cwd = m?.probe_cwd ?? homedir();
-    this.kill_session(incident.tmux_session);
+    if (incident.tmux_session) this.kill_session(incident.tmux_session);
+
     const handle = await this.gen_url(incident.config_dir, cwd);
-    const incidents = await load_auth_incidents(this.config);
-    if (!handle) {
-      // Drop the incident so the next tick re-opens cleanly.
-      delete incidents[incident.key];
-      await save_auth_incidents(incidents, this.config);
-      return;
-    }
     const updated: AuthIncident = {
       ...incident,
-      state: handle.state,
-      tmux_session: handle.tmux_session,
-      url: handle.url,
+      state: handle?.state ?? "",
+      tmux_session: handle?.tmux_session ?? null,
+      url: handle?.url ?? null,
     };
+
+    const incidents = await load_auth_incidents(this.config);
     incidents[incident.key] = updated;
     await save_auth_incidents(incidents, this.config);
-    await this.reply(incident.channel_id, `New re-auth link: ${handle.url}`);
+
+    await this.reply(
+      incident.channel_id,
+      handle
+        ? `New re-auth link: ${handle.url}`
+        : `Couldn't produce a new link.\n\n${manual_instruction(incident.config_dir)}`,
+    );
   }
 
   /** Mark the incident resolved (green), post the update, and clear state. */
