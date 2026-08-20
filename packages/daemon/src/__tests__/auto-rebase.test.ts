@@ -144,6 +144,8 @@ describe("attempt_auto_merge", () => {
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
+      // No merge commits in origin/main..HEAD — the #367 guard lets the rebase run.
+      "git rev-list": () => ({ stdout: "" }),
       "git rebase": (args) => {
         if (args.includes("--abort")) return { stdout: "" };
         rebase_attempted = true;
@@ -171,6 +173,8 @@ describe("attempt_auto_merge", () => {
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
+      // No merge commits in origin/main..HEAD — the #367 guard lets the rebase run.
+      "git rev-list": () => ({ stdout: "" }),
       "git rebase": (args) => {
         if (args.includes("--abort")) {
           rebase_abort_called = true;
@@ -186,6 +190,51 @@ describe("attempt_auto_merge", () => {
     expect(result.merged).toBe(false);
     expect(result.error).toContain("Rebase conflicts require manual resolution");
     expect(rebase_abort_called).toBe(true);
+  });
+
+  it("never rebases, pushes, or merges a branch carrying merge commits (#367)", async () => {
+    // The v2 merge-gate is not the only caller of try_local_rebase — this
+    // legacy path reaches it too, and must fail closed the same way. Real-git
+    // coverage of the guard itself lives in rebase-merge-commits.integration.test.ts.
+    let rebase_called = false;
+    let push_called = false;
+    let merge_after_rebase = false;
+    let merge_count = 0;
+
+    route_exec({
+      "gh pr merge": () => {
+        merge_count++;
+        if (merge_count > 1) merge_after_rebase = true;
+        return new Error("Pull request is not mergeable");
+      },
+      "gh repo view": () => ({ stdout: "test-org/test-repo" }),
+      "gh api": () => new Error("Merge conflict"),
+      "gh pr view": () => ({
+        stdout: JSON.stringify({ mergeable: "UNKNOWN", mergeStateStatus: "BEHIND" }),
+      }),
+      mktemp: () => ({ stdout: "/tmp/test-rebase-dir" }),
+      "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
+      "git clone": () => ({ stdout: "" }),
+      "git fetch": () => ({ stdout: "" }),
+      "git rev-list": () => ({ stdout: "abc1234def5678\n9876543210fedc\n" }),
+      "git rebase": () => {
+        rebase_called = true;
+        return { stdout: "" };
+      },
+      "git push": () => {
+        push_called = true;
+        return { stdout: "" };
+      },
+      rm: () => ({ stdout: "" }),
+    });
+
+    const result = await attempt_auto_merge(42, "feature/test", "/repo", "gh");
+
+    expect(rebase_called).toBe(false);
+    expect(push_called).toBe(false);
+    expect(merge_after_rebase).toBe(false);
+    expect(result.merged).toBe(false);
+    expect(result.error).toContain("abc1234def5678");
   });
 
   it("does not attempt update-branch or rebase when direct merge succeeds", async () => {
@@ -251,6 +300,8 @@ describe("attempt_auto_merge", () => {
       mktemp: () => ({ stdout: "/tmp/auto-rebase-test-42" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
+      // No merge commits in origin/main..HEAD — the #367 guard lets the rebase run.
+      "git rev-list": () => ({ stdout: "" }),
       "git rebase": (args) => {
         if (args.includes("--abort")) return { stdout: "" };
         return new Error("CONFLICT");
@@ -444,6 +495,8 @@ describe("attempt_auto_merge", () => {
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
+      // No merge commits in origin/main..HEAD — the #367 guard lets the rebase run.
+      "git rev-list": () => ({ stdout: "" }),
       "git rebase": (args) => {
         if (args.includes("--abort")) return { stdout: "" };
         // Simulate a non-conflict git error (e.g. network, timeout).
@@ -548,6 +601,8 @@ describe("attempt_auto_merge", () => {
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
+      // No merge commits in origin/main..HEAD — the #367 guard lets the rebase run.
+      "git rev-list": () => ({ stdout: "" }),
       "git rebase": (args) => {
         if (args.includes("--abort")) return { stdout: "" };
         rebase_attempted = true;

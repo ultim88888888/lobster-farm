@@ -59,8 +59,10 @@ export interface MergeGateInput {
  *   needed; the next check_suite will fire.
  * - `rebased_awaiting_ci` — branch was behind, rebase succeeded, force-push
  *   done. Waiting for a fresh check_suite on the rebased SHA before merging.
- * - `rebase_conflict` — branch is behind and cannot be cleanly rebased. Real
- *   conflict — needs human resolution.
+ * - `rebase_conflict` — branch is behind and cannot be safely rebased. Either
+ *   a real content conflict, or a branch carrying merge commits that a plain
+ *   rebase would drop (#367). Both need human resolution; neither can be
+ *   retried automatically.
  * - `branch_protected` — branch protection is blocking (missing required review
  *   from a team, etc.). Cannot self-resolve; alert.
  * - `mergeable_unknown` — GitHub hasn't finished computing mergeability. Wait
@@ -188,6 +190,15 @@ async function rebase_then_merge(
 
   if (!result.success) {
     if (result.kind === "conflict") {
+      return { kind: "rebase_conflict", error: result.error };
+    }
+    // The branch carries merge commits, so the rebase was refused before it
+    // started (#367). Like a conflict, this cannot resolve itself and cannot
+    // be retried — it needs a human — so it takes the same alert path. The
+    // distinct signal lives on `LocalRebaseResult.kind`; giving the gate its
+    // own outcome kind would need matching dispatch in webhook-handler.ts,
+    // which is owned by open PR #366. Worth splitting once that lands.
+    if (result.kind === "unsafe_merge_commits") {
       return { kind: "rebase_conflict", error: result.error };
     }
     return {
