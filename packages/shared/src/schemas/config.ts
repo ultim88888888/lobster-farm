@@ -100,8 +100,21 @@ export const LobsterFarmConfigSchema = z.object({
     .object({
       enabled: z.boolean().default(true),
       interval_minutes: z.number().int().min(1).default(5),
-      /** Proactively warn when a credential is within this many minutes of expiry. */
-      expiry_warn_minutes: z.number().int().min(1).default(30),
+      /**
+       * Proactively warn when a credential is within this many minutes of needing
+       * a *human re-login* — i.e. of its refresh token expiring, after which no
+       * silent refresh can save it.
+       *
+       * This is deliberately NOT measured against the access token, which rolls
+       * over every few hours on its own; doing so kept two healthy accounts under
+       * a permanent alarm (#363). Refresh tokens last weeks, so the default gives
+       * a day of notice rather than the half hour that suited the old meaning.
+       */
+      expiry_warn_minutes: z
+        .number()
+        .int()
+        .min(1)
+        .default(24 * 60),
       /** Channel to post alerts to. When unset, resolves to #command-center at runtime. */
       alert_channel_id: z.string().optional(),
     })
