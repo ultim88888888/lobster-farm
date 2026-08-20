@@ -97,7 +97,12 @@ function make_pr_payload(
   pr_number = 42,
   repo_full_name = "test-org/lobster-farm",
   overrides: Record<string, unknown> = {},
-  options: { installation_id?: number; head_sha?: string } = {},
+  options: {
+    installation_id?: number;
+    head_sha?: string;
+    /** Top-level `changes` object GitHub sends with `pull_request.edited`. */
+    changes?: Record<string, unknown>;
+  } = {},
 ): string {
   // Default SHA is deterministic per PR so same-PR events collide by default.
   // Tests that exercise HEAD movement pass an explicit head_sha override.
@@ -126,6 +131,10 @@ function make_pr_payload(
     },
     repository: { full_name: repo_full_name },
   };
+
+  if (options.changes != null) {
+    payload.changes = options.changes;
+  }
 
   if (options.installation_id != null) {
     payload.installation = { id: options.installation_id };
@@ -1873,6 +1882,274 @@ describe("handle_github_webhook", () => {
       // reviewDecision and does not unblock auto-merge. The #311 "Round 2
       // Approved" plain-comment anomaly must not be reintroduced.
       expect(prompt).not.toContain("gh pr comment");
+    });
+  });
+
+  // ── pull_request.edited (issue #362) ──
+  //
+  // A reviewer that requests changes about the PR *description* (a missing
+  // `Closes #N`, a wrong summary) is satisfied by the builder editing the PR
+  // body. That emits `pull_request.edited` and nothing else — no push, no
+  // `synchronize`. Before #362 the handler dropped those events and the fix
+  // loop dead-ended with the work already done.
+  describe("pull_request.edited re-review (issue #362)", () => {
+    beforeEach(async () => {
+      // vi.clearAllMocks() clears calls but not implementations — restore the
+      // module default so an outcome set by one test can't leak into the next.
+      const { detect_review_outcome } = await import("../actions.js");
+      vi.mocked(detect_review_outcome).mockImplementation(async () => "approved" as never);
+    });
+
+    /** Count reviewer spawns only — the fix loop also spawns builders. */
+    function reviewer_spawns(ctx: WebhookContext): number {
+      return (ctx.session_manager as any).spawn.mock.calls.filter(
+        (call: any[]) => (call[0] as { archetype?: string } | undefined)?.archetype === "reviewer",
+      ).length;
+    }
+
+    /** Drive the most recently spawned reviewer session to completion. */
+    async function complete_review(ctx: WebhookContext): Promise<void> {
+      const spawn = (ctx.session_manager as any).spawn;
+      let idx = -1;
+      spawn.mock.calls.forEach((call: any[], i: number) => {
+        if ((call[0] as { archetype?: string } | undefined)?.archetype === "reviewer") idx = i;
+      });
+      const result = await spawn.mock.results[idx].value;
+      (ctx.session_manager as any).emit("session:completed", {
+        session_id: result.session_id,
+        exit_code: 0,
+      });
+    }
+
+    async function deliver(body: string, ctx: WebhookContext): Promise<void> {
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      await handle_github_webhook(req, make_response(), ctx);
+    }
+
+    function edited_payload(
+      pr_number: number,
+      changes: Record<string, unknown> | undefined,
+      pr_overrides: Record<string, unknown> = {},
+      head_sha?: string,
+    ): string {
+      return make_pr_payload("edited", pr_number, "test-org/lobster-farm", pr_overrides, {
+        head_sha,
+        changes,
+      });
+    }
+
+    /** Let the async route_event pipeline settle before a no-op assertion. */
+    function settle(): Promise<void> {
+      return new Promise((r) => setTimeout(r, 150));
+    }
+
+    async function set_outcome(outcome: string): Promise<void> {
+      const { detect_review_outcome } = await import("../actions.js");
+      vi.mocked(detect_review_outcome).mockImplementation(async () => outcome as never);
+    }
+
+    it("spawns a fresh review when the body is edited after changes were requested", async () => {
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(700, { body: { from: "old body" } }), ctx);
+
+      await vi.waitFor(
+        () => {
+          expect(reviewer_spawns(ctx)).toBe(1);
+        },
+        { timeout: 2000 },
+      );
+    });
+
+    it("does not spawn a review when the body is edited on an approved PR", async () => {
+      await set_outcome("approved");
+      const ctx = make_context();
+
+      await deliver(edited_payload(701, { body: { from: "old body" } }), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(0);
+    });
+
+    it("treats a title-only edit the same as a body edit", async () => {
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(702, { title: { from: "old title" } }), ctx);
+
+      await vi.waitFor(
+        () => {
+          expect(reviewer_spawns(ctx)).toBe(1);
+        },
+        { timeout: 2000 },
+      );
+    });
+
+    it("ignores a base-branch-only edit", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(703, { base: { ref: { from: "main" } } }), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(0);
+      // Cheap guards come first — a base edit must not even cost a GitHub round-trip.
+      expect(detect_review_outcome).not.toHaveBeenCalled();
+    });
+
+    it("ignores an edited event with no changes object", async () => {
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(704, undefined), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(0);
+    });
+
+    it("ignores body edits on draft PRs", async () => {
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(705, { body: { from: "old body" } }, { draft: true }), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(0);
+    });
+
+    it("ignores body edits on closed PRs", async () => {
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(
+        edited_payload(706, { body: { from: "old body" } }, { state: "closed", merged: true }),
+        ctx,
+      );
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(0);
+    });
+
+    it("re-reviews at most once per head SHA, however many edits arrive", async () => {
+      // The loop guard. A re-review can itself request changes again, and the
+      // builder it spawns can edit the body again — on a HEAD that never moves.
+      // Without a per-SHA cap that is an unbounded review loop.
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(707, { body: { from: "v1" } }, {}, "sha-707-a"), ctx);
+      await vi.waitFor(
+        () => {
+          expect(reviewer_spawns(ctx)).toBe(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // Let the reviewer finish. That releases the in-flight dedup entry, so
+      // the edit memory is the only thing left that can stop the next edit.
+      await complete_review(ctx);
+      await vi.waitFor(
+        () => {
+          expect(get_active_webhook_reviews().find((r) => r.pr_number === 707)?.state).toBe(
+            "completed",
+          );
+        },
+        { timeout: 2000 },
+      );
+
+      await deliver(edited_payload(707, { body: { from: "v2" } }, {}, "sha-707-a"), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(1);
+    });
+
+    it("allows an edit-triggered review again once HEAD moves", async () => {
+      // The per-SHA cap must not permanently disable edit-triggered reviews —
+      // a new commit is a new review budget.
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(edited_payload(708, { body: { from: "v1" } }, {}, "sha-708-a"), ctx);
+      await vi.waitFor(
+        () => {
+          expect(reviewer_spawns(ctx)).toBe(1);
+        },
+        { timeout: 2000 },
+      );
+
+      await complete_review(ctx);
+      await vi.waitFor(
+        () => {
+          expect(
+            get_active_webhook_reviews().find(
+              (r) => r.pr_number === 708 && r.head_sha === "sha-708-a",
+            )?.state,
+          ).toBe("completed");
+        },
+        { timeout: 2000 },
+      );
+
+      await deliver(edited_payload(708, { body: { from: "v2" } }, {}, "sha-708-b"), ctx);
+
+      await vi.waitFor(
+        () => {
+          expect(reviewer_spawns(ctx)).toBe(2);
+        },
+        { timeout: 2000 },
+      );
+    });
+
+    it("does not spawn a second reviewer while a review is already in flight", async () => {
+      await set_outcome("changes_requested");
+      const ctx = make_context();
+
+      await deliver(make_pr_payload("opened", 709), ctx);
+      await vi.waitFor(
+        () => {
+          expect(reviewer_spawns(ctx)).toBe(1);
+        },
+        { timeout: 2000 },
+      );
+
+      await deliver(edited_payload(709, { body: { from: "old body" } }), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(1);
+    });
+
+    it("skips edited events for entities on pr_lifecycle=v2", async () => {
+      // v2 drives its whole review loop from check_suite.completed, with its
+      // own persisted state and reviewer prompt. Spawning a v1-style review
+      // from here would bypass both.
+      await set_outcome("changes_requested");
+      const registry = {
+        get_active: vi.fn().mockReturnValue([
+          {
+            entity: {
+              id: "lobster-farm",
+              pr_lifecycle: "v2",
+              repos: [
+                {
+                  name: "lobster-farm",
+                  url: "https://github.com/test-org/lobster-farm.git",
+                  path: "/tmp/test-repo",
+                },
+              ],
+            },
+          },
+        ]),
+      } as unknown as EntityRegistry;
+      const ctx = make_context({ registry });
+
+      await deliver(edited_payload(710, { body: { from: "old body" } }), ctx);
+      await settle();
+
+      expect(reviewer_spawns(ctx)).toBe(0);
     });
   });
 });

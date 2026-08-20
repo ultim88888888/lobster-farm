@@ -85,6 +85,18 @@ export interface WebhookPR {
   user: { login: string };
   merged?: boolean;
   draft?: boolean;
+  /** "open" | "closed". Absent on payloads from older tests/fixtures. */
+  state?: string;
+}
+
+/**
+ * The `changes` object GitHub sends with `pull_request.edited`. Only the keys
+ * that actually changed are present, each carrying its previous value.
+ */
+interface WebhookPREditChanges {
+  body?: { from?: string | null };
+  title?: { from?: string | null };
+  base?: unknown;
 }
 
 /** Minimal workflow_run shape from webhook payload. */
@@ -103,6 +115,8 @@ interface WebhookPayload {
   pull_request?: WebhookPR;
   workflow_run?: WebhookWorkflowRun;
   repository?: { full_name: string };
+  /** Present on `pull_request.edited` — names which fields changed. */
+  changes?: WebhookPREditChanges;
   /** GitHub includes the installation that generated the webhook event. */
   installation?: { id: number };
 }
@@ -284,6 +298,27 @@ function find_review_for_pr(
   return completed_entry;
 }
 
+/**
+ * head_sha keys that a `pull_request.edited` event has already re-reviewed,
+ * with the timestamp we recorded them. Values are timestamps only — presence
+ * is the guard (#362).
+ *
+ * This is the loop bound. An edit-triggered review can itself request changes
+ * again, and the builder it spawns can fix the complaint by editing the body
+ * again — on a HEAD that never moves, that is an unbounded review loop. One
+ * edit-triggered review per {entity, pr, head_sha} caps it. A new commit
+ * produces a new key and therefore a fresh budget.
+ */
+const edit_triggered_reviews = new Map<string, number>();
+
+/**
+ * How long an edit-triggered review is remembered. Long enough that no fix
+ * loop can churn through it (loops turn over in minutes), short enough that
+ * a human editing a long-stalled PR still gets a review — and that the map
+ * doesn't grow without bound.
+ */
+const EDIT_REVIEW_MEMORY_MS = 6 * 60 * 60 * 1000;
+
 const REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
@@ -310,6 +345,12 @@ function cleanup_stale_reviews(): void {
       now - review.completed_at > REVIEW_DEDUP_HOLD_MS
     ) {
       active_reviews.delete(key);
+    }
+  }
+
+  for (const [key, recorded_at] of edit_triggered_reviews) {
+    if (now - recorded_at > EDIT_REVIEW_MEMORY_MS) {
+      edit_triggered_reviews.delete(key);
     }
   }
 }
@@ -459,6 +500,22 @@ async function route_event(
     return;
   }
 
+  // A PR body/title edit is the only signal the fix loop emits when the
+  // reviewer's complaint was about the description itself (#362). It gets its
+  // own guards — see handle_pr_edited.
+  if (action === "edited") {
+    await handle_pr_edited(
+      payload.changes,
+      pr,
+      repo_full_name,
+      match.entity_id,
+      match.repo_path,
+      ctx,
+      installation_id,
+    );
+    return;
+  }
+
   // Only handle PR events that warrant a review
   const reviewable_actions = ["opened", "synchronize", "reopened", "ready_for_review"];
   if (!reviewable_actions.includes(action)) {
@@ -555,6 +612,111 @@ async function route_event(
 
   // No in-flight review for this SHA — spawn fresh.
   await spawn_review(match.entity_id, match.repo_path, repo_full_name, pr, ctx, installation_id);
+}
+
+// ── PR description edits (#362) ──
+
+/**
+ * Handle `pull_request.edited`.
+ *
+ * When a reviewer requests changes about the PR *description* — a missing
+ * `Closes #N`, a wrong summary — the builder resolves it by editing the PR
+ * body. That emits `pull_request.edited` and nothing else: no push, so no
+ * `synchronize`, so no re-review. The fix loop dead-ended with the work
+ * already done (observed on PR #691: fixed in six minutes, sat four hours).
+ *
+ * Guards, cheapest first:
+ *  1. only body/title edits are review input — a base-branch retarget is not
+ *  2. the PR must be open and out of draft
+ *  3. v1 only — v2 drives its loop from check_suite, with its own persisted
+ *     state and reviewer prompt, and spawning here would bypass both
+ *  4. one edit-triggered review per head SHA — the loop bound
+ *  5. nothing already in flight for this PR
+ *  6. the last recorded outcome must be `changes_requested` — an edit on an
+ *     approved or not-yet-reviewed PR has nothing to re-review
+ */
+async function handle_pr_edited(
+  changes: WebhookPREditChanges | undefined,
+  pr: WebhookPR,
+  repo_full_name: string,
+  entity_id: string,
+  repo_path: string,
+  ctx: WebhookContext,
+  installation_id?: string,
+): Promise<void> {
+  const tag = `pull_request.edited for #${String(pr.number)}`;
+
+  if (changes?.body === undefined && changes?.title === undefined) {
+    console.log(`[webhook] Ignoring ${tag} — no body or title change`);
+    return;
+  }
+
+  if (pr.state != null && pr.state !== "open") {
+    console.log(`[webhook] Ignoring ${tag} — PR is ${pr.state}`);
+    return;
+  }
+
+  if (pr.draft) {
+    console.log(`[webhook] Ignoring ${tag} — draft PR`);
+    return;
+  }
+
+  if (get_pr_lifecycle(ctx.registry, entity_id) === "v2") {
+    console.log(`[webhook] Ignoring ${tag} — entity ${entity_id} is on pr_lifecycle=v2`);
+    return;
+  }
+
+  const head_sha = pr.head.sha;
+  if (!head_sha) {
+    // Without a SHA there is no loop bound. Refuse rather than risk one.
+    console.log(`[webhook] Ignoring ${tag} — missing head.sha`);
+    return;
+  }
+
+  const key = review_key(entity_id, pr.number, head_sha);
+  if (edit_triggered_reviews.has(key)) {
+    console.log(
+      `[webhook] Ignoring ${tag} — an edit already triggered a review @ ${head_sha.slice(0, 7)}`,
+    );
+    return;
+  }
+
+  const existing = find_review_for_pr(entity_id, pr.number);
+  if (existing?.review.state === "in_flight") {
+    // A reviewer is running right now and will read the PR as it stands.
+    console.log(
+      `[webhook] Ignoring ${tag} — review in flight @ ${existing.review.head_sha.slice(0, 7)}`,
+    );
+    return;
+  }
+
+  let gh_token: string | undefined;
+  try {
+    gh_token = await resolve_token(ctx.github_app, installation_id);
+  } catch (err) {
+    // Fall through — detect_review_outcome falls back to the daemon's auth.
+    console.warn(`[webhook] Token resolution failed for ${tag}: ${String(err)}`);
+  }
+
+  const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
+  if (outcome !== "changes_requested") {
+    console.log(`[webhook] Ignoring ${tag} — last review outcome is "${outcome}"`);
+    return;
+  }
+
+  console.log(
+    `[webhook] ${tag} in ${entity_id} — changes were requested, re-reviewing @ ${head_sha.slice(0, 7)}`,
+  );
+
+  sentry.addBreadcrumb({
+    category: "daemon.api",
+    message: `Webhook: pull_request.edited PR #${String(pr.number)} — re-review`,
+    data: { entity: entity_id, pr_number: pr.number, head_sha },
+  });
+
+  // Record before spawning so a burst of edits can't race past the guard.
+  edit_triggered_reviews.set(key, Date.now());
+  await spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
 }
 
 // ── Reviewer spawning ──
@@ -2052,4 +2214,5 @@ export function get_active_webhook_reviews(): Array<{
  */
 export function _reset_active_reviews_for_testing(): void {
   active_reviews.clear();
+  edit_triggered_reviews.clear();
 }
