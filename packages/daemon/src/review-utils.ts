@@ -642,9 +642,20 @@ async function poll_mergeable(
  * fetch_failed, push_failed) and a real merge conflict that requires manual
  * resolution. The merge-gate (#257) uses `kind` to decide whether to alert
  * a human or wait for the next CI cycle.
+ *
+ * `unsafe_merge_commits` (#367) is neither: the branch was never rebased at
+ * all, because rebasing it would have been unsafe. It carries the SHAs of the
+ * merge commits that made it so.
  */
 export type LocalRebaseResult =
   | { success: true }
+  | {
+      success: false;
+      kind: "unsafe_merge_commits";
+      /** Merge commits found in `origin/main..HEAD`, newest first. */
+      merge_shas: string[];
+      error: string;
+    }
   | {
       success: false;
       kind:
@@ -711,14 +722,72 @@ export async function try_local_rebase(
       };
     }
 
-    // Fetch main
+    // Fetch main.
+    //
+    // The explicit refspec is load-bearing. The clone above is --single-branch,
+    // so remote.origin.fetch only maps the PR branch; a bare `git fetch origin
+    // main` then writes FETCH_HEAD and nothing else, leaving `origin/main`
+    // unresolvable and every subsequent `git rebase origin/main` dying with
+    // "fatal: invalid upstream 'origin/main'". Naming the destination ref
+    // creates refs/remotes/origin/main, which both the merge-commit scan and
+    // the rebase below address by name.
     try {
-      await exec_async("git", ["fetch", "origin", "main"], { cwd: tmp_dir, env, timeout: 30_000 });
+      await exec_async("git", ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"], {
+        cwd: tmp_dir,
+        env,
+        timeout: 30_000,
+      });
     } catch (err) {
       return {
         success: false,
         kind: "fetch_failed",
         error: `Fetch failed: ${String(err instanceof Error ? err.message : err)}`,
+      };
+    }
+
+    // Refuse to rebase a branch that contains merge commits (#367).
+    //
+    // Plain `git rebase` drops merge commits and linearises history. Anything
+    // recorded only in a merge commit — a conflict resolution, or an edit made
+    // while merging main to adapt the branch to it — has no commit to replay
+    // from, so it is simply lost, and the branch's pre-merge version of the
+    // file lands on top instead. Git raises no conflict: it never sees the
+    // collision, because the content it would have collided with is gone. The
+    // rebase reports success and we force-push a regression.
+    //
+    // There is no safe automatic answer. `--rebase-merges` preserves the
+    // topology but brings its own surprises, so we fail closed and hand the
+    // branch to a human rather than guess.
+    let merge_shas: string[];
+    try {
+      const { stdout } = await exec_async("git", ["rev-list", "--merges", "origin/main..HEAD"], {
+        cwd: tmp_dir,
+        env,
+        timeout: 30_000,
+      });
+      merge_shas = stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+    } catch (err) {
+      // Could not establish whether the branch is safe. Fail closed — never
+      // fall through to the rebase on an unanswered question.
+      return {
+        success: false,
+        kind: "other",
+        error: `Could not scan branch for merge commits: ${String(err instanceof Error ? err.message : err)}`,
+      };
+    }
+
+    if (merge_shas.length > 0) {
+      console.log(
+        `[auto-merge] Refusing to rebase ${branch}: ${String(merge_shas.length)} merge commit(s) in origin/main..HEAD`,
+      );
+      return {
+        success: false,
+        kind: "unsafe_merge_commits",
+        merge_shas,
+        error: `Branch contains ${String(merge_shas.length)} merge commit(s) (${merge_shas.join(", ")}). A plain rebase would drop them and can silently revert work already on main, so no rebase was attempted. Manual resolution required.`,
       };
     }
 

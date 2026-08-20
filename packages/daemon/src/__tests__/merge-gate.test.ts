@@ -262,6 +262,39 @@ describe("run_merge_gate", () => {
     expect(deps.gh_pr_merge).not.toHaveBeenCalled();
   });
 
+  it("BEHIND with merge commits on the branch → rebase_conflict alert, never a merge (#367)", async () => {
+    // The rebase was refused before it started, so there is nothing to retry
+    // and nothing to wait for. This must reach a human on the same alert path
+    // as a real conflict — a silent stall would leave the PR sitting approved
+    // and unmerged with nobody told why.
+    const deps = make_deps({
+      mergeability: {
+        mergeable: "MERGEABLE",
+        merge_state_status: "BEHIND",
+        head_sha: APPROVED_SHA,
+      },
+      rebase: {
+        success: false,
+        kind: "unsafe_merge_commits",
+        merge_shas: ["abc1234def5678", "9876543210fedc"],
+        error:
+          "Branch contains 2 merge commit(s) (abc1234def5678, 9876543210fedc). " +
+          "A plain rebase would drop them and can silently revert work already on main, " +
+          "so no rebase was attempted. Manual resolution required.",
+      },
+    });
+    const result = await run_merge_gate(make_input(), deps);
+
+    expect(result.kind).toBe("rebase_conflict");
+    expect(deps.gh_pr_merge).not.toHaveBeenCalled();
+    // The alert body is this error string, so the SHAs a human needs in order
+    // to resolve the branch have to survive into it.
+    if (result.kind !== "rebase_conflict") throw new Error("unreachable");
+    expect(result.error).toContain("abc1234def5678");
+    expect(result.error).toContain("9876543210fedc");
+    expect(result.error).toMatch(/merge commit/i);
+  });
+
   it("BEHIND with transient rebase failure → merge_failed (not falsely reported as conflict)", async () => {
     // Issue #254 — non-conflict rebase failures must NOT be reported as conflicts.
     const deps = make_deps({
