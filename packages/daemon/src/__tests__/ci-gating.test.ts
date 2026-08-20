@@ -269,6 +269,231 @@ describe("check_ci_status", () => {
   });
 });
 
+// ── Fallback to unfiltered checks when branch protection is unavailable (#361) ──
+
+/**
+ * `gh pr checks --required` only reports checks marked required by branch
+ * protection. On repos where branch protection cannot be configured, it reports
+ * nothing even though CI is running — so `check_ci_status` must retry without
+ * `--required`. These tests route the two shapes independently.
+ */
+function route_required_and_unfiltered(
+  required: ExecRoute,
+  unfiltered: ExecRoute,
+): { calls: string[][] } {
+  const calls: string[][] = [];
+  route_exec({
+    "gh pr checks": (args, opts) => {
+      calls.push(args);
+      return args.includes("--required") ? required(args, opts) : unfiltered(args, opts);
+    },
+  });
+  return { calls };
+}
+
+/** gh's error when `--required` matches nothing (cli/cli checks.go). */
+const NO_REQUIRED_CHECKS = new Error("no required checks reported on the 'feature/test' branch");
+
+/** gh's error when the PR has no checks at all. */
+const NO_CHECKS_AT_ALL = new Error("no checks reported on the 'feature/test' branch");
+
+describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const key of Object.keys(routes)) delete routes[key];
+  });
+
+  it("reports the real state when --required errors but CI exists", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => ({
+        stdout: JSON.stringify([
+          { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "backend", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "gate", state: "COMPLETED", conclusion: "SUCCESS" },
+        ]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).not.toContain("--required");
+    expect(calls[1]).toEqual(["pr", "checks", "42", "--json", "name,state,conclusion"]);
+  });
+
+  it("reports the real state when --required returns an empty list", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => ({ stdout: JSON.stringify([]) }),
+      () => ({
+        stdout: JSON.stringify([{ name: "backend", state: "COMPLETED", conclusion: "SUCCESS" }]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reports pending when the unfiltered checks are still running", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => ({
+        stdout: JSON.stringify([
+          { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "backend", state: "IN_PROGRESS", conclusion: "" },
+          { name: "frontend", state: "QUEUED", conclusion: "" },
+          { name: "gate", state: "PENDING", conclusion: "" },
+        ]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reports failures from the unfiltered checks", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => ({
+        stdout: JSON.stringify([
+          { name: "backend", state: "COMPLETED", conclusion: "FAILURE" },
+          { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "gate", state: "COMPLETED", conclusion: "TIMED_OUT" },
+        ]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(false);
+    expect(result.pending).toBe(false);
+    expect(result.failures).toEqual(["backend", "gate"]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("treats SKIPPED and NEUTRAL unfiltered checks as passing (partial CI must not wedge)", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => ({
+        stdout: JSON.stringify([
+          { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "backend", state: "COMPLETED", conclusion: "SKIPPED" },
+          { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "gate", state: "COMPLETED", conclusion: "NEUTRAL" },
+        ]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reports no CI only when the unfiltered query also reports nothing", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => NO_CHECKS_AT_ALL,
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reports no CI when the unfiltered query returns an empty list", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => ({ stdout: JSON.stringify([]) }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("fails closed when the fallback query hits an infrastructure error", async () => {
+    route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => new Error("HTTP 401: Bad credentials"),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+  });
+
+  it("fails closed without falling back when the --required query hits an infrastructure error", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => new Error("API rate limit exceeded"),
+      () => ({
+        stdout: JSON.stringify([{ name: "backend", state: "COMPLETED", conclusion: "SUCCESS" }]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("--required");
+  });
+
+  it("does not fall back when --required reports checks", async () => {
+    const { calls } = route_required_and_unfiltered(
+      () => ({
+        stdout: JSON.stringify([
+          { name: "required-gate", state: "COMPLETED", conclusion: "FAILURE" },
+        ]),
+      }),
+      () => ({
+        stdout: JSON.stringify([{ name: "optional", state: "COMPLETED", conclusion: "SUCCESS" }]),
+      }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.failures).toEqual(["required-gate"]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("fails closed when the fallback returns unparseable output", async () => {
+    route_required_and_unfiltered(
+      () => NO_REQUIRED_CHECKS,
+      () => ({ stdout: "not json" }),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+  });
+
+  it("passes GH_TOKEN to the fallback query too", async () => {
+    const envs: Array<Record<string, unknown>> = [];
+    route_exec({
+      "gh pr checks": (args, opts) => {
+        envs.push(opts.env as Record<string, unknown>);
+        if (args.includes("--required")) return NO_REQUIRED_CHECKS;
+        return {
+          stdout: JSON.stringify([{ name: "backend", state: "COMPLETED", conclusion: "SUCCESS" }]),
+        };
+      },
+    });
+
+    await check_ci_status(42, "/tmp/test-repo", "ghs_test_token");
+
+    expect(envs).toHaveLength(2);
+    expect(envs[1]!.GH_TOKEN).toBe("ghs_test_token");
+  });
+});
+
 // ── Webhook handler workflow_run tests ──
 
 const WEBHOOK_SECRET = "test-secret-for-ci-gating";
@@ -746,5 +971,35 @@ describe("webhook handler — CI gating on review completion", () => {
         title: expect.stringContaining("merged"),
       }),
     );
+  });
+
+  it("does NOT merge when --required reports nothing but CI is still running (#361)", async () => {
+    const merge_route = vi.fn(() => ({ stdout: "merged" }));
+
+    // Repo without branch protection: `--required` errors, but the unfiltered
+    // query shows four real jobs, one of them still executing.
+    const { discord } = await trigger_review_completion(
+      (args) => {
+        if (args.includes("--required")) {
+          return new Error("no required checks reported on the 'feature/test' branch");
+        }
+        return {
+          stdout: JSON.stringify([
+            { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
+            { name: "backend", state: "IN_PROGRESS", conclusion: "" },
+            { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
+            { name: "gate", state: "QUEUED", conclusion: "" },
+          ]),
+        };
+      },
+      {},
+      {
+        "gh pr merge": merge_route,
+        "gh repo view": () => ({ stdout: "test-org/lobster-farm" }),
+      },
+    );
+
+    expect(merge_route).not.toHaveBeenCalled();
+    expect(discord.send_to_entity).not.toHaveBeenCalled();
   });
 });
