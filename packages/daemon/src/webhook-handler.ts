@@ -928,17 +928,23 @@ async function handle_review_completion(
         // Never merge past running CI (#355). The v1 reviewer is told it may
         // approve-and-wait because "the daemon gates the actual merge on CI
         // completion" — this is that gate. Park the approval instead, pinned to
-        // the reviewed SHA; the `check_suite.completed` event for that SHA
-        // re-enters through check-suite-handler's v1 branch and merges once CI
-        // is green.
+        // the reviewed SHA.
+        //
+        // Two things release the park. `check_suite.completed` for this SHA
+        // re-enters through check-suite-handler's v1 branch and merges — fast,
+        // but only when the event arrives *after* this write. It usually does
+        // not: CI typically finishes while the reviewer is still reading, so
+        // the event fires first, finds no park, and no-ops (#372). The
+        // parked-approval sweep is the resolver that always finishes the job,
+        // and it is what makes an unresolvable park loud instead of silent.
         //
         // Unconditional on purpose. pr_cron has been disabled since 2026-04-24
         // (webhooks-only architecture), and its state says nothing about whether
         // bypassing a running check is safe — it never was.
         console.log(
-          `[webhook] CI checks pending for PR #${String(pr.number)} — parking approval, check_suite.completed will drive the merge`,
+          `[webhook] CI checks pending for PR #${String(pr.number)} — parking approval until CI completes`,
         );
-        await park_approved_pr(entity_id, pr, ctx);
+        await park_approved_pr(entity_id, repo_path, pr, ctx, installation_id);
         await ctx.alert_router?.post_alert({
           entity_id,
           tier: "routine",
@@ -1350,16 +1356,23 @@ async function spawn_fixer(
  *
  * The SHA pin is what makes the parked state safe to act on later: the CI fix
  * loop also writes `outcome: "approved"` entries, and merging on that alone
- * would land commits no reviewer has seen. check-suite-handler's v1 branch
- * merges only when the completed suite's SHA equals `v1_approved_sha`.
+ * would land commits no reviewer has seen. Both release paths merge only when
+ * the SHA they see equals `v1_approved_sha`.
+ *
+ * The repo path, installation ID and park timestamp are recorded alongside it
+ * (#372) so the parked-approval sweep can resolve the park without the event
+ * that created it: the state key (`entity_id:pr_number`) names no repo, and a
+ * multi-repo entity would otherwise leave the sweep guessing.
  *
  * Best-effort: a persistence failure means the PR stays unmerged and a human
  * picks it up from the #alerts message — strictly better than merging blind.
  */
 async function park_approved_pr(
   entity_id: string,
+  repo_path: string,
   pr: WebhookPR,
   ctx: WebhookContext,
+  installation_id?: string,
 ): Promise<void> {
   const key = ci_retry_key(entity_id, pr.number);
   try {
@@ -1372,6 +1385,11 @@ async function park_approved_pr(
       reviewed_at: new Date().toISOString(),
       outcome: "approved",
       v1_approved_sha: pr.head.sha,
+      v1_parked_at: new Date().toISOString(),
+      v1_repo_path: repo_path,
+      v1_installation_id: installation_id,
+      // A re-park on a new SHA starts with a clean escalation slate.
+      v1_park_escalated_sha: undefined,
     };
     await save_pr_reviews(state, ctx.config);
   } catch (err) {
@@ -1846,20 +1864,25 @@ export function build_reviewer_prompt(
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "",
     "CI status — three distinct cases, treat them differently:",
-    `  gh pr checks ${pr_num} --required`,
+    `  gh pr checks ${pr_num}`,
     "",
-    "1. FAILING required checks (conclusion failure/cancelled/timed_out):",
+    "Run it exactly as written. Do NOT add `--required`: these repos have no",
+    "branch protection, so the required-checks API 403s and the filtered list",
+    "comes back empty while CI is running — which reads as 'no CI configured'",
+    "and merges a PR whose tests have not finished (#365).",
+    "",
+    "1. FAILING checks (state failure/cancelled/timed_out):",
     "   The PR is broken. Note the failing checks in your review and request",
     "   changes so the builder can fix them. Do NOT merge.",
     "",
-    "2. PENDING required checks (state pending/queued/in_progress, no failures):",
+    "2. PENDING checks (state pending/queued/in_progress, no failures):",
     "   CI is still running — this is NOT a reason to request changes. Code",
     "   review is orthogonal to CI execution time. Review the code on its merits",
     "   and either:",
     "     - Approve (if the code is clean). The daemon gates the actual merge on",
-    "       CI completion — it parks your approval and merges when the",
-    "       check_suite for this commit completes green, so an approve-and-wait",
-    "       is safe. Note in your review body that merge will happen after CI",
+    "       CI completion — it parks your approval pinned to this commit and",
+    "       merges it once the checks report green, so an approve-and-wait is",
+    "       safe. Note in your review body that merge will happen after CI",
     "       clears.",
     "     - Request changes (only if the code itself has issues, independent of",
     "       CI status).",
@@ -1868,11 +1891,13 @@ export function build_reviewer_prompt(
     "   which spawns a fresh reviewer during the same pending-CI window, which",
     "   requests changes again.",
     "",
-    "3. PASSING required checks (all success/neutral/skipped), or no checks",
-    "   configured: safe to merge if you approved.",
+    "3. PASSING checks (every check success/neutral/skipped — skipped and",
+    "   neutral count as passing, our workflows use change detection), or no CI",
+    "   at all: safe to merge if you approved. 'No CI at all' means this command",
+    "   prints nothing at all — not that some filtered subset was empty.",
     "",
     "After posting your review:",
-    "- If you approved AND all required checks are passing (or none configured),",
+    "- If you approved AND every check is passing (or the repo has no CI),",
     "  merge the PR:",
     `  gh pr merge ${pr_num} --squash --delete-branch`,
     "- If you approved but CI is still pending, do NOT run the merge command",
