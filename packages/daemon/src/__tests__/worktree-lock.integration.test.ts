@@ -21,7 +21,7 @@ import type { EntityConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type FeatureData, cleanup_worktree, create_worktree } from "../actions.js";
 import { cleanup_after_merge, sweep_stale_worktrees } from "../worktree-cleanup.js";
-import { agent_lock_reason } from "../worktree-lock.js";
+import { agent_lock_reason, is_agent_lock, parse_lock_owner } from "../worktree-lock.js";
 
 const exec = promisify(execFile);
 
@@ -164,8 +164,21 @@ describe("worktree locking (real git)", () => {
         config_for(repo),
       );
 
-      expect(await lock_reason_of(repo, a)).toBe("issue-42 active build");
-      expect(await lock_reason_of(repo, b)).toBe("issue-570 active build");
+      expect(await lock_reason_of(repo, a)).toBe(
+        agent_lock_reason("issue-42", { kind: "pid", id: String(process.pid) }),
+      );
+      expect(await lock_reason_of(repo, b)).toBe(
+        agent_lock_reason("issue-570", { kind: "pid", id: String(process.pid) }),
+      );
+    });
+
+    it("records an owner the #370 reaper can resolve", async () => {
+      const wt = await create_worktree(make_feature(), config_for(repo));
+
+      const reason = await lock_reason_of(repo, wt);
+      expect(parse_lock_owner(reason)).toEqual({ kind: "pid", id: String(process.pid) });
+      // The owner token must not cost the lock its #358 identity.
+      expect(is_agent_lock(reason)).toBe(true);
     });
 
     it("falls back to the branch when the feature carries no issue number", async () => {
@@ -174,7 +187,9 @@ describe("worktree locking (real git)", () => {
         config_for(repo),
       );
 
-      expect(await lock_reason_of(repo, wt)).toBe("feature/no-issue active build");
+      expect(await lock_reason_of(repo, wt)).toBe(
+        agent_lock_reason("feature/no-issue", { kind: "pid", id: String(process.pid) }),
+      );
     });
 
     it("produces a lock git itself refuses to remove, even with --force", async () => {
@@ -194,7 +209,9 @@ describe("worktree locking (real git)", () => {
       const second = await create_worktree(feature, config_for(repo));
 
       expect(second).toBe(first);
-      expect(await lock_reason_of(repo, first)).toBe("issue-42 active build");
+      expect(await lock_reason_of(repo, first)).toBe(
+        agent_lock_reason("issue-42", { kind: "pid", id: String(process.pid) }),
+      );
     });
   });
 
@@ -217,8 +234,11 @@ describe("worktree locking (real git)", () => {
 
       expect(existsSync(control)).toBe(false);
       expect(existsSync(locked)).toBe(true);
-      // The sweep must never clear a lock — only an intended removal may.
-      expect(await lock_reason_of(repo, locked)).toBe("issue-42 active build");
+      // The sweep must never clear a lock — only an intended removal or the
+      // #370 reaper may, and the reaper is a separate pass that did not run.
+      expect(await lock_reason_of(repo, locked)).toBe(
+        agent_lock_reason("issue-42", { kind: "pid", id: String(process.pid) }),
+      );
     });
   });
 
