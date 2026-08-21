@@ -401,6 +401,13 @@ export async function handle_check_suite(
  * Deliberately narrow: this merges or it does nothing. No reviewers, no
  * ci-fixers, no flake reruns — v1 already has its own loops for those, driven
  * by `pull_request.synchronize`.
+ *
+ * This is the *fast* release path, not the only one. It fires once per SHA, and
+ * on a fast CI run it fires while the reviewer is still reading — before the
+ * park exists — so it finds nothing and no-ops, and no second event ever comes
+ * (#372). `parked-approvals.ts` is the resolver that always finishes the job;
+ * both stamp `v1_merge_attempted_sha` before merging, so whichever gets there
+ * first excludes the other.
  */
 async function handle_v1_check_suite(
   suite: CheckSuiteData,

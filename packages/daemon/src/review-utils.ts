@@ -855,11 +855,28 @@ export interface CICheckStatus {
   failures: string[];
 }
 
+/**
+ * One row of `gh pr checks --json name,state,bucket`.
+ *
+ * `state` is gh's single verdict field: the check run's conclusion once it has
+ * completed (SUCCESS / FAILURE / NEUTRAL / SKIPPED / CANCELLED / TIMED_OUT /
+ * ACTION_REQUIRED / STALE), otherwise its status (PENDING / QUEUED /
+ * IN_PROGRESS / REQUESTED / WAITING).
+ *
+ * `bucket` is gh's own coarse grouping — "pass" | "fail" | "pending" |
+ * "skipping" | "cancel" — kept as a backstop for states we don't enumerate.
+ *
+ * There is deliberately no `conclusion` field here: `gh pr checks --json` has
+ * never accepted one, and asking for it made gh exit 1 on every query (#372).
+ */
 interface GhCheck {
   name: string;
   state: string;
-  conclusion: string;
+  bucket: string;
 }
+
+/** The exact `--json` field list. Every name here must exist in `gh pr checks --json`. */
+const GH_CHECKS_JSON_FIELDS = "name,state,bucket";
 
 /**
  * Outcome of a single `gh pr checks` query.
@@ -879,7 +896,7 @@ async function query_pr_checks(
 ): Promise<ChecksQuery> {
   const args = ["pr", "checks", String(pr_number)];
   if (required) args.push("--required");
-  args.push("--json", "name,state,conclusion");
+  args.push("--json", GH_CHECKS_JSON_FIELDS);
 
   try {
     const { stdout } = await exec_async(gh_bin, args, {
@@ -892,6 +909,11 @@ async function query_pr_checks(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/no.*checks?\s+reported/i.test(msg)) return { kind: "none" };
+    // Everything else fails closed as pending, which is safe but silent — and
+    // silence is how a permanently-broken query (#372) hid for weeks. Say so.
+    console.error(
+      `[ci-status] gh pr checks failed for PR #${String(pr_number)} — reporting CI as pending: ${msg.split("\n").slice(0, 3).join(" | ")}`,
+    );
     return { kind: "error" };
   }
 }
@@ -902,18 +924,28 @@ async function query_pr_checks(
  * SUCCESS, NEUTRAL and SKIPPED all count as passing — our workflows use change
  * detection, so a frontend-only PR legitimately skips the backend job. Treating
  * skipped as pending would wedge every partial-CI PR forever.
+ *
+ * Pending is PENDING / QUEUED / IN_PROGRESS, plus anything gh itself buckets as
+ * pending. The bucket clause covers WAITING and REQUESTED (deployment approval
+ * gates): unfinished work that the state list alone would misread as a failure
+ * and hand to a CI fixer.
  */
 function classify_checks(checks: GhCheck[]): CICheckStatus {
   const failures: string[] = [];
   let has_pending = false;
 
   for (const check of checks) {
-    if (check.state === "PENDING" || check.state === "QUEUED" || check.state === "IN_PROGRESS") {
+    if (
+      check.bucket === "pending" ||
+      check.state === "PENDING" ||
+      check.state === "QUEUED" ||
+      check.state === "IN_PROGRESS"
+    ) {
       has_pending = true;
     } else if (
-      check.conclusion !== "SUCCESS" &&
-      check.conclusion !== "NEUTRAL" &&
-      check.conclusion !== "SKIPPED"
+      check.state !== "SUCCESS" &&
+      check.state !== "NEUTRAL" &&
+      check.state !== "SKIPPED"
     ) {
       failures.push(check.name);
     }

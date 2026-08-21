@@ -471,8 +471,8 @@ describe("webhook handler — CI fix loop", () => {
   it("spawns a builder when CI checks fail on an approved PR", async () => {
     const { session_manager, alert_router } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
-        { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
-        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+        { name: "Lint", state: "SUCCESS", bucket: "pass" },
+        { name: "Build", state: "FAILURE", bucket: "fail" },
       ]),
     }));
 
@@ -498,7 +498,7 @@ describe("webhook handler — CI fix loop", () => {
 
   it("increments ci_fix_attempts counter", async () => {
     await trigger_review_completion(() => ({
-      stdout: JSON.stringify([{ name: "Test", state: "COMPLETED", conclusion: "FAILURE" }]),
+      stdout: JSON.stringify([{ name: "Test", state: "FAILURE", bucket: "fail" }]),
     }));
 
     // Check that the persisted state has ci_fix_attempts = 1
@@ -510,8 +510,8 @@ describe("webhook handler — CI fix loop", () => {
   it("sets ci_failure_alerted to prevent pr-cron double-spawn", async () => {
     await trigger_review_completion(() => ({
       stdout: JSON.stringify([
-        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
-        { name: "Lint", state: "COMPLETED", conclusion: "FAILURE" },
+        { name: "Build", state: "FAILURE", bucket: "fail" },
+        { name: "Lint", state: "FAILURE", bucket: "fail" },
       ]),
     }));
 
@@ -537,7 +537,7 @@ describe("webhook handler — CI fix loop", () => {
     };
 
     const { session_manager, alert_router } = await trigger_review_completion(() => ({
-      stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
+      stdout: JSON.stringify([{ name: "Build", state: "FAILURE", bucket: "fail" }]),
     }));
 
     // Should NOT spawn a CI fix builder — counter is at 3, cap reached
@@ -575,7 +575,7 @@ describe("webhook handler — CI fix loop", () => {
 
     // CI still failing — fresh approval should NOT reset counter
     const { session_manager } = await trigger_review_completion(() => ({
-      stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
+      stdout: JSON.stringify([{ name: "Build", state: "FAILURE", bucket: "fail" }]),
     }));
 
     // Should spawn because we're at 2 < 3
@@ -615,7 +615,7 @@ describe("webhook handler — CI fix loop", () => {
     route_exec({
       "gh pr view": () => ({ stdout: "OPEN" }),
       "gh pr checks": () => ({
-        stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
+        stdout: JSON.stringify([{ name: "Build", state: "FAILURE", bucket: "fail" }]),
       }),
       "gh run list": () => ({
         stdout: JSON.stringify([{ databaseId: 100, name: "CI" }]),

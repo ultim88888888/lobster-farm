@@ -120,9 +120,9 @@ describe("check_ci_status", () => {
     route_exec({
       "gh pr checks": () => ({
         stdout: JSON.stringify([
-          { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "Build", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "Test", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "Lint", state: "SUCCESS", bucket: "pass" },
+          { name: "Build", state: "SUCCESS", bucket: "pass" },
+          { name: "Test", state: "SUCCESS", bucket: "pass" },
         ]),
       }),
     });
@@ -138,9 +138,9 @@ describe("check_ci_status", () => {
     route_exec({
       "gh pr checks": () => ({
         stdout: JSON.stringify([
-          { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
-          { name: "Test", state: "PENDING", conclusion: "" },
+          { name: "Lint", state: "SUCCESS", bucket: "pass" },
+          { name: "Build", state: "IN_PROGRESS", bucket: "pending" },
+          { name: "Test", state: "PENDING", bucket: "pending" },
         ]),
       }),
     });
@@ -156,9 +156,9 @@ describe("check_ci_status", () => {
     route_exec({
       "gh pr checks": () => ({
         stdout: JSON.stringify([
-          { name: "Lint", state: "COMPLETED", conclusion: "FAILURE" },
-          { name: "Build", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "Test", state: "COMPLETED", conclusion: "FAILURE" },
+          { name: "Lint", state: "FAILURE", bucket: "fail" },
+          { name: "Build", state: "SUCCESS", bucket: "pass" },
+          { name: "Test", state: "FAILURE", bucket: "fail" },
         ]),
       }),
     });
@@ -188,9 +188,9 @@ describe("check_ci_status", () => {
     route_exec({
       "gh pr checks": () => ({
         stdout: JSON.stringify([
-          { name: "Lint", state: "COMPLETED", conclusion: "NEUTRAL" },
-          { name: "Deploy", state: "COMPLETED", conclusion: "SKIPPED" },
-          { name: "Build", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "Lint", state: "NEUTRAL", bucket: "pass" },
+          { name: "Deploy", state: "SKIPPED", bucket: "skipping" },
+          { name: "Build", state: "SUCCESS", bucket: "pass" },
         ]),
       }),
     });
@@ -233,7 +233,7 @@ describe("check_ci_status", () => {
   it("handles QUEUED state as pending", async () => {
     route_exec({
       "gh pr checks": () => ({
-        stdout: JSON.stringify([{ name: "Build", state: "QUEUED", conclusion: "" }]),
+        stdout: JSON.stringify([{ name: "Build", state: "QUEUED", bucket: "pending" }]),
       }),
     });
 
@@ -308,10 +308,10 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
       () => NO_REQUIRED_CHECKS,
       () => ({
         stdout: JSON.stringify([
-          { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "backend", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "gate", state: "COMPLETED", conclusion: "SUCCESS" },
+          { name: "Detect changes", state: "SUCCESS", bucket: "pass" },
+          { name: "backend", state: "SUCCESS", bucket: "pass" },
+          { name: "frontend", state: "SUCCESS", bucket: "pass" },
+          { name: "gate", state: "SUCCESS", bucket: "pass" },
         ]),
       }),
     );
@@ -321,14 +321,14 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
     expect(result).toEqual({ passed: true, pending: false, failures: [] });
     expect(calls).toHaveLength(2);
     expect(calls[1]).not.toContain("--required");
-    expect(calls[1]).toEqual(["pr", "checks", "42", "--json", "name,state,conclusion"]);
+    expect(calls[1]).toEqual(["pr", "checks", "42", "--json", "name,state,bucket"]);
   });
 
   it("reports the real state when --required returns an empty list", async () => {
     const { calls } = route_required_and_unfiltered(
       () => ({ stdout: JSON.stringify([]) }),
       () => ({
-        stdout: JSON.stringify([{ name: "backend", state: "COMPLETED", conclusion: "SUCCESS" }]),
+        stdout: JSON.stringify([{ name: "backend", state: "SUCCESS", bucket: "pass" }]),
       }),
     );
 
@@ -343,10 +343,10 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
       () => NO_REQUIRED_CHECKS,
       () => ({
         stdout: JSON.stringify([
-          { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "backend", state: "IN_PROGRESS", conclusion: "" },
-          { name: "frontend", state: "QUEUED", conclusion: "" },
-          { name: "gate", state: "PENDING", conclusion: "" },
+          { name: "Detect changes", state: "SUCCESS", bucket: "pass" },
+          { name: "backend", state: "IN_PROGRESS", bucket: "pending" },
+          { name: "frontend", state: "QUEUED", bucket: "pending" },
+          { name: "gate", state: "PENDING", bucket: "pending" },
         ]),
       }),
     );
@@ -362,9 +362,9 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
       () => NO_REQUIRED_CHECKS,
       () => ({
         stdout: JSON.stringify([
-          { name: "backend", state: "COMPLETED", conclusion: "FAILURE" },
-          { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "gate", state: "COMPLETED", conclusion: "TIMED_OUT" },
+          { name: "backend", state: "FAILURE", bucket: "fail" },
+          { name: "frontend", state: "SUCCESS", bucket: "pass" },
+          { name: "gate", state: "TIMED_OUT", bucket: "fail" },
         ]),
       }),
     );
@@ -382,10 +382,10 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
       () => NO_REQUIRED_CHECKS,
       () => ({
         stdout: JSON.stringify([
-          { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "backend", state: "COMPLETED", conclusion: "SKIPPED" },
-          { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "gate", state: "COMPLETED", conclusion: "NEUTRAL" },
+          { name: "Detect changes", state: "SUCCESS", bucket: "pass" },
+          { name: "backend", state: "SKIPPED", bucket: "skipping" },
+          { name: "frontend", state: "SUCCESS", bucket: "pass" },
+          { name: "gate", state: "NEUTRAL", bucket: "pass" },
         ]),
       }),
     );
@@ -435,7 +435,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
     const { calls } = route_required_and_unfiltered(
       () => new Error("API rate limit exceeded"),
       () => ({
-        stdout: JSON.stringify([{ name: "backend", state: "COMPLETED", conclusion: "SUCCESS" }]),
+        stdout: JSON.stringify([{ name: "backend", state: "SUCCESS", bucket: "pass" }]),
       }),
     );
 
@@ -449,12 +449,10 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
   it("does not fall back when --required reports checks", async () => {
     const { calls } = route_required_and_unfiltered(
       () => ({
-        stdout: JSON.stringify([
-          { name: "required-gate", state: "COMPLETED", conclusion: "FAILURE" },
-        ]),
+        stdout: JSON.stringify([{ name: "required-gate", state: "FAILURE", bucket: "fail" }]),
       }),
       () => ({
-        stdout: JSON.stringify([{ name: "optional", state: "COMPLETED", conclusion: "SUCCESS" }]),
+        stdout: JSON.stringify([{ name: "optional", state: "SUCCESS", bucket: "pass" }]),
       }),
     );
 
@@ -482,7 +480,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
         envs.push(opts.env as Record<string, unknown>);
         if (args.includes("--required")) return NO_REQUIRED_CHECKS;
         return {
-          stdout: JSON.stringify([{ name: "backend", state: "COMPLETED", conclusion: "SUCCESS" }]),
+          stdout: JSON.stringify([{ name: "backend", state: "SUCCESS", bucket: "pass" }]),
         };
       },
     });
@@ -491,6 +489,128 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     expect(envs).toHaveLength(2);
     expect(envs[1]!.GH_TOKEN).toBe("ghs_test_token");
+  });
+});
+
+// ── The `--json` field contract with the real gh CLI (#372) ──
+
+/**
+ * `gh pr checks --json` validates field names client-side and exits 1 on an
+ * unknown one. It has never exposed a `conclusion` field — the completed
+ * verdict is carried by `state`.
+ *
+ * We asked for `conclusion` anyway. gh rejected every query with
+ *
+ *     Unknown JSON field: "conclusion"
+ *
+ * which `query_pr_checks` classifies as an infrastructure error, so
+ * `check_ci_status` failed closed to `pending: true` for every PR, on every
+ * entity, forever. That is what parked PR #371 while its only check was green.
+ *
+ * The old fixtures hid it: they invented `{ state: "COMPLETED", conclusion:
+ * "SUCCESS" }`, a shape gh never emits, and the command mock replayed it
+ * regardless of the `--json` argument. These tests validate the requested
+ * fields the way gh does, so a field that does not exist fails here first.
+ */
+
+/** Fields `gh pr checks --json` actually accepts (gh 2.87.3). */
+const GH_PR_CHECKS_JSON_FIELDS = new Set([
+  "bucket",
+  "completedAt",
+  "description",
+  "event",
+  "link",
+  "name",
+  "startedAt",
+  "state",
+  "workflow",
+]);
+
+/**
+ * Stand-in for the real `gh pr checks --json`: rejects unknown fields exactly
+ * as gh does, and otherwise replays the supplied checks.
+ */
+function route_gh_validating_json_fields(checks: Array<Record<string, string>>): {
+  calls: string[][];
+} {
+  const calls: string[][] = [];
+  route_exec({
+    "gh pr checks": (args) => {
+      calls.push(args);
+      const json_index = args.indexOf("--json");
+      const requested = json_index === -1 ? [] : (args[json_index + 1] ?? "").split(",");
+      for (const field of requested) {
+        if (!GH_PR_CHECKS_JSON_FIELDS.has(field)) {
+          return new Error(
+            `Command failed: gh ${args.join(" ")}\nUnknown JSON field: "${field}"\nAvailable fields:\n  ${[...GH_PR_CHECKS_JSON_FIELDS].join("\n  ")}\n`,
+          );
+        }
+      }
+      return { stdout: JSON.stringify(checks) };
+    },
+  });
+  return { calls };
+}
+
+describe("check_ci_status — only requests JSON fields gh supports (#372)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const key of Object.keys(routes)) delete routes[key];
+  });
+
+  it("reads a green PR as passing instead of failing closed on an unknown field", async () => {
+    const { calls } = route_gh_validating_json_fields([
+      { bucket: "pass", name: "Lint / Type-check / Test", state: "SUCCESS" },
+    ]);
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls[0]).not.toContain("name,state,conclusion");
+  });
+
+  it("still reports pending while a check is running", async () => {
+    route_gh_validating_json_fields([
+      { bucket: "pass", name: "Lint", state: "SUCCESS" },
+      { bucket: "pending", name: "Test", state: "IN_PROGRESS" },
+    ]);
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+  });
+
+  it("still reports failures", async () => {
+    route_gh_validating_json_fields([
+      { bucket: "fail", name: "Lint", state: "FAILURE" },
+      { bucket: "pass", name: "Test", state: "SUCCESS" },
+    ]);
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: false, failures: ["Lint"] });
+  });
+
+  it("keeps NEUTRAL and SKIPPED passing — change detection skips real jobs", async () => {
+    route_gh_validating_json_fields([
+      { bucket: "pass", name: "backend", state: "NEUTRAL" },
+      { bucket: "skipping", name: "frontend", state: "SKIPPED" },
+      { bucket: "pass", name: "gate", state: "SUCCESS" },
+    ]);
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+  });
+
+  it("treats a gh 'pending' bucket as pending even for a state we don't enumerate", async () => {
+    // WAITING/REQUESTED are real gh states (deployment approval gates). Reading
+    // them as failures would spawn a CI fixer against a green PR.
+    route_gh_validating_json_fields([{ bucket: "pending", name: "deploy", state: "WAITING" }]);
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
   });
 });
 
@@ -863,8 +983,8 @@ describe("webhook handler — CI gating on review completion", () => {
   it("blocks merge and spawns CI fixer when CI checks are failing", async () => {
     const { alert_router } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
-        { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
-        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+        { name: "Lint", state: "SUCCESS", bucket: "pass" },
+        { name: "Build", state: "FAILURE", bucket: "fail" },
       ]),
     }));
 
@@ -883,8 +1003,8 @@ describe("webhook handler — CI gating on review completion", () => {
     const { discord } = await trigger_review_completion(
       () => ({
         stdout: JSON.stringify([
-          { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
-          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
+          { name: "Lint", state: "SUCCESS", bucket: "pass" },
+          { name: "Build", state: "IN_PROGRESS", bucket: "pending" },
         ]),
       }),
       {},
@@ -912,7 +1032,7 @@ describe("webhook handler — CI gating on review completion", () => {
 
     const { alert_router } = await trigger_review_completion(
       () => ({
-        stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
+        stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", bucket: "pending" }]),
       }),
       { config: config_with_cron_disabled },
       {
@@ -936,7 +1056,7 @@ describe("webhook handler — CI gating on review completion", () => {
 
     await trigger_review_completion(
       () => ({
-        stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
+        stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", bucket: "pending" }]),
       }),
       { config: config_with_cron_disabled },
     );
@@ -985,10 +1105,10 @@ describe("webhook handler — CI gating on review completion", () => {
         }
         return {
           stdout: JSON.stringify([
-            { name: "Detect changes", state: "COMPLETED", conclusion: "SUCCESS" },
-            { name: "backend", state: "IN_PROGRESS", conclusion: "" },
-            { name: "frontend", state: "COMPLETED", conclusion: "SUCCESS" },
-            { name: "gate", state: "QUEUED", conclusion: "" },
+            { name: "Detect changes", state: "SUCCESS", bucket: "pass" },
+            { name: "backend", state: "IN_PROGRESS", bucket: "pending" },
+            { name: "frontend", state: "SUCCESS", bucket: "pass" },
+            { name: "gate", state: "QUEUED", bucket: "pending" },
           ]),
         };
       },

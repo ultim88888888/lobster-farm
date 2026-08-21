@@ -1597,7 +1597,42 @@ describe("handle_github_webhook", () => {
       const prompt: string = spawn_args.prompt;
 
       expect(prompt).toContain("gh pr merge 302 --squash --delete-branch");
-      expect(prompt).toContain("gh pr checks 302 --required");
+      expect(prompt).toContain("gh pr checks 302");
+    });
+
+    it("tells the reviewer to read every check, not just the required ones (#365)", async () => {
+      // `--required` reports nothing on a repo without branch protection (the
+      // API 403s with "Upgrade to GitHub Pro"). The reviewer read that as "no
+      // CI configured" and merged with CI still running — its own merge path,
+      // which the daemon's gate never sees.
+      const body = make_pr_payload("opened", 303, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      const prompt: string = (ctx.session_manager as any).spawn.mock.calls[0]![0].prompt;
+
+      expect(prompt).not.toContain("gh pr checks 303 --required");
+      expect(prompt).toContain("gh pr checks 303");
+      // The flag is named only to tell the reviewer not to reach for it.
+      expect(prompt).toContain("Do NOT add `--required`");
+      // "No checks configured" must mean the unfiltered list came back empty.
+      expect(prompt).toMatch(/'No CI at all' means this command\s+prints nothing at all/);
+      // Skipped/neutral stay passing; pending stays approve-and-wait.
+      expect(prompt).toContain("success/neutral/skipped");
+      expect(prompt).toContain("do NOT run the merge command");
     });
   });
 
@@ -1784,9 +1819,10 @@ describe("handle_github_webhook", () => {
       it("preserves the three-case CI handling from #268", () => {
         // Failing / pending / passing must all still be distinguished in the
         // prompt. Regression guard against accidentally reverting #268.
-        expect(prompt).toContain("FAILING required checks");
-        expect(prompt).toContain("PENDING required checks");
-        expect(prompt).toContain("PASSING required checks");
+        // No longer scoped to "required" checks — see #365.
+        expect(prompt).toContain("FAILING checks");
+        expect(prompt).toContain("PENDING checks");
+        expect(prompt).toContain("PASSING checks");
       });
     });
 

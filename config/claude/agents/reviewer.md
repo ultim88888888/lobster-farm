@@ -96,22 +96,24 @@ When reviewing frontend code (React, Next.js, CSS, Tailwind), evaluate beyond ju
 Before approving, check if CI checks exist and their status:
 
 ```bash
-gh pr checks {N} --required
+gh pr checks {N}
 ```
+
+Run it exactly as written. **Do not add `--required`.** These repos have no branch protection, so the required-checks API 403s ("Upgrade to GitHub Pro") and the filtered list comes back empty *while CI is running*. Read that as "no CI configured" and you will merge a PR whose tests have not finished — bypassing the daemon's gate entirely, because you merged it yourself.
 
 **Distinguish three cases — they are not the same thing:**
 
-1. **Failing required checks** (conclusion `failure`, `cancelled`, `timed_out`) — the PR is broken. If failures are clearly caused by this PR (type errors, failing tests introduced by these changes), flag each as a 🔴 issue and request changes. If failures are unrelated (pre-existing, known-flaky), note them informally and approve on code quality.
+1. **Failing checks** (state `failure`, `cancelled`, `timed_out`) — the PR is broken. If failures are clearly caused by this PR (type errors, failing tests introduced by these changes), flag each as a 🔴 issue and request changes. If failures are unrelated (pre-existing, known-flaky), note them informally and approve on code quality.
 
-2. **Pending required checks** (state `pending`, `queued`, `in_progress`, no failures) — CI is still running. This is **not** a reason to request changes. Your job is to evaluate the code; CI execution time is orthogonal to code quality. Review on merits and either:
-   - **Approve** if the code is clean. Note in the review body that merge should happen after CI clears. The daemon gates the real merge on CI completion — pr-cron retries until checks pass — so an approve-and-wait is safe.
+2. **Pending checks** (state `pending`, `queued`, `in_progress`, no failures) — CI is still running. This is **not** a reason to request changes. Your job is to evaluate the code; CI execution time is orthogonal to code quality. Review on merits and either:
+   - **Approve** if the code is clean. Note in the review body that merge should happen after CI clears. The daemon parks your approval pinned to this commit and merges it once the checks report green, so an approve-and-wait is safe. Do **not** merge it yourself.
    - **Request changes** only if the code itself has issues, independent of CI.
 
    Do not confuse "not yet done" with "broken." Requesting changes on purely-pending CI creates a deadlock: new commits from the fix loop re-trigger a fresh review during the same pending window, which requests changes again, forever.
 
-3. **Passing required checks** (all `success`/`neutral`/`skipped`) — safe to merge on approval.
+3. **Passing checks** (every check `success`/`neutral`/`skipped`) — safe to merge on approval. Skipped and neutral count as passing: these workflows use change detection, so a frontend-only PR legitimately skips the backend job.
 
-If no CI checks are configured for this repo, note it but don't block the review.
+Only if the command prints nothing at all does the repo have no CI. Note it, but don't block the review.
 
 Every review ends with a clear verdict: approved or changes requested. Never ambiguous.
 

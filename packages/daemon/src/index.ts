@@ -13,6 +13,11 @@ import { DiscordBot, resolve_bot_token } from "./discord.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { prune_daily_logs } from "./memory-pruning.js";
+import {
+  PARK_SWEEP_INTERVAL_MS,
+  make_parked_approval_deps,
+  sweep_parked_approvals,
+} from "./parked-approvals.js";
 import { append_session_log, load_context_alerts, save_context_alerts } from "./persistence.js";
 import { remove_pid, write_pid } from "./pid.js";
 import { BotPool } from "./pool.js";
@@ -338,6 +343,35 @@ async function main(): Promise<void> {
   }, CONTEXT_SWEEP_INTERVAL_MS);
   console.log("[context-alerts] Context threshold sweep scheduled (every 15 min)");
 
+  // Start the parked-approval resolver (#372) — finishes v1 merges that were
+  // parked behind running CI. `check_suite.completed` releases a park only when
+  // it arrives after the park was written, which is usually not the case, and
+  // there is no pr-cron safety net. Runs once at startup so a restart mid-park
+  // resolves immediately, then every two minutes.
+  let park_sweep_timer: NodeJS.Timeout | undefined;
+  if (github_app) {
+    const app = github_app;
+    const run_park_sweep = (): void => {
+      void sweep_parked_approvals(
+        make_parked_approval_deps({
+          config,
+          github_app: app,
+          post_alert: (payload) => alert_router.post_alert(payload),
+        }),
+      ).catch((err) => {
+        console.error(`[parked-approvals] Sweep failed: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "parked-approvals", action: "sweep" },
+        });
+      });
+    };
+    run_park_sweep();
+    park_sweep_timer = setInterval(run_park_sweep, PARK_SWEEP_INTERVAL_MS);
+    console.log("[parked-approvals] Parked-approval resolver scheduled (every 2 min)");
+  } else {
+    console.log("[parked-approvals] No GitHub App configured — resolver disabled");
+  }
+
   // Start weekly memory pruning — archives daily logs older than 30 days.
   // Runs once on startup (catches up if daemon was down) then weekly.
   const MEMORY_PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 1 week
@@ -413,6 +447,7 @@ async function main(): Promise<void> {
     auth_watchdog.stop();
     clearInterval(worktree_sweep_timer);
     clearInterval(context_sweep_timer);
+    if (park_sweep_timer) clearInterval(park_sweep_timer);
     clearInterval(memory_prune_timer);
 
     // Check for active work

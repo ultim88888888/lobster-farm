@@ -57,6 +57,19 @@ export interface ProcessedPR {
    * Pinning the SHA matters: `outcome: "approved"` alone is also set by the CI
    * fix loop, and merging on that would land commits no reviewer has seen. */
   v1_approved_sha?: string;
+  /** When the approval was parked, ISO-8601. Set alongside `v1_approved_sha`.
+   * The parked-approval sweep uses it to decide when a park has waited long
+   * enough to be escalated to a human rather than waited on forever (#372). */
+  v1_parked_at?: string;
+  /** Absolute path to the repo the parked PR lives in, and the GitHub App
+   * installation that can act on it. Recorded at park time because the state
+   * key (`entity_id:pr_number`) does not identify a repo — a multi-repo entity
+   * would otherwise leave the sweep guessing which one to query (#372). */
+  v1_repo_path?: string;
+  v1_installation_id?: string;
+  /** Head SHA whose park has already produced an escalation alert. Keeps the
+   * sweep to one alert per parked commit instead of one per two-minute tick. */
+  v1_park_escalated_sha?: string;
   /** Head SHA the v1 check-suite merge re-entry has already acted on.
    * One SHA produces one `check_suite.completed` per workflow, so without this
    * the merge would be attempted several times. Deliberately distinct from
