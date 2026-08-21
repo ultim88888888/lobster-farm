@@ -138,6 +138,7 @@ import {
   set_pool,
 } from "../actions.js";
 import * as sentry from "../sentry.js";
+import { is_agent_lock, parse_lock_owner } from "../worktree-lock.js";
 
 // ── Test helpers ──
 
@@ -296,16 +297,52 @@ describe("create_worktree", () => {
     const add_at = git_args.findIndex((a) => a[0] === "worktree" && a[1] === "add");
     const lock_at = git_args.findIndex((a) => a[0] === "worktree" && a[1] === "lock");
 
-    expect(git_args[lock_at]).toEqual([
+    expect(git_args[lock_at]?.slice(0, 4)).toEqual([
       "worktree",
       "lock",
       "/repos/test-repo/worktrees/42-widget",
       "--reason",
-      "issue-570 active build",
     ]);
+    // The issue number is what makes `git worktree list` self-explanatory.
+    expect(git_args[lock_at]?.[4]).toContain("issue-570");
     // The window between creating and locking is exactly the window #357
     // destroyed work in, so the order is part of the contract.
     expect(lock_at).toBeGreaterThan(add_at);
+  });
+
+  it("records an owner the lock reaper can resolve (#370)", async () => {
+    // Without a resolvable owner the lock is un-reapable, and #360's lock-at-
+    // creation turns every agent worktree into a permanent one.
+    exec_mock_impl = async () => ({ stdout: "", stderr: "" });
+
+    await create_worktree(make_feature({ githubIssue: 570 }), make_entity_config());
+
+    const lock_call = exec_calls.find(
+      (c) => c.command === "git" && c.args[0] === "worktree" && c.args[1] === "lock",
+    );
+    const reason = lock_call?.args[4] ?? "";
+
+    expect(is_agent_lock(reason)).toBe(true);
+    // Nothing else in this process knows better than the daemon's own pid.
+    expect(parse_lock_owner(reason)).toEqual({ kind: "pid", id: String(process.pid) });
+  });
+
+  it("lets the caller name the session that actually owns the build", async () => {
+    // A tmux session is a far better owner than the daemon pid: it dies when
+    // the work does, whereas the daemon outlives every build it starts.
+    exec_mock_impl = async () => ({ stdout: "", stderr: "" });
+
+    await create_worktree(make_feature({ githubIssue: 570 }), make_entity_config(), {
+      owner: { kind: "tmux", id: "pool-3" },
+    });
+
+    const lock_call = exec_calls.find(
+      (c) => c.command === "git" && c.args[0] === "worktree" && c.args[1] === "lock",
+    );
+    const reason = lock_call?.args[4] ?? "";
+
+    expect(parse_lock_owner(reason)).toEqual({ kind: "tmux", id: "pool-3" });
+    expect(is_agent_lock(reason)).toBe(true);
   });
 
   it("still returns the worktree path when locking fails", async () => {

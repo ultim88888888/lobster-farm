@@ -25,6 +25,14 @@
  *
  * Every guard fails closed: a check that errors protects the worktree. Losing
  * an hour of agent work is far more expensive than leaking a directory.
+ *
+ * A lock is the one veto with no expiry of its own, which is why orphaned
+ * locks accumulated until nothing was cleanable (#370). Releasing them is
+ * `worktree-lock-reaper.ts`'s job, and it runs immediately before this sweep
+ * on the same hourly tick. Nothing in that arrangement relaxes the guards
+ * below: a released lock returns a worktree to *normal* eligibility, where all
+ * four still apply — including the sweep's own 6h grace, which is three times
+ * the reaper's.
  */
 
 import { execFile, execFileSync } from "node:child_process";

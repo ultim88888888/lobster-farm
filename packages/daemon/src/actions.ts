@@ -30,7 +30,7 @@ import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
 import * as sentry from "./sentry.js";
-import { agent_lock_reason } from "./worktree-lock.js";
+import { type LockOwner, agent_lock_reason } from "./worktree-lock.js";
 
 const exec = promisify(execFile);
 const exec_shell = promisify(execCb);
@@ -56,21 +56,38 @@ async function run(
 /**
  * The lock reason recorded against a feature's worktree.
  *
- * Names the owning feature so `git worktree list` is self-explanatory to
- * whoever finds a locked tree. Falls back to the branch when there is no
- * issue number to name — an anonymous lock protects the directory but tells
- * nobody who to ask about it.
+ * Two audiences, one string. The label names the owning feature so `git
+ * worktree list` is self-explanatory to whoever finds a locked tree; it falls
+ * back to the branch when there is no issue number, because an anonymous lock
+ * protects the directory but tells nobody who to ask about it.
+ *
+ * The embedded owner token is for the reaper (#370). Before it existed nothing
+ * could establish whether a lock's owner was still running, so no lock was
+ * ever released and — once #360 started locking every worktree at creation —
+ * nothing was ever cleanable again.
  */
-function worktree_lock_reason(feature: FeatureData): string {
-  const owner = feature.githubIssue > 0 ? `issue-${String(feature.githubIssue)}` : feature.branch;
-  return agent_lock_reason(owner);
+function worktree_lock_reason(feature: FeatureData, owner: LockOwner): string {
+  const label = feature.githubIssue > 0 ? `issue-${String(feature.githubIssue)}` : feature.branch;
+  return agent_lock_reason(label, owner);
 }
 
-/** Create a git worktree for a feature branch. */
+/**
+ * Create a git worktree for a feature branch.
+ *
+ * @param options.owner - Who to record as the lock's owner. Pass the tmux
+ *   session running the build whenever the caller knows it: a session dies
+ *   when its work does, which is exactly what makes the lock reapable.
+ *
+ *   The default names the daemon process, which is the weakest owner that is
+ *   still true — it proves only that the daemon which placed the lock is
+ *   running, so a lock survives a daemon restart by at most one reaper pass.
+ */
 export async function create_worktree(
   feature: FeatureData,
   entity_config: EntityConfig,
+  options: { owner?: LockOwner } = {},
 ): Promise<string> {
+  const owner: LockOwner = options.owner ?? { kind: "pid", id: String(process.pid) };
   const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
   const worktree_path = `${repo_path}/worktrees/${feature.branch.replace("feature/", "")}`;
 
@@ -99,7 +116,7 @@ export async function create_worktree(
   //
   // Best-effort by design — a build that could not be locked is still a build
   // worth running, and failing here would abort the very work being protected.
-  const reason = worktree_lock_reason(feature);
+  const reason = worktree_lock_reason(feature, owner);
   try {
     await run("git", ["worktree", "lock", worktree_path, "--reason", reason], repo_path);
     console.log(`[actions] Locked worktree at ${worktree_path} (${reason})`);

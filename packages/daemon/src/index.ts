@@ -26,6 +26,7 @@ import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
 import { query_context_usage } from "./tmux-query.js";
 import { sweep_stale_worktrees } from "./worktree-cleanup.js";
+import { reap_stale_worktree_locks } from "./worktree-lock-reaper.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -306,18 +307,35 @@ async function main(): Promise<void> {
   }
   auth_watchdog.start();
 
-  // Start periodic worktree sweep (hourly) — cleans up stale worktrees from
+  // Start periodic worktree cleanup (hourly) — cleans up stale worktrees from
   // merged PRs that the webhook handler missed or from manual merges.
+  //
+  // Two passes, in this order and never in parallel (#370):
+  //
+  //  1. The reaper releases locks whose owning session is gone. It releases
+  //     and nothing else — no worktree is removed, no branch deleted.
+  //  2. The sweep decides what to remove, with every #357/#358 guard intact.
+  //
+  // Sequential because the sweep reads lock state from its own `git worktree
+  // list`: releasing first means a lock cleared this hour is honoured by the
+  // same hour's sweep instead of waiting for the next one. The reaper's grace
+  // (2h) is deliberately shorter than the sweep's (6h), so nothing is ever
+  // removed on the strength of a release that just happened.
   const WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
   const worktree_sweep_timer = setInterval(() => {
-    void sweep_stale_worktrees(registry).catch((err) => {
+    void (async () => {
+      await reap_stale_worktree_locks(registry);
+      await sweep_stale_worktrees(registry);
+    })().catch((err) => {
       console.error(`[worktree-cleanup] Sweep failed: ${String(err)}`);
       sentry.captureException(err, {
         tags: { module: "worktree-cleanup", action: "sweep" },
       });
     });
   }, WORKTREE_SWEEP_INTERVAL_MS);
-  console.log("[worktree-cleanup] Stale worktree sweep scheduled (every 60 min)");
+  console.log(
+    "[worktree-cleanup] Orphaned lock reaper and stale worktree sweep scheduled (every 60 min)",
+  );
 
   // Start periodic context-size sweep (#353) — alerts when a pool session's
   // context crosses 200k/500k/800k tokens, so a runaway session can be
