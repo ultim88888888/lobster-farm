@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   MCP_GIVEUP_THRESHOLD,
   MCP_GRACE_PERIOD_MS,
+  MCP_MAX_DOWN_PRESSES,
   MCP_MAX_RECONNECT_ATTEMPTS,
   MCP_RECOVERY_COOLDOWN_MS,
   attempt_mcp_reconnect,
@@ -19,6 +20,12 @@ import {
   wait_for_mcp_child,
 } from "../mcp-health.js";
 import type { McpDriver, McpRecoveryState, ProcessNode } from "../mcp-health.js";
+import {
+  REAL_PANE_DETAIL_MENU,
+  REAL_PANE_DISCORD_SELECTED,
+  REAL_PANE_SERVER_LIST,
+  real_pane_showing,
+} from "./helpers/mcp-pane-fixtures.js";
 
 // ── has_mcp_child (process-level detection, delegates to has_bun_descendant) ──
 
@@ -214,18 +221,69 @@ describe("encode_cache_slug", () => {
 // ── selection_line ──
 
 describe("selection_line", () => {
-  it("finds the line containing the ❯ selection cursor", () => {
-    const pane = [
-      "Manage MCP servers",
-      "  computer-use",
-      "❯ plugin:discord",
-      "  claude-design",
-    ].join("\n");
-    expect(selection_line(pane)).toBe("❯ plugin:discord");
+  // Guards the fixtures themselves. Every assertion below is only meaningful
+  // because the real captures carry `❯ …` prompt echoes in the transcript
+  // ABOVE the panel — that is exactly what #373 matched by mistake. A fixture
+  // trimmed down to just the panel block would pass against the buggy
+  // implementation and prove nothing, which is how this shipped in the first
+  // place. If this fails, re-capture the fixtures; do not relax the test.
+  it.each([
+    ["server list", REAL_PANE_SERVER_LIST],
+    ["discord selected", REAL_PANE_DISCORD_SELECTED],
+    ["detail menu", REAL_PANE_DETAIL_MENU],
+  ])("fixture guard: the %s capture has ❯ decoys above the panel", (_name, pane) => {
+    const lines = pane.split("\n");
+    const panel_start = lines.findIndex((l) => /^─{10,}/.test(l));
+    const decoys = lines.slice(0, panel_start).filter((l) => l.includes("❯"));
+
+    expect(panel_start).toBeGreaterThan(0);
+    expect(decoys.length).toBeGreaterThanOrEqual(2);
+    // ...and they must be the shape that fooled `.find()`: `❯` at column 0.
+    expect(decoys.every((l) => l.startsWith("❯"))).toBe(true);
   });
 
-  it("returns null when no line has a selection cursor", () => {
+  it("returns the panel cursor, not the transcript's own ❯ prompt echoes (#373)", () => {
+    // The regression. `.find()` returned "❯ /compact" here — the first ❯ in
+    // the pane, nine `❯ /mcp` echoes above the panel and completely unrelated
+    // to the cursor. The Down-hunt could therefore never match, so every
+    // automated reconnect aborted with server_not_found.
+    expect(selection_line(REAL_PANE_DISCORD_SELECTED)).toBe(
+      "  ❯ plugin:discord:discord · ✘ failed",
+    );
+  });
+
+  it("returns the first panel row when the cursor has not moved yet", () => {
+    expect(selection_line(REAL_PANE_SERVER_LIST)).toBe("  ❯ computer-use · ◯ disabled");
+  });
+
+  it("reads the detail menu, which carries no 'Manage MCP servers' header", () => {
+    // The detail panel is headed "Plugin:discord:discord MCP Server". Scoping
+    // the search by slicing at the server-list header would return null here
+    // and break the final guard of the sequence, so the region is anchored on
+    // the composer border instead.
+    expect(REAL_PANE_DETAIL_MENU).not.toContain("Manage MCP servers");
+    expect(selection_line(REAL_PANE_DETAIL_MENU)).toBe("  ❯ 1. Reconnect");
+  });
+
+  it("returns null for an idle pane with no panel open", () => {
+    // Fails closed rather than handing back a transcript line that might
+    // coincidentally match what a caller is looking for.
+    expect(selection_line(real_pane_showing())).toBeNull();
+  });
+
+  it("returns null when the pane has no composer at all", () => {
     expect(selection_line("nothing here\njust text")).toBeNull();
+  });
+
+  it("ignores indented markdown table rules when locating the composer", () => {
+    // Table borders are the only other `─` runs a pane shows; they are
+    // indented and start with a corner glyph, so the anchored pattern skips
+    // them and the composer border is still found.
+    const pane = real_pane_showing("  ❯ plugin:discord:discord · ✘ failed").replace(
+      "✻ Conversation compacted (ctrl+o for history)",
+      "  ┌────────────┬─────────┐\n  ├────────────┼─────────┤\n  └────────────┴─────────┘",
+    );
+    expect(selection_line(pane)).toBe("  ❯ plugin:discord:discord · ✘ failed");
   });
 });
 
@@ -512,14 +570,28 @@ describe("run_mcp_recovery_cycle", () => {
   });
 });
 
-function make_scripted_success_driver(): McpDriver {
-  const panel = "Manage MCP servers";
-  const captures = [
-    panel,
-    `${panel}\n❯ plugin:discord`,
-    `${panel}\n❯ plugin:discord`,
-    "❯ 1. Reconnect",
+/**
+ * The pane sequence a successful reconnect actually walks through, in real
+ * captures: panel opens with the cursor on the first row, one Down lands on
+ * the failed discord server, the pre-Enter guard re-reads the same pane, and
+ * Enter opens the detail menu with Reconnect preselected.
+ *
+ * This is the sequence verified by hand against a live bot whose MCP server
+ * had been killed — the driver drove it end to end and the bun child came
+ * back (#373).
+ */
+function real_success_captures(): string[] {
+  return [
+    REAL_PANE_SERVER_LIST, // panel-open guard
+    REAL_PANE_SERVER_LIST, // hunt: cursor still on computer-use → Down
+    REAL_PANE_DISCORD_SELECTED, // hunt: landed on plugin:discord
+    REAL_PANE_DISCORD_SELECTED, // pre-Enter re-confirm
+    REAL_PANE_DETAIL_MENU, // detail menu, ❯ 1. Reconnect
   ];
+}
+
+function make_scripted_success_driver(): McpDriver {
+  const captures = real_success_captures();
   return {
     capture: vi.fn(() => captures.shift() ?? null),
     send: vi.fn(),
@@ -553,33 +625,60 @@ describe("attempt_mcp_reconnect", () => {
   });
 
   it("hunts with Down until the selection line contains plugin:discord, never counting keystrokes", async () => {
-    const panel = "Manage MCP servers";
-    const captures = [
-      panel, // after /mcp
-      `${panel}\n❯ computer-use`, // 1st nav check — wrong server first (per spec)
-      `${panel}\n  computer-use\n❯ plugin:discord`, // 2nd nav check — found it
-      `${panel}\n  computer-use\n❯ plugin:discord`, // re-confirm before Enter
-      "Manage MCP servers\n❯ 1. Reconnect", // detail menu
-    ];
+    const captures = real_success_captures();
     const capture = vi.fn(() => captures.shift() ?? null);
     const driver = make_driver({ capture, is_healthy: vi.fn().mockReturnValue(true) });
 
     const result = await attempt_mcp_reconnect("pool-1", driver);
 
     expect(result).toEqual({ ok: true });
-    // One Down press to skip past "computer-use" before landing on plugin:discord.
-    expect(driver.send).toHaveBeenCalledWith("pool-1", "Down");
+    // Exactly one Down press to step off computer-use onto plugin:discord.
+    // This count is the driver-level regression assertion for #373: reading
+    // the transcript instead of the panel meant the hunt never matched, so it
+    // burned all MCP_MAX_DOWN_PRESSES presses and then gave up.
+    const downs = (driver.send as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c) => c[1] === "Down",
+    );
+    expect(downs).toHaveLength(1);
     expect(driver.send).toHaveBeenCalledWith("pool-1", "Enter");
     // Final step returns to the prompt.
     expect(driver.send).toHaveBeenLastCalledWith("pool-1", "Escape");
   });
 
+  it("gives up with server_not_found when the panel never lists plugin:discord", async () => {
+    // A real panel, but discord genuinely isn't in it. The hunt should exhaust
+    // its press budget and abort — the correct behaviour for this pane, and
+    // the behaviour #373 produced for every pane.
+    const pane = real_pane_showing(
+      "  Manage MCP servers",
+      "  1 server",
+      "",
+      "  ❯ computer-use · ◯ disabled",
+    );
+    const driver = make_driver({ capture: vi.fn().mockReturnValue(pane) });
+
+    const result = await attempt_mcp_reconnect("pool-1", driver);
+
+    expect(result).toEqual({ ok: false, reason: "server_not_found" });
+    const downs = (driver.send as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c) => c[1] === "Down",
+    );
+    expect(downs).toHaveLength(MCP_MAX_DOWN_PRESSES);
+    expect(driver.send).toHaveBeenCalledWith("pool-1", "Escape");
+  });
+
   it("aborts without pressing Enter when the selection line is wrong right before select", async () => {
-    const panel = "Manage MCP servers";
+    const moved = real_pane_showing(
+      "  Manage MCP servers",
+      "  2 servers",
+      "",
+      "  ❯ computer-use · ◯ disabled",
+      "    plugin:discord:discord · ✘ failed",
+    );
     const captures = [
-      panel, // after /mcp
-      `${panel}\n❯ plugin:discord`, // nav check — found immediately
-      `${panel}\n❯ something-else`, // re-confirm — selection moved (stray key)
+      REAL_PANE_SERVER_LIST, // panel-open guard
+      REAL_PANE_DISCORD_SELECTED, // hunt — found immediately
+      moved, // re-confirm — a stray key moved the cursor
     ];
     const capture = vi.fn(() => captures.shift() ?? null);
     const send = vi.fn();
@@ -594,12 +693,19 @@ describe("attempt_mcp_reconnect", () => {
   });
 
   it("aborts when the detail menu doesn't show Reconnect selected", async () => {
-    const panel = "Manage MCP servers";
+    const wrong_item = real_pane_showing(
+      "  Plugin:discord:discord MCP Server",
+      "",
+      "  Status:           ✘ failed",
+      "",
+      "    1. Reconnect",
+      "  ❯ 2. Disable",
+    );
     const captures = [
-      panel,
-      `${panel}\n❯ plugin:discord`,
-      `${panel}\n❯ plugin:discord`,
-      "some other detail menu\n❯ 2. Disable", // wrong item selected
+      REAL_PANE_SERVER_LIST,
+      REAL_PANE_DISCORD_SELECTED,
+      REAL_PANE_DISCORD_SELECTED,
+      wrong_item,
     ];
     const capture = vi.fn(() => captures.shift() ?? null);
     const send = vi.fn();
@@ -610,19 +716,16 @@ describe("attempt_mcp_reconnect", () => {
     expect(result).toEqual({ ok: false, reason: "detail_menu_not_shown" });
     // The failing capture was after the plugin:discord Enter — that Enter did fire...
     expect(send).toHaveBeenCalledWith("pool-1", "Enter");
-    // ...but the final Reconnect-confirming Enter must never fire.
+    // ...but the final Reconnect-confirming Enter must never fire. Note the
+    // pane *contains* the text "1. Reconnect" on an unselected row: the guard
+    // has to read the cursor, not the panel body.
+    expect(wrong_item).toContain("1. Reconnect");
     expect(send.mock.calls.filter((c) => c[1] === "Enter")).toHaveLength(1);
     expect(send).toHaveBeenCalledWith("pool-1", "Escape");
   });
 
   it("reports child_still_missing when the process signal doesn't recover after Reconnect", async () => {
-    const panel = "Manage MCP servers";
-    const captures = [
-      panel,
-      `${panel}\n❯ plugin:discord`,
-      `${panel}\n❯ plugin:discord`,
-      "❯ 1. Reconnect",
-    ];
+    const captures = real_success_captures();
     const capture = vi.fn(() => captures.shift() ?? null);
     const driver = make_driver({ capture, is_healthy: vi.fn().mockReturnValue(false) });
 
@@ -636,13 +739,7 @@ describe("attempt_mcp_reconnect", () => {
   });
 
   it("happy path: full sequence confirms reconnect and re-verifies the process signal", async () => {
-    const panel = "Manage MCP servers";
-    const captures = [
-      panel,
-      `${panel}\n❯ plugin:discord`,
-      `${panel}\n❯ plugin:discord`,
-      "❯ 1. Reconnect",
-    ];
+    const captures = real_success_captures();
     const capture = vi.fn(() => captures.shift() ?? null);
     const is_healthy = vi.fn().mockReturnValue(true);
     const driver = make_driver({ capture, is_healthy });

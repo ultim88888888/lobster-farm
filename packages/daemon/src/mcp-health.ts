@@ -40,7 +40,13 @@
  * (Reconnect x2 + fallback, still unhealthy) within 30 minutes, give up —
  * stop attempting and let the caller alert. The bot is never released.
  *
- * References: issue #345, #347. Template for pane-driving with guards:
+ * 2026-08-21 (#373): the scripted Reconnect above had in fact never worked
+ * in production — `selection_line` was reading the session's own transcript
+ * instead of the panel, so every attempt aborted and fell back to kill +
+ * resume. See that function's comment; it is the reason a long run of
+ * "deaf channel" reports all traced back to one helper.
+ *
+ * References: issue #345, #347, #373. Template for pane-driving with guards:
  * `rate-limit-recovery.ts` (#270) and `econnreset-recovery.ts` (#337, sibling
  * — a different failure mode, deliberately not merged with this detector).
  */
@@ -73,7 +79,15 @@ export const MCP_GIVEUP_THRESHOLD = 3;
 export const MCP_GIVEUP_WINDOW_MS = 30 * 60 * 1000;
 
 /** Wait between each guarded keystroke of the reconnect driver, giving the
- * TUI time to render before the next pane capture. */
+ * TUI time to render before the next pane capture.
+ *
+ * Measured (#373) against a live idle session by polling `capture-pane` every
+ * 50ms: the `/mcp` panel paints 60-81ms after Enter, a Down moves the cursor
+ * in 4-6ms, and the detail menu paints in 59-68ms — four consecutive runs.
+ * 1.5s is ~20x headroom, so this was never the bottleneck it looked like when
+ * the driver appeared to hang; that was `selection_line` failing to match.
+ * Left as-is: it already absorbs a 20x slowdown, and raising it would only
+ * make each *failed* cycle slower (up to MCP_MAX_DOWN_PRESSES waits). */
 export const MCP_RECONNECT_STEP_WAIT_MS = 1_500;
 
 /** After sending the final Reconnect keystroke, wait this long before
@@ -287,9 +301,61 @@ export function send_keys(tmux_session: string, ...keys: string[]): void {
   }
 }
 
-/** Find the line containing the `❯` selection cursor in a TUI list/panel. */
+/**
+ * A full-width horizontal rule at column 0 — one of the two lines Claude Code
+ * draws around the composer. Anchored and unindented on purpose: the only
+ * other `─` runs a pane ever shows are markdown table borders, which are
+ * indented and start with `┌`/`├`/`└`.
+ *
+ * The 10-character floor is a safety margin, not a measurement — real borders
+ * span the terminal width (193-200 chars in the captures this was verified
+ * against) and would still be matched in a very narrow terminal.
+ */
+const COMPOSER_BORDER = /^─{10,}/;
+
+/**
+ * Find the line bearing the `❯` selection cursor in the overlay panel that
+ * Claude Code draws *below* the composer — the `/mcp` server list, or a
+ * single server's detail menu.
+ *
+ * #373: this used to be `.find((line) => line.includes("❯"))` across the
+ * whole pane. But `capture_pane` returns everything visible, and the
+ * transcript above the composer echoes every command the session has run as
+ * `❯ /mcp` at column 0. On any bot that had already attempted a reconnect,
+ * the FIRST `❯` was one of those stale echoes, never the cursor. The
+ * Down-hunt in `attempt_mcp_reconnect` then burned all
+ * MCP_MAX_DOWN_PRESSES iterations without ever matching "plugin:discord",
+ * aborted with `server_not_found`, and pressed Escape — surfacing in the
+ * transcript as "MCP dialog dismissed". The failure was self-reinforcing:
+ * each attempt echoed one more `❯ /mcp` decoy above the panel. Every
+ * automated recovery since had been failing this way; manual recovery always
+ * worked first try because a human reads the actual cursor.
+ *
+ * So the search is scoped to the panel rather than the pane. The panel is
+ * always drawn after the composer's bottom border, which makes the cursor the
+ * first `❯` following the LAST border rule. Scoping by region rather than by
+ * `findLast` is deliberate: it is a statement about where the cursor lives,
+ * not an assumption that nothing below it can ever contain a `❯`. It also
+ * fails closed — a pane with no panel open yields null instead of whatever
+ * `❯` line happened to be last, so the callers' guards abort rather than
+ * matching a transcript line by coincidence.
+ *
+ * Deliberately NOT scoped by slicing at the "Manage MCP servers" header: the
+ * server detail menu is headed "Plugin:discord:discord MCP Server" and
+ * contains no such string, so a header slice would return null for the
+ * `1. Reconnect` guard and break the last step of the sequence.
+ *
+ * Returns null when no panel is open (or the pane is unreadable enough to
+ * have lost its composer) — same fail-closed posture as `capture_pane`.
+ */
 export function selection_line(pane_output: string): string | null {
-  return pane_output.split("\n").find((line) => line.includes("❯")) ?? null;
+  const lines = pane_output.split("\n");
+  let composer_bottom = lines.length - 1;
+  while (composer_bottom >= 0 && !COMPOSER_BORDER.test(lines[composer_bottom] ?? "")) {
+    composer_bottom--;
+  }
+  if (composer_bottom < 0) return null;
+  return lines.slice(composer_bottom + 1).find((line) => line.includes("❯")) ?? null;
 }
 
 // ── Reconnect driver (Step 1) ──
@@ -334,6 +400,10 @@ export type ReconnectResult = { ok: true } | { ok: false; reason: ReconnectFailu
  *   4. Re-confirm the selection line before Enter (guards against a stray
  *      keystroke moving the cursor between capture and send).
  *   5. Confirm the detail menu shows "❯ 1. Reconnect" selected, else abort.
+ *      Verified against a real failed server (#373): its menu is
+ *      "❯ 1. Reconnect / 2. Disable", Reconnect preselected. A *connected*
+ *      server shows "1. View tools / 2. Reconnect / 3. Disable" instead, but
+ *      recovery only ever runs against a failed one.
  *   6. Enter, wait ~6s, then re-verify the process-level signal.
  */
 export async function attempt_mcp_reconnect(
