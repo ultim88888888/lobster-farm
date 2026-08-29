@@ -143,6 +143,12 @@ Every task in a spec must be assigned to the correct agent. Never give work to t
 
 ---
 
+## Discord-Bridged Sessions
+
+**Never call `AskUserQuestion` in Discord-bridged sessions.** The option picker is a local terminal UI and doesn't reach the user — it wedges the conversation. Send the question as a Discord reply with a numbered/lettered list and read the answer from the next inbound message. (Enforced by the `block-askuserquestion-in-discord.py` PreToolUse hook, which detects bridged sessions via the `DISCORD_STATE_DIR` env var.)
+
+---
+
 ## Anti-Patterns
 
 - ❌ Specs that describe HOW to implement instead of WHAT to build — leave implementation to the Builder

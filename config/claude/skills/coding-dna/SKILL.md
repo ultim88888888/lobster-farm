@@ -1076,6 +1076,12 @@ Loggers are configurable per-environment. In prod you want structured logs. In d
 
 ---
 
+## Communication
+
+**Never call `AskUserQuestion` in Discord-bridged sessions.** The option picker is a local terminal UI and doesn't reach the user — it wedges the conversation. Send the question as a Discord reply with a numbered/lettered list and read the answer from the next inbound message. (Enforced by the `block-askuserquestion-in-discord.py` PreToolUse hook, which detects bridged sessions via the `DISCORD_STATE_DIR` env var.)
+
+---
+
 ## Anti-Patterns — Things We Don't Do
 
 | Don't | Do Instead |
