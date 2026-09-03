@@ -54,6 +54,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { COMPOSER_BORDER } from "./tui-pane.js";
 
 // ── Thresholds ──
 
@@ -300,18 +301,6 @@ export function send_keys(tmux_session: string, ...keys: string[]): void {
     /* best-effort — see doc comment above */
   }
 }
-
-/**
- * A full-width horizontal rule at column 0 — one of the two lines Claude Code
- * draws around the composer. Anchored and unindented on purpose: the only
- * other `─` runs a pane ever shows are markdown table borders, which are
- * indented and start with `┌`/`├`/`└`.
- *
- * The 10-character floor is a safety margin, not a measurement — real borders
- * span the terminal width (193-200 chars in the captures this was verified
- * against) and would still be matched in a very narrow terminal.
- */
-const COMPOSER_BORDER = /^─{10,}/;
 
 /**
  * Find the line bearing the `❯` selection cursor in the overlay panel that

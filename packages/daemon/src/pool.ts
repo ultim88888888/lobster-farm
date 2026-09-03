@@ -30,6 +30,7 @@ import { scan_and_recover } from "./rate-limit-recovery.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
+import { is_pane_idle } from "./tui-pane.js";
 
 // ── Types ──
 
@@ -94,12 +95,14 @@ export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_c
 
 /**
  * Check whether a tmux session is idle (showing a prompt, not actively processing).
- * Reads the last line of the tmux pane and looks for prompt or permission dialog indicators.
  *
- * Checks three things (in order):
- * 1. "esc to interrupt" → actively generating → NOT idle
- * 2. "local agent" → background subagent running → NOT idle
- * 3. "❯" or "bypass permissions" → at prompt with no active work → idle
+ * Delegates the actual reading to `is_pane_idle`, which anchors on the composer
+ * border rather than indexing a fixed row. This used to read only the pane's
+ * last line, which stopped working the moment Claude Code began wrapping its
+ * right-aligned `/rc` hint onto a row of its own: the last line became
+ * `'                    /rc'`, matching no indicator, so every long-idle bot
+ * reported "working" and the pool became permanently un-evictable once
+ * saturated. See issue #377.
  *
  * Fails open (returns true) when the pane can't be read — safe default for eviction
  * and typing-loop termination.
@@ -110,20 +113,7 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
       encoding: "utf-8",
       timeout: 2000,
     });
-    const lines = output.trim().split("\n");
-    const last_line = lines[lines.length - 1] ?? "";
-
-    // Claude Code's status bar shows "esc to interrupt" only during active generation.
-    if (last_line.includes("esc to interrupt")) return false;
-
-    // Background subagents: status bar shows "N local agent(s)" when subagents are running.
-    // The parent is at the prompt but work is still happening — NOT idle.
-    if (last_line.includes("local agent")) return false;
-
-    // If no active indicators, check for idle indicators:
-    // - "❯" prompt visible (waiting for input)
-    // - "bypass permissions" in status bar without active-work indicators (idle at prompt)
-    return last_line.includes("❯") || last_line.includes("bypass permissions");
+    return is_pane_idle(output);
   } catch {
     return true; // Can't check — assume idle (fail-open)
   }
