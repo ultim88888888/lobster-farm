@@ -28,6 +28,7 @@ import {
 } from "../parked-approvals.js";
 import type { PRReviewState, ProcessedPR } from "../persistence.js";
 import type { AutoMergeResult, CICheckStatus } from "../review-utils.js";
+import { describe_ci_source } from "../review-utils.js";
 
 // ── Harness ──
 
@@ -86,7 +87,8 @@ function harness(options: {
     },
     resolve_token: async (installation_id) => `token-for-${installation_id ?? "default"}`,
     fetch_pr_snapshot: async () => options.pr ?? snapshot(),
-    check_ci_status: async () => options.ci ?? { passed: true, pending: false, failures: [] },
+    check_ci_status: async () =>
+      options.ci ?? { passed: true, pending: false, failures: [], source: "pr-checks" },
     attempt_merge: async (pr_number, branch, repo_path, gh_token) => {
       merges.push({ pr_number, branch, repo_path, gh_token });
       return options.merge_result ?? { merged: true, method: "direct" };
@@ -109,7 +111,7 @@ describe("sweep_parked_approvals — the PR #371 scenario (#372)", () => {
   });
 
   it("merges a v1 approval that was parked before check_suite could release it", async () => {
-    const h = harness({ ci: { passed: true, pending: false, failures: [] } });
+    const h = harness({ ci: { passed: true, pending: false, failures: [], source: "pr-checks" } });
 
     const outcomes = await sweep_parked_approvals(h.deps);
 
@@ -149,13 +151,13 @@ describe("sweep_parked_approvals — the PR #371 scenario (#372)", () => {
   it("survives a daemon restart — the park is read back from persisted state", async () => {
     // A "restart" is just a fresh sweep over the same on-disk state: nothing
     // about the park lives in a timer or in memory.
-    const h = harness({ ci: { passed: false, pending: true, failures: [] } });
+    const h = harness({ ci: { passed: false, pending: true, failures: [], source: "pr-checks" } });
     await sweep_parked_approvals(h.deps);
     expect(h.state["lobster-farm:371"]!.v1_approved_sha).toBe(APPROVED_SHA);
 
     const restarted = harness({
       entries: h.state,
-      ci: { passed: true, pending: false, failures: [] },
+      ci: { passed: true, pending: false, failures: [], source: "pr-checks" },
     });
     const outcomes = await sweep_parked_approvals(restarted.deps);
 
@@ -168,7 +170,7 @@ describe("sweep_parked_approvals — the PR #371 scenario (#372)", () => {
 
 describe("sweep_parked_approvals — never merges past CI", () => {
   it("does not merge while checks are pending", async () => {
-    const h = harness({ ci: { passed: false, pending: true, failures: [] } });
+    const h = harness({ ci: { passed: false, pending: true, failures: [], source: "pr-checks" } });
 
     const outcomes = await sweep_parked_approvals(h.deps);
 
@@ -178,7 +180,9 @@ describe("sweep_parked_approvals — never merges past CI", () => {
   });
 
   it("does not merge when checks failed — it alerts and drops the park", async () => {
-    const h = harness({ ci: { passed: false, pending: false, failures: ["Lint", "Test"] } });
+    const h = harness({
+      ci: { passed: false, pending: false, failures: ["Lint", "Test"], source: "pr-checks" },
+    });
 
     const outcomes = await sweep_parked_approvals(h.deps);
 
@@ -190,6 +194,32 @@ describe("sweep_parked_approvals — never merges past CI", () => {
     expect(h.alerts[0]!.tier).toBe("action_required");
     expect(h.alerts[0]!.body).toContain("Lint, Test");
     expect(h.state["lobster-farm:371"]!.v1_approved_sha).toBeUndefined();
+  });
+
+  it("names the CI source in the failure alert, so a human can judge the reading", async () => {
+    const h = harness({
+      ci: { passed: false, pending: false, failures: ["Lint"], source: "status-rollup" },
+    });
+
+    await sweep_parked_approvals(h.deps);
+
+    expect(h.alerts[0]!.body).toContain(describe_ci_source("status-rollup"));
+  });
+
+  it("names the CI source in the stale-park alert too", async () => {
+    // The coarse source is exactly where this matters: `merge-state` knows the
+    // PR is not mergeable but cannot say which check is holding it, so the
+    // alert has to admit that rather than read as "CI is just slow".
+    const h = harness({
+      ci: { passed: false, pending: true, failures: [], source: "merge-state" },
+      now: Date.parse("2026-08-21T19:39:19.886Z") + PARK_STALE_AFTER_MS + 1,
+    });
+
+    await sweep_parked_approvals(h.deps);
+
+    expect(h.alerts).toHaveLength(1);
+    expect(h.alerts[0]!.body).toContain(describe_ci_source("merge-state"));
+    expect(h.alerts[0]!.body).toContain("no individual check can be named");
   });
 
   it("does not merge a PR whose head moved after the approval", async () => {
@@ -228,7 +258,7 @@ describe("sweep_parked_approvals — escalates rather than expiring quietly", ()
 
   it("escalates a park that has waited past the staleness threshold", async () => {
     const h = harness({
-      ci: { passed: false, pending: true, failures: [] },
+      ci: { passed: false, pending: true, failures: [], source: "pr-checks" },
       now: stale_now,
     });
 
@@ -244,7 +274,7 @@ describe("sweep_parked_approvals — escalates rather than expiring quietly", ()
 
   it("escalates once per parked commit, not once per tick", async () => {
     const h = harness({
-      ci: { passed: false, pending: true, failures: [] },
+      ci: { passed: false, pending: true, failures: [], source: "pr-checks" },
       now: stale_now,
     });
 
@@ -256,12 +286,15 @@ describe("sweep_parked_approvals — escalates rather than expiring quietly", ()
   });
 
   it("still merges a stale park once its CI finally reports green", async () => {
-    const h = harness({ ci: { passed: false, pending: true, failures: [] }, now: stale_now });
+    const h = harness({
+      ci: { passed: false, pending: true, failures: [], source: "pr-checks" },
+      now: stale_now,
+    });
     await sweep_parked_approvals(h.deps);
 
     const later = harness({
       entries: h.state,
-      ci: { passed: true, pending: false, failures: [] },
+      ci: { passed: true, pending: false, failures: [], source: "pr-checks" },
       now: stale_now + 60_000,
     });
     const outcomes = await sweep_parked_approvals(later.deps);
@@ -299,7 +332,7 @@ describe("sweep_parked_approvals — escalates rather than expiring quietly", ()
   it("stamps a missing park timestamp instead of escalating on the first sight", async () => {
     const h = harness({
       entries: { "lobster-farm:371": parked_entry({ v1_parked_at: undefined }) },
-      ci: { passed: false, pending: true, failures: [] },
+      ci: { passed: false, pending: true, failures: [], source: "pr-checks" },
     });
 
     const outcomes = await sweep_parked_approvals(h.deps);

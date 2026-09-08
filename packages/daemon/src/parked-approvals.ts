@@ -49,7 +49,7 @@ import type { GitHubAppAuth } from "./github-app.js";
 import type { PRReviewState, ProcessedPR } from "./persistence.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { AutoMergeResult, CICheckStatus } from "./review-utils.js";
-import { attempt_auto_merge, check_ci_status } from "./review-utils.js";
+import { attempt_auto_merge, check_ci_status, describe_ci_source } from "./review-utils.js";
 import * as sentry from "./sentry.js";
 
 const exec_async = promisify(execFile);
@@ -233,7 +233,7 @@ async function resolve_one(
       key,
       entry,
       deps,
-      `PR #${String(pr_number)}: "${snapshot.title}" was approved, but CI failed on ${approved_sha.slice(0, 8)} (${ci.failures.join(", ")}). Not merging — the branch needs a new commit.`,
+      `PR #${String(pr_number)}: "${snapshot.title}" was approved, but CI failed on ${approved_sha.slice(0, 8)} (${ci.failures.join(", ")}). Not merging — the branch needs a new commit. [${describe_ci_source(ci.source)}]`,
     );
     await clear_park(key, entry, deps);
     return { kind: "escalated", entity_id, pr_number, reason: "ci_failed" };
@@ -253,7 +253,7 @@ async function resolve_one(
         key,
         entry,
         deps,
-        `PR #${String(pr_number)}: "${snapshot.title}" has been approved and waiting on CI for ${String(Math.round(waited_ms / 60_000))} minutes. Checks on ${approved_sha.slice(0, 8)} still report pending. The merge is still parked and still being retried, but CI may never report — worth a look.`,
+        `PR #${String(pr_number)}: "${snapshot.title}" has been approved and waiting on CI for ${String(Math.round(waited_ms / 60_000))} minutes. Checks on ${approved_sha.slice(0, 8)} still report pending. The merge is still parked and still being retried, but CI may never report — worth a look. [${describe_ci_source(ci.source)}]`,
       );
       return { kind: "escalated", entity_id, pr_number, reason: "stale" };
     }

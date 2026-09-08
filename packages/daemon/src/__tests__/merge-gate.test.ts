@@ -40,7 +40,12 @@ function make_deps(fixtures: DepFixtures = {}): MergeGateDeps {
     merge_state_status: "CLEAN",
     head_sha: APPROVED_SHA,
   };
-  const ci: CICheckStatus = fixtures.ci ?? { passed: true, pending: false, failures: [] };
+  const ci: CICheckStatus = fixtures.ci ?? {
+    passed: true,
+    pending: false,
+    failures: [],
+    source: "pr-checks",
+  };
   const rebase: LocalRebaseResult = fixtures.rebase ?? { success: true };
 
   return {
@@ -99,7 +104,7 @@ describe("run_merge_gate", () => {
 
   it("CI regressed since review (was green, now failing) → ci_regressed, no merge", async () => {
     const deps = make_deps({
-      ci: { passed: false, pending: false, failures: ["typecheck", "lint"] },
+      ci: { passed: false, pending: false, failures: ["typecheck", "lint"], source: "pr-checks" },
     });
     const result = await run_merge_gate(make_input(), deps);
 
@@ -109,7 +114,7 @@ describe("run_merge_gate", () => {
 
   it("CI pending after approval (new check started) → ci_pending, wait", async () => {
     const deps = make_deps({
-      ci: { passed: false, pending: true, failures: [] },
+      ci: { passed: false, pending: true, failures: [], source: "pr-checks" },
     });
     const result = await run_merge_gate(make_input(), deps);
 
