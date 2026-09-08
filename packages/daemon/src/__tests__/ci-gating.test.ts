@@ -100,7 +100,7 @@ import type { GitHubAppAuth } from "../github-app.js";
 import { save_pr_reviews } from "../persistence.js";
 import type { EntityRegistry } from "../registry.js";
 // Import after mocks are registered
-import { check_ci_status } from "../review-utils.js";
+import { _reset_ci_status_notices_for_testing, check_ci_status } from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
 import {
   type WebhookContext,
@@ -611,6 +611,189 @@ describe("check_ci_status — only requests JSON fields gh supports (#372)", () 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
     expect(result).toEqual({ passed: false, pending: true, failures: [] });
+  });
+});
+
+// ── Falling back when the token cannot read `bucket` ──
+
+/**
+ * `bucket` is not a plain column: gh resolves it through
+ * `checkSuite.workflowRun`, which a GitHub App token may only read with the
+ * `Actions: Read` permission. Our installation token does not hold it, so the
+ * whole query 403s — taking `name` and `state` down with it — and every
+ * approved PR parked forever on a green CI.
+ *
+ * gh emits the denial as a single line with the clause repeated once per check
+ * in the rollup, which is why the diagnostic must not echo it verbatim.
+ */
+function bucket_denied(args: string[]): Error {
+  const clause =
+    "Resource not accessible by integration (node.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0.checkSuite.workflowRun)";
+  return new Error(
+    `Command failed: gh ${args.join(" ")}\nGraphQL: ${Array.from({ length: 10 }, () => clause).join(", ")}`,
+  );
+}
+
+/**
+ * Stand-in for gh under a token without `Actions: Read`: every query asking for
+ * `bucket` fails with the GraphQL denial; the rest is delegated to `fallback`.
+ */
+function route_gh_denying_bucket(fallback: ExecRoute): { calls: string[][] } {
+  const calls: string[][] = [];
+  route_exec({
+    "gh pr checks": (args, opts) => {
+      calls.push(args);
+      const json_index = args.indexOf("--json");
+      const requested = json_index === -1 ? [] : (args[json_index + 1] ?? "").split(",");
+      if (requested.includes("bucket")) return bucket_denied(args);
+      return fallback(args, opts);
+    },
+  });
+  return { calls };
+}
+
+/** Replays checks as gh would with `--json name,state` — no `bucket` key at all. */
+function bucketless(checks: Array<{ name: string; state: string }>): ExecRoute {
+  return () => ({ stdout: JSON.stringify(checks) });
+}
+
+describe("check_ci_status — falls back to name,state when gh denies `bucket`", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const key of Object.keys(routes)) delete routes[key];
+    _reset_ci_status_notices_for_testing();
+  });
+
+  it("reads a green PR as passing instead of parking it forever", async () => {
+    const { calls } = route_gh_denying_bucket(
+      bucketless([
+        { name: "Lint / Type-check / Test", state: "SUCCESS" },
+        { name: "Build", state: "SUCCESS" },
+      ]),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    // Same query, retried with the denied field dropped.
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual(["pr", "checks", "42", "--required", "--json", "name,state,bucket"]);
+    expect(calls[1]).toEqual(["pr", "checks", "42", "--required", "--json", "name,state"]);
+  });
+
+  it("still reports failures found by the fallback query", async () => {
+    route_gh_denying_bucket(
+      bucketless([
+        { name: "Lint", state: "FAILURE" },
+        { name: "Test", state: "SUCCESS" },
+      ]),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: false, failures: ["Lint"] });
+  });
+
+  it("keeps running checks pending without a bucket to lean on", async () => {
+    route_gh_denying_bucket(
+      bucketless([
+        { name: "Lint", state: "SUCCESS" },
+        { name: "Test", state: "IN_PROGRESS" },
+      ]),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+  });
+
+  it.each(["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"])(
+    "reads %s as pending, not as a failure, with no bucket present",
+    async (state) => {
+      route_gh_denying_bucket(bucketless([{ name: "deploy", state }]));
+
+      const result = await check_ci_status(42, "/tmp/test-repo");
+
+      expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    },
+  );
+
+  it("keeps NEUTRAL and SKIPPED passing with no bucket present", async () => {
+    route_gh_denying_bucket(
+      bucketless([
+        { name: "backend", state: "NEUTRAL" },
+        { name: "frontend", state: "SKIPPED" },
+        { name: "gate", state: "SUCCESS" },
+      ]),
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+  });
+
+  it("fails closed when the fallback query fails too", async () => {
+    const { calls } = route_gh_denying_bucket(() => new Error("network timeout"));
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    // Failed closed on `--required`, so no unfiltered query was attempted.
+    expect(calls).toHaveLength(2);
+  });
+
+  it("honours 'no checks reported' from the fallback query", async () => {
+    const { calls } = route_gh_denying_bucket(() => NO_CHECKS_AT_ALL);
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    // Nothing required and nothing at all — the repo genuinely has no CI.
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls.map((c) => c.includes("--required"))).toEqual([true, true, false, false]);
+  });
+
+  it("falls back on the unfiltered query too", async () => {
+    const { calls } = route_gh_denying_bucket((args) =>
+      args.includes("--required")
+        ? NO_REQUIRED_CHECKS
+        : { stdout: JSON.stringify([{ name: "Test", state: "SUCCESS" }]) },
+    );
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(calls).toHaveLength(4);
+  });
+
+  it("says once, in one line, that it dropped the field — no repeated GraphQL clauses", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    route_gh_denying_bucket(bucketless([{ name: "Test", state: "SUCCESS" }]));
+
+    await check_ci_status(42, "/tmp/test-repo");
+    await check_ci_status(43, "/tmp/test-repo");
+
+    // Silence is how #372 hid for weeks — the degradation must be stated...
+    expect(errors).toHaveBeenCalledTimes(1);
+    const [line] = errors.mock.calls[0] as [string];
+    expect(line).toContain("[ci-status]");
+    expect(line).toContain("bucket");
+    // ...but the repeated GraphQL clause is what floods the log.
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line.match(/Resource not accessible by integration/g) ?? []).toHaveLength(1);
+
+    errors.mockRestore();
+  });
+
+  it("reports an unrelated failure verbatim rather than blaming the bucket", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    route_exec({ "gh pr checks": () => new Error("network timeout") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(errors.mock.calls.flat().join(" ")).toContain("network timeout");
+
+    errors.mockRestore();
   });
 });
 
