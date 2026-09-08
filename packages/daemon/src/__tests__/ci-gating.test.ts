@@ -11,7 +11,7 @@
 import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Command routing for check_ci_status tests ──
 
@@ -100,7 +100,11 @@ import type { GitHubAppAuth } from "../github-app.js";
 import { save_pr_reviews } from "../persistence.js";
 import type { EntityRegistry } from "../registry.js";
 // Import after mocks are registered
-import { _reset_ci_status_notices_for_testing, check_ci_status } from "../review-utils.js";
+import {
+  _reset_ci_status_notices_for_testing,
+  check_ci_status,
+  describe_ci_source,
+} from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
 import {
   type WebhookContext,
@@ -318,7 +322,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(2);
     expect(calls[1]).not.toContain("--required");
     expect(calls[1]).toEqual(["pr", "checks", "42", "--json", "name,state,bucket"]);
@@ -334,7 +338,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(2);
   });
 
@@ -353,7 +357,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(2);
   });
 
@@ -392,7 +396,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(2);
   });
 
@@ -404,7 +408,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(2);
   });
 
@@ -416,7 +420,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(2);
   });
 
@@ -428,7 +432,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "unavailable" });
   });
 
   it("fails closed without falling back when the --required query hits an infrastructure error", async () => {
@@ -441,7 +445,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "unavailable" });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toContain("--required");
   });
@@ -470,7 +474,7 @@ describe("check_ci_status — falls back to unfiltered checks (#361)", () => {
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "unavailable" });
   });
 
   it("passes GH_TOKEN to the fallback query too", async () => {
@@ -565,7 +569,7 @@ describe("check_ci_status — only requests JSON fields gh supports (#372)", () 
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls[0]).not.toContain("name,state,conclusion");
   });
 
@@ -577,7 +581,7 @@ describe("check_ci_status — only requests JSON fields gh supports (#372)", () 
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "pr-checks" });
   });
 
   it("still reports failures", async () => {
@@ -588,7 +592,12 @@ describe("check_ci_status — only requests JSON fields gh supports (#372)", () 
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: false, failures: ["Lint"] });
+    expect(result).toEqual({
+      passed: false,
+      pending: false,
+      failures: ["Lint"],
+      source: "pr-checks",
+    });
   });
 
   it("keeps NEUTRAL and SKIPPED passing — change detection skips real jobs", async () => {
@@ -600,7 +609,7 @@ describe("check_ci_status — only requests JSON fields gh supports (#372)", () 
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
   });
 
   it("treats a gh 'pending' bucket as pending even for a state we don't enumerate", async () => {
@@ -610,7 +619,7 @@ describe("check_ci_status — only requests JSON fields gh supports (#372)", () 
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "pr-checks" });
   });
 });
 
@@ -674,7 +683,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     // Same query, retried with the denied field dropped.
     expect(calls).toHaveLength(2);
     expect(calls[0]).toEqual(["pr", "checks", "42", "--required", "--json", "name,state,bucket"]);
@@ -691,7 +700,12 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: false, failures: ["Lint"] });
+    expect(result).toEqual({
+      passed: false,
+      pending: false,
+      failures: ["Lint"],
+      source: "pr-checks",
+    });
   });
 
   it("keeps running checks pending without a bucket to lean on", async () => {
@@ -704,7 +718,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "pr-checks" });
   });
 
   it.each(["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"])(
@@ -714,7 +728,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
       const result = await check_ci_status(42, "/tmp/test-repo");
 
-      expect(result).toEqual({ passed: false, pending: true, failures: [] });
+      expect(result).toEqual({ passed: false, pending: true, failures: [], source: "pr-checks" });
     },
   );
 
@@ -729,7 +743,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
   });
 
   it("fails closed when the fallback query fails too", async () => {
@@ -737,7 +751,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "unavailable" });
     // Failed closed on `--required`, so no unfiltered query was attempted.
     expect(calls).toHaveLength(2);
   });
@@ -748,7 +762,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
     const result = await check_ci_status(42, "/tmp/test-repo");
 
     // Nothing required and nothing at all — the repo genuinely has no CI.
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls.map((c) => c.includes("--required"))).toEqual([true, true, false, false]);
   });
 
@@ -761,7 +775,7 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: true, pending: false, failures: [] });
+    expect(result).toEqual({ passed: true, pending: false, failures: [], source: "pr-checks" });
     expect(calls).toHaveLength(4);
   });
 
@@ -790,10 +804,546 @@ describe("check_ci_status — falls back to name,state when gh denies `bucket`",
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result).toEqual({ passed: false, pending: true, failures: [] });
+    expect(result).toEqual({ passed: false, pending: true, failures: [], source: "unavailable" });
     expect(errors.mock.calls.flat().join(" ")).toContain("network timeout");
 
     errors.mockRestore();
+  });
+});
+// ── Reading CI when `gh pr checks` is denied outright ──
+
+/**
+ * `gh pr checks` resolves `checkSuite.workflowRun` on every query, whatever
+ * `--json` asks for, so an installation without `Actions: Read` gets nothing
+ * from it — dropping `bucket` is not enough. The permission is not always
+ * obtainable (we do not own every org whose repos we review), so the gate has
+ * to read the same facts from queries GitHub will actually answer.
+ */
+type ChainRoutes = {
+  pr_checks?: ExecRoute;
+  rollup?: ExecRoute;
+  merge_state?: ExecRoute;
+};
+
+/**
+ * Route the whole three-source chain. Anything left unspecified is refused with
+ * the same GraphQL denial GitHub sends an under-permissioned installation.
+ */
+function route_ci_chain(opts: ChainRoutes): { calls: string[][] } {
+  const calls: string[][] = [];
+  const denied: ExecRoute = (args) => bucket_denied(args);
+  const json_fields = (args: string[]): string => {
+    const i = args.indexOf("--json");
+    return i === -1 ? "" : (args[i + 1] ?? "");
+  };
+
+  route_exec({
+    "gh pr checks": (args, o) => {
+      calls.push(args);
+      return (opts.pr_checks ?? denied)(args, o);
+    },
+    "gh pr view": (args, o) => {
+      calls.push(args);
+      const route =
+        json_fields(args) === "statusCheckRollup"
+          ? (opts.rollup ?? denied)
+          : (opts.merge_state ?? denied);
+      return route(args, o);
+    },
+  });
+
+  return { calls };
+}
+
+/** Replays `gh pr view --json statusCheckRollup`. */
+function rollup(entries: Array<Record<string, unknown>>): ExecRoute {
+  return () => ({ stdout: JSON.stringify({ statusCheckRollup: entries }) });
+}
+
+/** Replays `gh pr view --json mergeStateStatus,mergeable`. */
+function merge_state(mergeStateStatus: string, mergeable = "MERGEABLE"): ExecRoute {
+  return () => ({ stdout: JSON.stringify({ mergeStateStatus, mergeable }) });
+}
+
+/** The `gh pr view` queries the chain made, by their `--json` field list. */
+function view_queries(calls: string[][]): string[] {
+  return calls
+    .filter((args) => args[1] === "view")
+    .map((args) => args[args.indexOf("--json") + 1] ?? "");
+}
+
+/** Console spies shared by the chain suites — see each `beforeEach`. */
+let errors: ReturnType<typeof vi.spyOn>;
+let logs: ReturnType<typeof vi.spyOn>;
+
+describe("check_ci_status — falls back to statusCheckRollup when gh pr checks is denied", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const key of Object.keys(routes)) delete routes[key];
+    _reset_ci_status_notices_for_testing();
+    // The chain is loud on purpose. Capture it so the suite output stays
+    // readable and the notices stay assertable.
+    errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    logs = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errors.mockRestore();
+    logs.mockRestore();
+  });
+
+  it("reads a green PR from the rollup instead of parking it forever", async () => {
+    const { calls } = route_ci_chain({
+      rollup: rollup([
+        { __typename: "CheckRun", name: "Lint", status: "COMPLETED", conclusion: "SUCCESS" },
+        { __typename: "CheckRun", name: "Test", status: "COMPLETED", conclusion: "SUCCESS" },
+      ]),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: true,
+      pending: false,
+      failures: [],
+      source: "status-rollup",
+    });
+    // Both `gh pr checks` shapes were refused, so it moved on rather than
+    // wasting a query on the unfiltered list that would be refused too.
+    expect(calls[0]).toEqual(["pr", "checks", "42", "--required", "--json", "name,state,bucket"]);
+    expect(calls[1]).toEqual(["pr", "checks", "42", "--required", "--json", "name,state"]);
+    expect(view_queries(calls)).toEqual(["statusCheckRollup"]);
+  });
+
+  it("names the failing checks the rollup reports", async () => {
+    route_ci_chain({
+      rollup: rollup([
+        { __typename: "CheckRun", name: "Lint", status: "COMPLETED", conclusion: "FAILURE" },
+        { __typename: "CheckRun", name: "Test", status: "COMPLETED", conclusion: "SUCCESS" },
+        { __typename: "CheckRun", name: "Build", status: "COMPLETED", conclusion: "TIMED_OUT" },
+      ]),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: false,
+      failures: ["Lint", "Build"],
+      source: "status-rollup",
+    });
+  });
+
+  it("keeps a running rollup check pending rather than calling it a failure", async () => {
+    route_ci_chain({
+      rollup: rollup([
+        { __typename: "CheckRun", name: "Lint", status: "COMPLETED", conclusion: "SUCCESS" },
+        { __typename: "CheckRun", name: "Test", status: "IN_PROGRESS", conclusion: null },
+      ]),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "status-rollup",
+    });
+  });
+
+  it.each(["QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"])(
+    "reads a rollup CheckRun in %s as pending, not as a failure",
+    async (status) => {
+      route_ci_chain({
+        rollup: rollup([{ __typename: "CheckRun", name: "deploy", status, conclusion: null }]),
+      });
+
+      const result = await check_ci_status(42, "/tmp/test-repo");
+
+      expect(result).toEqual({
+        passed: false,
+        pending: true,
+        failures: [],
+        source: "status-rollup",
+      });
+    },
+  );
+
+  it("keeps NEUTRAL and SKIPPED rollup conclusions passing — change detection skips real jobs", async () => {
+    route_ci_chain({
+      rollup: rollup([
+        { __typename: "CheckRun", name: "backend", status: "COMPLETED", conclusion: "NEUTRAL" },
+        { __typename: "CheckRun", name: "frontend", status: "COMPLETED", conclusion: "SKIPPED" },
+        { __typename: "CheckRun", name: "gate", status: "COMPLETED", conclusion: "SUCCESS" },
+      ]),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(true);
+    expect(result.failures).toEqual([]);
+  });
+
+  it("classifies CheckRun and StatusContext entries side by side", async () => {
+    // StatusContext is the older commit-status API — Vercel, Netlify, bots. It
+    // has no `status`/`conclusion` pair: one `state` field is both at once, and
+    // the name lives in `context`.
+    route_ci_chain({
+      rollup: rollup([
+        { __typename: "CheckRun", name: "Lint", status: "COMPLETED", conclusion: "SUCCESS" },
+        { __typename: "CheckRun", name: "Test", status: "COMPLETED", conclusion: "FAILURE" },
+        { __typename: "StatusContext", context: "vercel", state: "SUCCESS" },
+        { __typename: "StatusContext", context: "netlify/deploy", state: "FAILURE" },
+        { __typename: "StatusContext", context: "codecov", state: "ERROR" },
+      ]),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: false,
+      failures: ["Test", "netlify/deploy", "codecov"],
+      source: "status-rollup",
+    });
+  });
+
+  it.each(["PENDING", "EXPECTED"])(
+    "reads a StatusContext in %s as pending, not as a failure",
+    async (state) => {
+      route_ci_chain({
+        rollup: rollup([
+          { __typename: "CheckRun", name: "Lint", status: "COMPLETED", conclusion: "SUCCESS" },
+          { __typename: "StatusContext", context: "vercel", state },
+        ]),
+      });
+
+      const result = await check_ci_status(42, "/tmp/test-repo");
+
+      expect(result).toEqual({
+        passed: false,
+        pending: true,
+        failures: [],
+        source: "status-rollup",
+      });
+    },
+  );
+
+  it("treats an empty rollup as a repo with no CI, matching gh pr checks", async () => {
+    route_ci_chain({ rollup: rollup([]) });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: true,
+      pending: false,
+      failures: [],
+      source: "status-rollup",
+    });
+  });
+
+  it("treats a null rollup as a repo with no CI", async () => {
+    route_ci_chain({ rollup: () => ({ stdout: JSON.stringify({ statusCheckRollup: null }) }) });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(true);
+    expect(result.source).toBe("status-rollup");
+  });
+
+  it("fails a COMPLETED check with no conclusion rather than waving it through", async () => {
+    route_ci_chain({
+      rollup: rollup([{ __typename: "CheckRun", name: "mystery", status: "COMPLETED" }]),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(false);
+    expect(result.failures).toEqual(["mystery"]);
+  });
+
+  it("passes GH_TOKEN to the rollup query too", async () => {
+    let seen: Record<string, unknown> | undefined;
+    route_ci_chain({
+      rollup: (_args, opts) => {
+        seen = opts.env as Record<string, unknown>;
+        return { stdout: JSON.stringify({ statusCheckRollup: [] }) };
+      },
+    });
+
+    await check_ci_status(42, "/tmp/test-repo", "ghs_tok");
+
+    expect(seen?.GH_TOKEN).toBe("ghs_tok");
+  });
+
+  it("says once, in one line, that it degraded to the rollup", async () => {
+    route_ci_chain({
+      rollup: rollup([{ __typename: "CheckRun", name: "Lint", conclusion: "SUCCESS" }]),
+    });
+
+    await check_ci_status(42, "/tmp/test-repo");
+    await check_ci_status(43, "/tmp/test-repo");
+
+    // Anchored on the notice's own wording, not the bare field name: the
+    // `bucket` denial echoes a GraphQL path that mentions statusCheckRollup too.
+    const lines = errors.mock.calls.map((c) => String(c[0]));
+    const degraded = lines.filter((l) => l.includes("reading CI from `gh pr view"));
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toContain("[ci-status]");
+    expect(degraded[0]).toContain("Actions: Read");
+  });
+});
+
+describe("check_ci_status — falls back to mergeStateStatus when the rollup is denied too", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const key of Object.keys(routes)) delete routes[key];
+    _reset_ci_status_notices_for_testing();
+    // The chain is loud on purpose. Capture it so the suite output stays
+    // readable and the notices stay assertable.
+    errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    logs = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errors.mockRestore();
+    logs.mockRestore();
+  });
+
+  it("passes a CLEAN PR — GitHub's own verdict already covers required checks", async () => {
+    const { calls } = route_ci_chain({ merge_state: merge_state("CLEAN") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: true,
+      pending: false,
+      failures: [],
+      source: "merge-state",
+    });
+    expect(view_queries(calls)).toEqual(["statusCheckRollup", "mergeStateStatus,mergeable"]);
+  });
+
+  it("does not pass a BLOCKED PR", async () => {
+    route_ci_chain({ merge_state: merge_state("BLOCKED") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(false);
+    expect(result.source).toBe("merge-state");
+  });
+
+  it("reports UNKNOWN as pending — GitHub is still computing, not failing", async () => {
+    route_ci_chain({ merge_state: merge_state("UNKNOWN", "UNKNOWN") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "merge-state",
+    });
+    expect(result.failures).toEqual([]);
+  });
+
+  it("reports pending when mergeable is UNKNOWN even though the state reads CLEAN", async () => {
+    route_ci_chain({ merge_state: merge_state("CLEAN", "UNKNOWN") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(false);
+    expect(result.pending).toBe(true);
+  });
+
+  it.each(["BLOCKED", "UNSTABLE", "BEHIND", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN"])(
+    "never lets %s read as mergeable: not passed, and pending so no caller sees green",
+    async (state) => {
+      route_ci_chain({ merge_state: merge_state(state) });
+
+      const result = await check_ci_status(42, "/tmp/test-repo");
+
+      expect(result.passed).toBe(false);
+      // Every caller derives "safe to merge" from `!pending && !failures.length`.
+      // This source cannot name a check, so `pending` is what holds the gate.
+      expect(result.pending || result.failures.length > 0).toBe(true);
+    },
+  );
+
+  it("says once, in one line, that it degraded to mergeStateStatus", async () => {
+    route_ci_chain({ merge_state: merge_state("CLEAN") });
+
+    await check_ci_status(42, "/tmp/test-repo");
+    await check_ci_status(43, "/tmp/test-repo");
+
+    const degraded = errors.mock.calls
+      .map((c) => String(c[0]))
+      .filter((l) => l.includes("falling back to GitHub's own"));
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toContain("[ci-status]");
+  });
+
+  it("passes GH_TOKEN to the mergeStateStatus query too", async () => {
+    let seen: Record<string, unknown> | undefined;
+    route_ci_chain({
+      merge_state: (_args, opts) => {
+        seen = opts.env as Record<string, unknown>;
+        return { stdout: JSON.stringify({ mergeStateStatus: "CLEAN", mergeable: "MERGEABLE" }) };
+      },
+    });
+
+    await check_ci_status(42, "/tmp/test-repo", "ghs_tok");
+
+    expect(seen?.GH_TOKEN).toBe("ghs_tok");
+  });
+});
+
+describe("check_ci_status — the chain still fails closed", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const key of Object.keys(routes)) delete routes[key];
+    _reset_ci_status_notices_for_testing();
+    // The chain is loud on purpose. Capture it so the suite output stays
+    // readable and the notices stay assertable.
+    errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    logs = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errors.mockRestore();
+    logs.mockRestore();
+  });
+
+  it("reports pending when all three sources are refused", async () => {
+    const { calls } = route_ci_chain({});
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "unavailable",
+    });
+    expect(view_queries(calls)).toEqual(["statusCheckRollup", "mergeStateStatus,mergeable"]);
+    expect(errors.mock.calls.flat().join(" ")).toContain("Every CI source was refused");
+  });
+
+  it("stops at a network error on gh pr checks — a timeout says nothing about permissions", async () => {
+    const { calls } = route_ci_chain({ pr_checks: () => new Error("network timeout") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "unavailable",
+    });
+    // No fallthrough: retrying a timeout against two more queries would just be
+    // three timeouts, and the rollup could have wrongly reported "no CI".
+    expect(view_queries(calls)).toEqual([]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("stops at a network error on the bucketless retry, without reaching the rollup", async () => {
+    const { calls } = route_ci_chain({
+      pr_checks: (args) =>
+        args.includes("bucket") ? bucket_denied(args) : new Error("dial tcp: i/o timeout"),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.pending).toBe(true);
+    expect(result.source).toBe("unavailable");
+    expect(view_queries(calls)).toEqual([]);
+  });
+
+  it("stops at a network error on the rollup, without reaching mergeStateStatus", async () => {
+    const { calls } = route_ci_chain({ rollup: () => new Error("API rate limit exceeded") });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "unavailable",
+    });
+    expect(view_queries(calls)).toEqual(["statusCheckRollup"]);
+  });
+
+  it("reports pending when the rollup answers with unparseable output", async () => {
+    route_ci_chain({ rollup: () => ({ stdout: "not json" }) });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "unavailable",
+    });
+  });
+
+  it("reports pending when mergeStateStatus answers with unparseable output", async () => {
+    route_ci_chain({ merge_state: () => ({ stdout: "<html>502</html>" }) });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(false);
+    expect(result.pending).toBe(true);
+    expect(result.source).toBe("unavailable");
+  });
+
+  it("never falls through when gh pr checks answers, however it answers", async () => {
+    const { calls } = route_ci_chain({
+      pr_checks: () => ({ stdout: JSON.stringify([{ name: "Lint", state: "FAILURE" }]) }),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result).toEqual({
+      passed: false,
+      pending: false,
+      failures: ["Lint"],
+      source: "pr-checks",
+    });
+    expect(view_queries(calls)).toEqual([]);
+  });
+
+  it("has no path that reports passed without a source that saw the checks", async () => {
+    // The whole point of the gate: "we could not tell" is never green.
+    for (const chain of [
+      {},
+      { pr_checks: () => new Error("network timeout") } as ChainRoutes,
+      { rollup: () => new Error("network timeout") } as ChainRoutes,
+      { merge_state: () => new Error("network timeout") } as ChainRoutes,
+      { merge_state: merge_state("BLOCKED") } as ChainRoutes,
+    ]) {
+      _reset_ci_status_notices_for_testing();
+      route_ci_chain(chain);
+
+      const result = await check_ci_status(42, "/tmp/test-repo");
+
+      expect(result.passed).toBe(false);
+      expect(result.pending).toBe(true);
+    }
+  });
+});
+
+describe("describe_ci_source", () => {
+  it.each(["pr-checks", "status-rollup", "merge-state", "unavailable"] as const)(
+    "describes %s in a line a human can act on",
+    (source) => {
+      const note = describe_ci_source(source);
+      expect(note.length).toBeGreaterThan(0);
+    },
+  );
+
+  it("says plainly that merge-state cannot name a check", () => {
+    expect(describe_ci_source("merge-state")).toContain("no individual check can be named");
   });
 });
 

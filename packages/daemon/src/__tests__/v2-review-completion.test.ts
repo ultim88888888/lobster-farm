@@ -24,7 +24,12 @@ vi.mock("../review-utils.js", () => ({
   build_review_fix_prompt: vi.fn(() => "fix prompt"),
   check_merge_conflicts: vi.fn(async () => false),
   attempt_auto_merge: vi.fn(async () => ({ merged: true, method: "direct" })),
-  check_ci_status: vi.fn(async () => ({ passed: true, pending: false, failures: [] })),
+  check_ci_status: vi.fn(async () => ({
+    passed: true,
+    pending: false,
+    failures: [],
+    source: "pr-checks",
+  })),
   fetch_pr_mergeability: vi.fn(async () => ({
     mergeable: "MERGEABLE",
     merge_state_status: "CLEAN",

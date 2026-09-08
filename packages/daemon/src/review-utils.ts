@@ -849,11 +849,178 @@ function sleep(ms: number): Promise<void> {
 
 // ── CI check gating (#189) ──
 
+/**
+ * Which query produced a CI reading.
+ *
+ * The three real sources are tried in order and answer with decreasing
+ * precision, so the source is part of the answer: a human reading an alert
+ * needs to know whether "not green" means "the `lint` job failed" or "GitHub
+ * says this branch is not mergeable and we cannot see why".
+ *
+ * - `pr-checks`     — `gh pr checks`. Per-check names and states. Best signal,
+ *                     but needs `Actions: Read` on the App installation.
+ * - `status-rollup` — `gh pr view --json statusCheckRollup`. Per-check names
+ *                     and states too, without touching `checkSuite.workflowRun`.
+ * - `merge-state`   — `gh pr view --json mergeStateStatus,mergeable`. GitHub's
+ *                     own verdict. Coarse: green or not, never *which* check.
+ * - `unavailable`   — nothing answered. Always fail-closed pending.
+ */
+export type CIStatusSource = "pr-checks" | "status-rollup" | "merge-state" | "unavailable";
+
+/**
+ * A PR's CI verdict.
+ *
+ * **Invariant: `passed === false` implies `pending === true || failures.length > 0`.**
+ *
+ * Every caller derives "safe to merge" from `!pending && failures.length === 0`
+ * rather than from `passed`, so a status that is not passing must always carry
+ * one of the two — otherwise a PR GitHub refuses to merge reads as green. The
+ * `merge-state` source is where this bites: it knows a PR is blocked but cannot
+ * name a single failing check, so it reports `pending` and lets the parked
+ * approval escalate loudly instead of inventing a failure name or, worse,
+ * merging.
+ */
 export interface CICheckStatus {
   passed: boolean;
   pending: boolean;
   failures: string[];
+  /** Which query answered. See {@link CIStatusSource}. */
+  source: CIStatusSource;
 }
+
+/** Human-readable note on how much a reading from this source can be trusted. */
+export function describe_ci_source(source: CIStatusSource): string {
+  switch (source) {
+    case "pr-checks":
+      return "read from `gh pr checks` (per-check detail)";
+    case "status-rollup":
+      return "read from the PR's statusCheckRollup — `gh pr checks` is denied to this token (per-check detail)";
+    case "merge-state":
+      return "read from GitHub's own mergeStateStatus — per-check detail is unavailable to this token, so no individual check can be named";
+    case "unavailable":
+      return "no CI source answered — reported pending to fail closed";
+  }
+}
+
+/** The fail-closed reading: we could not tell, so nothing merges. */
+function ci_unavailable(): CICheckStatus {
+  return { passed: false, pending: true, failures: [], source: "unavailable" };
+}
+
+/**
+ * One source's attempt at a reading.
+ *
+ * The distinction that matters is `denied` vs `failed`: a permission refusal is
+ * a standing condition that the next source may not share, so it falls through.
+ * A timeout, rate limit or network blip says nothing about permissions and must
+ * fail closed exactly as it always has — retrying it against a different query
+ * would just be three timeouts instead of one.
+ */
+type SourceOutcome =
+  | { kind: "answer"; status: CICheckStatus }
+  | { kind: "denied"; message: string }
+  | { kind: "failed"; message: string };
+
+/**
+ * Does this failure mean GitHub refused the query on permissions?
+ *
+ * Two things trip it. `gh pr checks` resolves through `checkSuite.workflowRun`,
+ * which an installation token may only read with `Actions: Read`; without it
+ * GitHub 403s that node and gh exits non-zero for the *whole* query, taking
+ * `name` and `state` down with it. The same string comes back for any other
+ * node the installation cannot reach. The `workflowRun` path is the tell; the
+ * bare permission string is matched too because gh does not always echo a path.
+ *
+ * A false positive costs one extra query against a different source — which
+ * either answers or fails closed like any other error — so this errs on the
+ * side of trying the next source.
+ */
+function is_permission_denied(msg: string): boolean {
+  return /workflowRun/i.test(msg) || /resource not accessible by integration/i.test(msg);
+}
+
+/**
+ * Collapse a gh failure into a single log-safe line.
+ *
+ * The permission denial arrives as one clause repeated once per check in the
+ * rollup — ten of them per line, every two minutes, per parked PR. Clauses are
+ * dropped when an earlier one already contains them end-to-end, which also
+ * catches the first copy hiding behind gh's `Command failed: …` echo. The
+ * result is capped so a diagnostic stays a diagnostic.
+ */
+function summarize_gh_error(msg: string): string {
+  const kept: string[] = [];
+  for (const clause of msg
+    .split("\n")
+    .slice(0, 3)
+    .join(" | ")
+    .split(", ")
+    .map((c) => c.trim())) {
+    if (kept.some((seen) => seen.endsWith(clause) || clause.endsWith(seen))) continue;
+    kept.push(clause);
+  }
+  const summary = kept.join(", ");
+  return summary.length > 300 ? `${summary.slice(0, 300)}…` : summary;
+}
+
+/**
+ * Diagnostics that have already been stated this process.
+ *
+ * Every condition announced through here is a standing one — a missing App
+ * permission, not an incident — so it is stated once per daemon run rather than
+ * on every poll of every parked PR. Keyed by condition, so degrading from
+ * `gh pr checks` to the rollup and then to mergeStateStatus produces three
+ * distinct lines rather than one that hides the other two.
+ */
+const reported_notices = new Set<string>();
+
+/** Test seam: forget the once-per-process diagnostics. */
+export function _reset_ci_status_notices_for_testing(): void {
+  reported_notices.clear();
+}
+
+/**
+ * Say something once per process.
+ *
+ * Silence is how a permanently-broken CI query hid for weeks twice over (#372,
+ * #382). Degrading to a coarser source is never allowed to be silent.
+ */
+function notice_once(key: string, line: string, stream: "log" | "error" = "error"): void {
+  if (reported_notices.has(key)) return;
+  reported_notices.add(key);
+  if (stream === "log") console.log(line);
+  else console.error(line);
+}
+
+/** Announce which source answered — once per process, per source. */
+function note_source(source: CIStatusSource, pr_number: number): void {
+  const seen_on = `First seen on PR #${String(pr_number)}.`;
+  switch (source) {
+    case "pr-checks":
+      notice_once(
+        "source:pr-checks",
+        `[ci-status] Reading CI from \`gh pr checks\`. ${seen_on}`,
+        "log",
+      );
+      return;
+    case "status-rollup":
+      notice_once(
+        "source:status-rollup",
+        `[ci-status] \`gh pr checks\` is denied to this token (needs Actions: Read on the App installation) — reading CI from \`gh pr view --json statusCheckRollup\` instead for the rest of this process. Per-check names and states are still available. ${seen_on}`,
+      );
+      return;
+    case "merge-state":
+      notice_once(
+        "source:merge-state",
+        `[ci-status] Both \`gh pr checks\` and statusCheckRollup are denied to this token — falling back to GitHub's own \`mergeStateStatus\` for the rest of this process. Only CLEAN reads as green; anything else reports pending, because this source cannot name which check failed. ${seen_on}`,
+      );
+      return;
+    case "unavailable":
+      return;
+  }
+}
+
+// ── Source 1: `gh pr checks` ──
 
 /**
  * One row of `gh pr checks --json name,state,bucket`.
@@ -885,69 +1052,26 @@ const GH_CHECKS_JSON_FIELDS = "name,state,bucket";
 const GH_CHECKS_JSON_FIELDS_NO_BUCKET = "name,state";
 
 /**
- * Outcome of a single `gh pr checks` query.
+ * Outcome of a single `gh pr checks` invocation.
  *
  * `none` means gh answered "nothing matches this query" — either an empty JSON
  * array or the non-zero exit carrying "no [required] checks reported on the
- * 'x' branch". `error` means we never got an answer (auth, rate limit, network).
+ * 'x' branch". `error` keeps the failure text, because what the text says
+ * decides whether another source is worth trying.
  */
-type ChecksQuery = { kind: "checks"; checks: GhCheck[] } | { kind: "none" } | { kind: "error" };
-
-/** One attempt, with the failure text kept so the caller can decide what it means. */
-type ChecksAttempt = Exclude<ChecksQuery, { kind: "error" }> | { kind: "error"; message: string };
+type ChecksAttempt =
+  | { kind: "checks"; checks: GhCheck[] }
+  | { kind: "none" }
+  | { kind: "error"; message: string };
 
 /**
- * Does this failure mean GitHub refused the `bucket` field specifically?
+ * Outcome of the whole `gh pr checks` source, bucket retry included.
  *
- * gh resolves `bucket` via `checkSuite.workflowRun`, which needs `Actions: Read`
- * on the installation token. Without it GitHub 403s that one node and gh exits
- * non-zero for the *whole* query — taking `name` and `state` down with it. The
- * `workflowRun` path in the error is the tell; the bare permission string is
- * matched too because gh does not always echo the path.
- *
- * A false positive costs one extra query — the retry either answers or fails
- * closed like any other error — so this errs on the side of retrying.
+ * A single attempt cannot tell `denied` from `error` on its own — only the
+ * retry without `bucket` proves the refusal was about the query rather than
+ * the field.
  */
-function is_bucket_denied(msg: string): boolean {
-  return /workflowRun/i.test(msg) || /resource not accessible by integration/i.test(msg);
-}
-
-/**
- * Collapse a gh failure into a single log-safe line.
- *
- * The `bucket` denial arrives as one clause repeated once per check in the
- * rollup — ten of them per line, every two minutes, per parked PR. Clauses are
- * dropped when an earlier one already contains them end-to-end, which also
- * catches the first copy hiding behind gh's `Command failed: …` echo. The
- * result is capped so a diagnostic stays a diagnostic.
- */
-function summarize_gh_error(msg: string): string {
-  const kept: string[] = [];
-  for (const clause of msg
-    .split("\n")
-    .slice(0, 3)
-    .join(" | ")
-    .split(", ")
-    .map((c) => c.trim())) {
-    if (kept.some((seen) => seen.endsWith(clause) || clause.endsWith(seen))) continue;
-    kept.push(clause);
-  }
-  const summary = kept.join(", ");
-  return summary.length > 300 ? `${summary.slice(0, 300)}…` : summary;
-}
-
-/**
- * Whether the "dropped `bucket`" notice has already been logged this process.
- *
- * The condition is a standing one — a missing App permission, not an incident —
- * so it is stated once per daemon run rather than on every poll.
- */
-let bucket_fallback_reported = false;
-
-/** Test seam: forget the once-per-process diagnostics. */
-export function _reset_ci_status_notices_for_testing(): void {
-  bucket_fallback_reported = false;
-}
+type ChecksQuery = ChecksAttempt | { kind: "denied"; message: string };
 
 /** Run `gh pr checks` once with an explicit `--json` field list. */
 async function run_pr_checks(
@@ -985,6 +1109,12 @@ async function run_pr_checks(
  * field and re-asking is strictly better than reporting a green PR as pending
  * forever — which is what asking for `bucket` unconditionally (472e110) did to
  * every approved PR across every entity until this fallback existed.
+ *
+ * Dropping the field is not always enough, though: `gh pr checks` resolves
+ * `checkSuite.workflowRun` whatever `--json` asks for, so on an installation
+ * without `Actions: Read` the bucketless retry is refused too. That is not a
+ * dead end any more — it returns `denied`, and the caller tries a different
+ * query entirely.
  */
 async function query_pr_checks(
   pr_number: number,
@@ -1003,15 +1133,11 @@ async function query_pr_checks(
   );
   if (first.kind !== "error") return first;
 
-  if (is_bucket_denied(first.message)) {
-    if (!bucket_fallback_reported) {
-      bucket_fallback_reported = true;
-      // Silence is how a permanently-broken query (#372) hid for weeks, so say
-      // it — once per process, on one line, without the repeated GraphQL clause.
-      console.error(
-        `[ci-status] gh denied the 'bucket' field (needs Actions: Read on the App installation) — retrying CI queries as '${GH_CHECKS_JSON_FIELDS_NO_BUCKET}' for the rest of this process; deployment gates now read from 'state' alone. First seen on PR #${String(pr_number)}: ${summarize_gh_error(first.message)}`,
-      );
-    }
+  if (is_permission_denied(first.message)) {
+    notice_once(
+      "bucket-dropped",
+      `[ci-status] gh denied the 'bucket' field (needs Actions: Read on the App installation) — retrying CI queries as '${GH_CHECKS_JSON_FIELDS_NO_BUCKET}' for the rest of this process; deployment gates now read from 'state' alone. First seen on PR #${String(pr_number)}: ${summarize_gh_error(first.message)}`,
+    );
 
     const fallback = await run_pr_checks(
       pr_number,
@@ -1023,10 +1149,16 @@ async function query_pr_checks(
     );
     if (fallback.kind !== "error") return fallback;
 
+    // Refused even without `bucket` — `gh pr checks` needs the permission no
+    // matter which fields are asked for. Hand the caller a different query.
+    if (is_permission_denied(fallback.message)) {
+      return { kind: "denied", message: fallback.message };
+    }
+
     console.error(
       `[ci-status] gh pr checks failed for PR #${String(pr_number)} even without 'bucket' — reporting CI as pending: ${summarize_gh_error(fallback.message)}`,
     );
-    return { kind: "error" };
+    return { kind: "error", message: fallback.message };
   }
 
   // Everything else fails closed as pending, which is safe but silent — and
@@ -1034,7 +1166,7 @@ async function query_pr_checks(
   console.error(
     `[ci-status] gh pr checks failed for PR #${String(pr_number)} — reporting CI as pending: ${summarize_gh_error(first.message)}`,
   );
-  return { kind: "error" };
+  return { kind: "error", message: first.message };
 }
 
 /**
@@ -1046,6 +1178,9 @@ async function query_pr_checks(
  * handed to a CI fixer.
  */
 const PENDING_CHECK_STATES = new Set(["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"]);
+
+/** Conclusions that count as "this check is not standing in the way". */
+const PASSING_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 
 /**
  * Classify a non-empty list of checks into pass / pending / failures.
@@ -1066,11 +1201,7 @@ function classify_checks(checks: GhCheck[]): CICheckStatus {
   for (const check of checks) {
     if (check.bucket === "pending" || PENDING_CHECK_STATES.has(check.state)) {
       has_pending = true;
-    } else if (
-      check.state !== "SUCCESS" &&
-      check.state !== "NEUTRAL" &&
-      check.state !== "SKIPPED"
-    ) {
+    } else if (!PASSING_CONCLUSIONS.has(check.state)) {
       failures.push(check.name);
     }
   }
@@ -1079,21 +1210,270 @@ function classify_checks(checks: GhCheck[]): CICheckStatus {
     passed: failures.length === 0 && !has_pending,
     pending: has_pending,
     failures,
+    source: "pr-checks",
   };
 }
 
 /**
- * Query the CI check status for a PR.
+ * Source 1 — `gh pr checks`, required checks first.
  *
- * Asks `gh pr checks --required` first — required checks are the authoritative
+ * Asks `gh pr checks --required` first: required checks are the authoritative
  * merge gate where branch protection exists. When that reports nothing, falls
  * back to the unfiltered list (#361): `--required` only sees checks pinned by
  * branch protection, and private repos without GitHub Pro cannot configure
- * branch protection at all (the API 403s), so it comes back empty on repos whose
- * CI is running right now. Only an empty *unfiltered* list means "no CI".
+ * branch protection at all (the API 403s), so it comes back empty on repos
+ * whose CI is running right now. Only an empty *unfiltered* list means "no CI".
+ */
+async function ci_status_from_pr_checks(
+  pr_number: number,
+  repo_path: string,
+  env: NodeJS.ProcessEnv,
+  gh_bin: string,
+): Promise<SourceOutcome> {
+  const required = await query_pr_checks(pr_number, repo_path, env, gh_bin, true);
+  if (required.kind === "denied") return { kind: "denied", message: required.message };
+  if (required.kind === "error") return { kind: "failed", message: required.message };
+  if (required.kind === "checks") {
+    return { kind: "answer", status: classify_checks(required.checks) };
+  }
+
+  const all = await query_pr_checks(pr_number, repo_path, env, gh_bin, false);
+  if (all.kind === "denied") return { kind: "denied", message: all.message };
+  if (all.kind === "error") return { kind: "failed", message: all.message };
+  // Nothing required *and* nothing at all — the repo really has no CI.
+  if (all.kind === "none") {
+    return {
+      kind: "answer",
+      status: { passed: true, pending: false, failures: [], source: "pr-checks" },
+    };
+  }
+  return { kind: "answer", status: classify_checks(all.checks) };
+}
+
+// ── Source 2: `gh pr view --json statusCheckRollup` ──
+
+/**
+ * One entry of a PR's `statusCheckRollup`.
  *
- * Fails closed on infrastructure errors — an unanswered query reports pending,
- * never mergeable, so a rate limit or auth blip can't wave a PR through.
+ * The list is heterogeneous. `CheckRun` entries (GitHub Actions and most Apps)
+ * carry `name`, a lifecycle `status` and, once complete, a `conclusion`.
+ * `StatusContext` entries (the older commit-status API — Vercel, Netlify, some
+ * bots) carry `context` and a single `state` that is both at once. Both shapes
+ * are handled; an entry matching neither is treated as failing, because a check
+ * we cannot read is not a check we may wave through.
+ *
+ * Unlike `gh pr checks`, this query never resolves `checkSuite.workflowRun`, so
+ * it survives an installation without `Actions: Read`.
+ */
+interface RollupEntry {
+  __typename?: string;
+  name?: string;
+  context?: string;
+  status?: string;
+  conclusion?: string;
+  state?: string;
+  workflowName?: string;
+}
+
+/** The `--json` field list for the rollup query. */
+const GH_ROLLUP_JSON_FIELDS = "statusCheckRollup";
+
+/**
+ * States that mean "not finished yet", across both rollup shapes.
+ *
+ * EXPECTED is the StatusContext equivalent of a queued check: a required
+ * context branch protection knows about but nothing has reported yet.
+ */
+const PENDING_ROLLUP_STATES = new Set([
+  "PENDING",
+  "QUEUED",
+  "IN_PROGRESS",
+  "REQUESTED",
+  "WAITING",
+  "EXPECTED",
+]);
+
+/** The name to show for a rollup entry, whichever shape it is. */
+function rollup_entry_name(entry: RollupEntry): string {
+  return entry.name ?? entry.context ?? entry.workflowName ?? "(unnamed check)";
+}
+
+/**
+ * Reduce one rollup entry to a verdict.
+ *
+ * A `StatusContext`'s single `state` field stands in for both `status` and
+ * `conclusion`, which collapses the two shapes into one rule: if the lifecycle
+ * field says "running", it is pending; otherwise the conclusion field decides,
+ * and anything that is not an explicit pass is a failure. That last clause is
+ * what keeps a COMPLETED check with a null conclusion — or an entry in a shape
+ * we have never seen — from reading as green.
+ */
+function classify_rollup_entry(entry: RollupEntry): "pending" | "pass" | "fail" {
+  const status = (entry.status ?? entry.state ?? "").toUpperCase();
+  const conclusion = (entry.conclusion ?? entry.state ?? "").toUpperCase();
+
+  if (PENDING_ROLLUP_STATES.has(status)) return "pending";
+  if (PASSING_CONCLUSIONS.has(conclusion)) return "pass";
+  return "fail";
+}
+
+/**
+ * Source 2 — the PR's own check rollup.
+ *
+ * Same per-check precision as `gh pr checks`, reached by a query GitHub will
+ * answer without `Actions: Read`. An empty rollup means the repo reported no
+ * checks at all, which is the same "no CI configured" verdict source 1 gives
+ * for an empty unfiltered list.
+ */
+async function ci_status_from_rollup(
+  pr_number: number,
+  repo_path: string,
+  env: NodeJS.ProcessEnv,
+  gh_bin: string,
+): Promise<SourceOutcome> {
+  let stdout: string;
+  try {
+    ({ stdout } = await exec_async(
+      gh_bin,
+      ["pr", "view", String(pr_number), "--json", GH_ROLLUP_JSON_FIELDS],
+      { cwd: repo_path, env, timeout: 15_000 },
+    ));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (is_permission_denied(message)) return { kind: "denied", message };
+    console.error(
+      `[ci-status] gh pr view --json ${GH_ROLLUP_JSON_FIELDS} failed for PR #${String(pr_number)} — reporting CI as pending: ${summarize_gh_error(message)}`,
+    );
+    return { kind: "failed", message };
+  }
+
+  let entries: RollupEntry[];
+  try {
+    const parsed = JSON.parse(stdout) as { statusCheckRollup?: RollupEntry[] | null };
+    entries = parsed.statusCheckRollup ?? [];
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[ci-status] Could not parse statusCheckRollup for PR #${String(pr_number)} — reporting CI as pending: ${summarize_gh_error(message)}`,
+    );
+    return { kind: "failed", message };
+  }
+
+  const failures: string[] = [];
+  let has_pending = false;
+  for (const entry of entries) {
+    const verdict = classify_rollup_entry(entry);
+    if (verdict === "pending") has_pending = true;
+    else if (verdict === "fail") failures.push(rollup_entry_name(entry));
+  }
+
+  return {
+    kind: "answer",
+    status: {
+      passed: failures.length === 0 && !has_pending,
+      pending: has_pending,
+      failures,
+      source: "status-rollup",
+    },
+  };
+}
+
+// ── Source 3: `gh pr view --json mergeStateStatus,mergeable` ──
+
+/** The `--json` field list for GitHub's own merge verdict. */
+const GH_MERGE_STATE_JSON_FIELDS = "mergeStateStatus,mergeable";
+
+/**
+ * Source 3 — GitHub's own verdict on whether the PR may merge.
+ *
+ * `mergeStateStatus` already folds in branch protection and required checks,
+ * and it needs no Actions permission. What it cannot do is name anything: a
+ * blocked PR looks identical whether `lint` failed or a required check never
+ * reported. So only CLEAN reads as green.
+ *
+ * Everything else reports `{ passed: false, pending: true }` rather than a bare
+ * `passed: false`. That is deliberate, and it is the invariant documented on
+ * {@link CICheckStatus}: every caller decides "safe to merge" from
+ * `!pending && failures.length === 0`, so a `passed: false` with no named
+ * failure would sail straight through the gate this function exists to hold.
+ * Reporting pending keeps the approval parked, keeps it retrying in case the
+ * state resolves, and escalates it loudly — with the source named — once the
+ * park goes stale. Coarse and honest beats precise and wrong.
+ */
+async function ci_status_from_merge_state(
+  pr_number: number,
+  repo_path: string,
+  env: NodeJS.ProcessEnv,
+  gh_bin: string,
+): Promise<SourceOutcome> {
+  let stdout: string;
+  try {
+    ({ stdout } = await exec_async(
+      gh_bin,
+      ["pr", "view", String(pr_number), "--json", GH_MERGE_STATE_JSON_FIELDS],
+      { cwd: repo_path, env, timeout: 15_000 },
+    ));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (is_permission_denied(message)) return { kind: "denied", message };
+    console.error(
+      `[ci-status] gh pr view --json ${GH_MERGE_STATE_JSON_FIELDS} failed for PR #${String(pr_number)} — reporting CI as pending: ${summarize_gh_error(message)}`,
+    );
+    return { kind: "failed", message };
+  }
+
+  let merge_state: string;
+  let mergeable: string;
+  try {
+    const parsed = JSON.parse(stdout) as { mergeStateStatus?: string; mergeable?: string };
+    merge_state = (parsed.mergeStateStatus ?? "").toUpperCase();
+    mergeable = (parsed.mergeable ?? "").toUpperCase();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[ci-status] Could not parse ${GH_MERGE_STATE_JSON_FIELDS} for PR #${String(pr_number)} — reporting CI as pending: ${summarize_gh_error(message)}`,
+    );
+    return { kind: "failed", message };
+  }
+
+  // CLEAN is the only state that means "nothing is standing in the way".
+  // UNKNOWN on either field means GitHub is still computing the merge commit.
+  const green = merge_state === "CLEAN" && mergeable !== "UNKNOWN";
+
+  return {
+    kind: "answer",
+    status: {
+      passed: green,
+      pending: !green,
+      failures: [],
+      source: "merge-state",
+    },
+  };
+}
+
+// ── The chain ──
+
+/**
+ * Query the CI check status for a PR.
+ *
+ * Three sources, tried in order, stopping at the first that answers:
+ *
+ *   1. `gh pr checks`                              — per-check detail
+ *   2. `gh pr view --json statusCheckRollup`       — per-check detail
+ *   3. `gh pr view --json mergeStateStatus`        — green / not green
+ *
+ * A source is skipped to the next one **only** when GitHub refused it on
+ * permissions. That is the whole point of the chain: `gh pr checks` resolves
+ * `checkSuite.workflowRun` on every query, so an App installation without
+ * `Actions: Read` gets nothing from it, whatever `--json` asks for. Sources 2
+ * and 3 do not touch that node. Where the org will not grant the permission —
+ * and we do not always own the org — the gate has to read the same facts from
+ * a query GitHub will actually answer.
+ *
+ * Everything else still fails closed. A timeout, rate limit or network blip
+ * reports pending immediately and does not fall through: it says nothing about
+ * permissions, and three timeouts are no more informative than one. There is
+ * deliberately no path that returns `passed: true` because we could not tell.
  */
 export async function check_ci_status(
   pr_number: number,
@@ -1103,15 +1483,22 @@ export async function check_ci_status(
 ): Promise<CICheckStatus> {
   const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
 
-  const required = await query_pr_checks(pr_number, repo_path, env, gh_bin, true);
-  if (required.kind === "error") return { passed: false, pending: true, failures: [] };
-  if (required.kind === "checks") return classify_checks(required.checks);
+  const sources = [ci_status_from_pr_checks, ci_status_from_rollup, ci_status_from_merge_state];
 
-  const all = await query_pr_checks(pr_number, repo_path, env, gh_bin, false);
-  if (all.kind === "error") return { passed: false, pending: true, failures: [] };
-  // Nothing required *and* nothing at all — the repo really has no CI.
-  if (all.kind === "none") return { passed: true, pending: false, failures: [] };
-  return classify_checks(all.checks);
+  for (const read_source of sources) {
+    const outcome = await read_source(pr_number, repo_path, env, gh_bin);
+    if (outcome.kind === "answer") {
+      note_source(outcome.status.source, pr_number);
+      return outcome.status;
+    }
+    if (outcome.kind === "failed") return ci_unavailable();
+    // `denied` — try the next source.
+  }
+
+  console.error(
+    `[ci-status] Every CI source was refused for PR #${String(pr_number)} (gh pr checks, statusCheckRollup and mergeStateStatus all denied) — reporting CI as pending.`,
+  );
+  return ci_unavailable();
 }
 
 /** Maximum number of CI fix attempts before escalating to a human (#196). */

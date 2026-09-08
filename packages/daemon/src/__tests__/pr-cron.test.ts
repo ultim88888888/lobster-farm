@@ -330,7 +330,9 @@ vi.mock("../review-utils.js", () => ({
   fetch_review_comments: vi.fn().mockResolvedValue("review comments"),
   build_review_fix_prompt: vi.fn().mockReturnValue("fix prompt"),
   attempt_auto_merge: vi.fn().mockResolvedValue({ merged: true, method: "direct" }),
-  check_ci_status: vi.fn().mockResolvedValue({ passed: true, pending: false, failures: [] }),
+  check_ci_status: vi
+    .fn()
+    .mockResolvedValue({ passed: true, pending: false, failures: [], source: "pr-checks" }),
   fetch_ci_failure_logs: vi.fn().mockResolvedValue([]),
   build_ci_fix_prompt: vi.fn().mockReturnValue("ci fix prompt"),
   MAX_CI_FIX_ATTEMPTS: 3,
@@ -571,7 +573,12 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     const pr = make_test_pr({ author: { login: "test-user" } });
     const entity_config = make_entity_with_github_user("test-user");
 
-    mock_check_ci.mockResolvedValueOnce({ passed: true, pending: false, failures: [] });
+    mock_check_ci.mockResolvedValueOnce({
+      passed: true,
+      pending: false,
+      failures: [],
+      source: "pr-checks",
+    });
     mock_auto_merge.mockResolvedValueOnce({ merged: true, method: "direct" });
 
     const { call_retry, get_processed } = make_retry_test_cron({
@@ -603,7 +610,12 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     const pr = make_test_pr({ author: { login: "test-user" } });
     const entity_config = make_entity_with_github_user("test-user");
 
-    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: true, failures: [] });
+    mock_check_ci.mockResolvedValueOnce({
+      passed: false,
+      pending: true,
+      failures: [],
+      source: "pr-checks",
+    });
 
     const { call_retry } = make_retry_test_cron({
       processed: {
@@ -740,7 +752,12 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
 
     // No processed entry — simulate webhook handler path
     mock_detect_outcome.mockResolvedValueOnce("approved");
-    mock_check_ci.mockResolvedValueOnce({ passed: true, pending: false, failures: [] });
+    mock_check_ci.mockResolvedValueOnce({
+      passed: true,
+      pending: false,
+      failures: [],
+      source: "pr-checks",
+    });
     mock_auto_merge.mockResolvedValueOnce({ merged: true, method: "direct" });
 
     const { call_retry } = make_retry_test_cron({
