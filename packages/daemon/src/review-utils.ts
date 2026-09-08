@@ -865,6 +865,9 @@ export interface CICheckStatus {
  *
  * `bucket` is gh's own coarse grouping — "pass" | "fail" | "pending" |
  * "skipping" | "cancel" — kept as a backstop for states we don't enumerate.
+ * It is optional: gh resolves it through `checkSuite.workflowRun`, which an
+ * installation token can only read with the `Actions: Read` permission, so the
+ * query is retried without it when GitHub says no.
  *
  * There is deliberately no `conclusion` field here: `gh pr checks --json` has
  * never accepted one, and asking for it made gh exit 1 on every query (#372).
@@ -872,11 +875,14 @@ export interface CICheckStatus {
 interface GhCheck {
   name: string;
   state: string;
-  bucket: string;
+  bucket?: string;
 }
 
 /** The exact `--json` field list. Every name here must exist in `gh pr checks --json`. */
 const GH_CHECKS_JSON_FIELDS = "name,state,bucket";
+
+/** The same query minus `bucket` — the one field that needs `Actions: Read`. */
+const GH_CHECKS_JSON_FIELDS_NO_BUCKET = "name,state";
 
 /**
  * Outcome of a single `gh pr checks` query.
@@ -887,16 +893,74 @@ const GH_CHECKS_JSON_FIELDS = "name,state,bucket";
  */
 type ChecksQuery = { kind: "checks"; checks: GhCheck[] } | { kind: "none" } | { kind: "error" };
 
-async function query_pr_checks(
+/** One attempt, with the failure text kept so the caller can decide what it means. */
+type ChecksAttempt = Exclude<ChecksQuery, { kind: "error" }> | { kind: "error"; message: string };
+
+/**
+ * Does this failure mean GitHub refused the `bucket` field specifically?
+ *
+ * gh resolves `bucket` via `checkSuite.workflowRun`, which needs `Actions: Read`
+ * on the installation token. Without it GitHub 403s that one node and gh exits
+ * non-zero for the *whole* query — taking `name` and `state` down with it. The
+ * `workflowRun` path in the error is the tell; the bare permission string is
+ * matched too because gh does not always echo the path.
+ *
+ * A false positive costs one extra query — the retry either answers or fails
+ * closed like any other error — so this errs on the side of retrying.
+ */
+function is_bucket_denied(msg: string): boolean {
+  return /workflowRun/i.test(msg) || /resource not accessible by integration/i.test(msg);
+}
+
+/**
+ * Collapse a gh failure into a single log-safe line.
+ *
+ * The `bucket` denial arrives as one clause repeated once per check in the
+ * rollup — ten of them per line, every two minutes, per parked PR. Clauses are
+ * dropped when an earlier one already contains them end-to-end, which also
+ * catches the first copy hiding behind gh's `Command failed: …` echo. The
+ * result is capped so a diagnostic stays a diagnostic.
+ */
+function summarize_gh_error(msg: string): string {
+  const kept: string[] = [];
+  for (const clause of msg
+    .split("\n")
+    .slice(0, 3)
+    .join(" | ")
+    .split(", ")
+    .map((c) => c.trim())) {
+    if (kept.some((seen) => seen.endsWith(clause) || clause.endsWith(seen))) continue;
+    kept.push(clause);
+  }
+  const summary = kept.join(", ");
+  return summary.length > 300 ? `${summary.slice(0, 300)}…` : summary;
+}
+
+/**
+ * Whether the "dropped `bucket`" notice has already been logged this process.
+ *
+ * The condition is a standing one — a missing App permission, not an incident —
+ * so it is stated once per daemon run rather than on every poll.
+ */
+let bucket_fallback_reported = false;
+
+/** Test seam: forget the once-per-process diagnostics. */
+export function _reset_ci_status_notices_for_testing(): void {
+  bucket_fallback_reported = false;
+}
+
+/** Run `gh pr checks` once with an explicit `--json` field list. */
+async function run_pr_checks(
   pr_number: number,
   repo_path: string,
   env: NodeJS.ProcessEnv,
   gh_bin: string,
   required: boolean,
-): Promise<ChecksQuery> {
+  json_fields: string,
+): Promise<ChecksAttempt> {
   const args = ["pr", "checks", String(pr_number)];
   if (required) args.push("--required");
-  args.push("--json", GH_CHECKS_JSON_FIELDS);
+  args.push("--json", json_fields);
 
   try {
     const { stdout } = await exec_async(gh_bin, args, {
@@ -909,14 +973,79 @@ async function query_pr_checks(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/no.*checks?\s+reported/i.test(msg)) return { kind: "none" };
-    // Everything else fails closed as pending, which is safe but silent — and
-    // silence is how a permanently-broken query (#372) hid for weeks. Say so.
+    return { kind: "error", message: msg };
+  }
+}
+
+/**
+ * Ask gh for a PR's checks, degrading rather than failing closed.
+ *
+ * `bucket` is a nicety — it only sharpens the reading of deployment-gate states
+ * that `state` alone would misread. When the token cannot read it, dropping the
+ * field and re-asking is strictly better than reporting a green PR as pending
+ * forever — which is what asking for `bucket` unconditionally (472e110) did to
+ * every approved PR across every entity until this fallback existed.
+ */
+async function query_pr_checks(
+  pr_number: number,
+  repo_path: string,
+  env: NodeJS.ProcessEnv,
+  gh_bin: string,
+  required: boolean,
+): Promise<ChecksQuery> {
+  const first = await run_pr_checks(
+    pr_number,
+    repo_path,
+    env,
+    gh_bin,
+    required,
+    GH_CHECKS_JSON_FIELDS,
+  );
+  if (first.kind !== "error") return first;
+
+  if (is_bucket_denied(first.message)) {
+    if (!bucket_fallback_reported) {
+      bucket_fallback_reported = true;
+      // Silence is how a permanently-broken query (#372) hid for weeks, so say
+      // it — once per process, on one line, without the repeated GraphQL clause.
+      console.error(
+        `[ci-status] gh denied the 'bucket' field (needs Actions: Read on the App installation) — retrying CI queries as '${GH_CHECKS_JSON_FIELDS_NO_BUCKET}' for the rest of this process; deployment gates now read from 'state' alone. First seen on PR #${String(pr_number)}: ${summarize_gh_error(first.message)}`,
+      );
+    }
+
+    const fallback = await run_pr_checks(
+      pr_number,
+      repo_path,
+      env,
+      gh_bin,
+      required,
+      GH_CHECKS_JSON_FIELDS_NO_BUCKET,
+    );
+    if (fallback.kind !== "error") return fallback;
+
     console.error(
-      `[ci-status] gh pr checks failed for PR #${String(pr_number)} — reporting CI as pending: ${msg.split("\n").slice(0, 3).join(" | ")}`,
+      `[ci-status] gh pr checks failed for PR #${String(pr_number)} even without 'bucket' — reporting CI as pending: ${summarize_gh_error(fallback.message)}`,
     );
     return { kind: "error" };
   }
+
+  // Everything else fails closed as pending, which is safe but silent — and
+  // silence is how a permanently-broken query (#372) hid for weeks. Say so.
+  console.error(
+    `[ci-status] gh pr checks failed for PR #${String(pr_number)} — reporting CI as pending: ${summarize_gh_error(first.message)}`,
+  );
+  return { kind: "error" };
 }
+
+/**
+ * Check states that mean "not finished yet".
+ *
+ * WAITING and REQUESTED are deployment approval gates. They are enumerated here
+ * rather than left to gh's `bucket` because `bucket` is not always available
+ * — and without them, an unfinished gate reads as a failure and gets
+ * handed to a CI fixer.
+ */
+const PENDING_CHECK_STATES = new Set(["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"]);
 
 /**
  * Classify a non-empty list of checks into pass / pending / failures.
@@ -925,22 +1054,17 @@ async function query_pr_checks(
  * detection, so a frontend-only PR legitimately skips the backend job. Treating
  * skipped as pending would wedge every partial-CI PR forever.
  *
- * Pending is PENDING / QUEUED / IN_PROGRESS, plus anything gh itself buckets as
- * pending. The bucket clause covers WAITING and REQUESTED (deployment approval
- * gates): unfinished work that the state list alone would misread as a failure
- * and hand to a CI fixer.
+ * `state` is the authority; gh's `bucket` only widens the pending set, as a
+ * backstop for states we have not enumerated. When `bucket` is absent — the
+ * token could not read it, so the query fell back to `name,state` — the
+ * reading is `state` alone. A missing bucket is never itself a failure signal.
  */
 function classify_checks(checks: GhCheck[]): CICheckStatus {
   const failures: string[] = [];
   let has_pending = false;
 
   for (const check of checks) {
-    if (
-      check.bucket === "pending" ||
-      check.state === "PENDING" ||
-      check.state === "QUEUED" ||
-      check.state === "IN_PROGRESS"
-    ) {
+    if (check.bucket === "pending" || PENDING_CHECK_STATES.has(check.state)) {
       has_pending = true;
     } else if (
       check.state !== "SUCCESS" &&
