@@ -171,6 +171,55 @@ function make_context(overrides: Partial<SentryTriageContext> = {}): SentryTriag
   };
 }
 
+/**
+ * Poll until `condition()` holds, or throw a descriptive error on timeout.
+ *
+ * The triage completion path is fire-and-forget: `update_triage_state` writes to
+ * disk, and only once that promise resolves does the `.then()` decide whether to
+ * spawn a fix. A fixed sleep is a guess at how long that disk round-trip takes —
+ * one that holds on a quiet laptop and fails on a loaded CI runner, either by
+ * asserting before the spawn lands or by letting a late write race `afterEach`'s
+ * `rm` (ENOTEMPTY). Wait for the actual condition instead.
+ */
+async function wait_for(
+  condition: () => boolean | Promise<boolean>,
+  description: string,
+  timeout_ms = 5000,
+): Promise<void> {
+  const deadline = Date.now() + timeout_ms;
+  for (;;) {
+    if (await condition()) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out after ${String(timeout_ms)}ms waiting for: ${description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/**
+ * Remove the per-test temp dir, tolerating a write that lands mid-teardown.
+ *
+ * Triage does several fire-and-forget state writes (alert posts, queue drains).
+ * A write that recreates a file while `rm` is walking the tree makes `rm` throw
+ * ENOTEMPTY even with `force: true` — `force` suppresses "already gone", not
+ * "something reappeared". That failure is pure teardown noise: it fails a test
+ * whose assertions all passed. Retry a few times so the last writer wins.
+ */
+async function remove_temp_dir(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOTEMPTY" && code !== "EBUSY") throw err;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  // Last attempt: let a genuine failure surface.
+  await rm(dir, { recursive: true, force: true });
+}
+
 // ── Setup ──
 
 beforeEach(async () => {
@@ -193,7 +242,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await rm(temp_dir, { recursive: true, force: true });
+  await remove_temp_dir(temp_dir);
   delete process.env.SENTRY_AUTH_TOKEN;
   delete process.env.SENTRY_ORG;
 
@@ -1073,6 +1122,7 @@ describe("auto-fix spawning", () => {
   async function triage_with_verdict(
     verdict_json: string,
     overrides: Partial<SentryTriageContext> = {},
+    expected_spawns = 1,
   ) {
     const session_manager = make_session_manager();
     const ctx = make_context({ session_manager, ...overrides });
@@ -1102,8 +1152,33 @@ describe("auto-fix spawning", () => {
       output_lines: ["Diagnostic output...", `SENTRY_TRIAGE_VERDICT:${verdict_json}`],
     });
 
-    // Wait for async state updates and potential fix spawn
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Wait for the verdict to be persisted — this is the disk round-trip that
+    // gates the fix-spawn decision, and the part CI load stretches unpredictably.
+    await wait_for(
+      async () => (await load_triage_state(ctx.config)).triages["ISSUE-FIX"]?.status === "tracked",
+      "triage verdict to be persisted",
+    );
+
+    if (expected_spawns > 1) {
+      // Eligible for auto-fix. Waiting on the spawn call alone is NOT enough:
+      // spawn_sentry_fix awaits another state write (fix_session_id) after
+      // spawn() resolves and only then registers its session:completed /
+      // session:failed listeners. A caller that emits into that window loses the
+      // event outright — the listener is registered afterwards and never fires.
+      // The triage listener removes itself synchronously during its own emit, so
+      // a non-zero count here means the *fix* listener is live.
+      await wait_for(
+        () =>
+          sm.spawn.mock.calls.length >= expected_spawns &&
+          (session_manager as unknown as EventEmitter).listenerCount("session:completed") > 0,
+        "the fix session to spawn and register its lifecycle listeners",
+      );
+    } else {
+      // Asserting a negative ("no fix spawned"). The eligibility check runs in the
+      // microtask right after the write above resolves, so a short drain is enough
+      // — the unbounded disk wait is already covered by wait_for.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
 
     return { sm, session_manager, ctx };
   }
@@ -1111,6 +1186,8 @@ describe("auto-fix spawning", () => {
   it("spawns auto-fix when P1 + auto_fixable + has github_issue", async () => {
     const { sm } = await triage_with_verdict(
       '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+      {},
+      2,
     );
 
     // Should have spawned 2 sessions: 1 triage (Ray) + 1 fix (Bob)
@@ -1126,6 +1203,8 @@ describe("auto-fix spawning", () => {
   it("spawns auto-fix when P2 + auto_fixable + has github_issue", async () => {
     const { sm } = await triage_with_verdict(
       '{"severity":"P2","auto_fixable":true,"github_issue":99,"fix_approach":"Edge case fix"}',
+      {},
+      2,
     );
 
     expect(sm.spawn).toHaveBeenCalledTimes(2);
@@ -1174,7 +1253,11 @@ describe("auto-fix spawning", () => {
       output_lines: ["Diagnostic output only", "No verdict here"],
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await wait_for(
+      async () =>
+        (await load_triage_state(ctx.config)).triages["ISSUE-NO-VERDICT"]?.status === "tracked",
+      "no-verdict triage to be marked tracked",
+    );
 
     // Should not have spawned a fix session
     expect(sm.spawn).toHaveBeenCalledTimes(1);
@@ -1242,7 +1325,13 @@ describe("auto-fix spawning", () => {
       ],
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Let the verdict write land before asserting the negative, so a late write
+    // can't race afterEach's rm of temp_dir.
+    await wait_for(
+      async () => (await load_triage_state(config)).triages["ISSUE-CAPPED"]?.severity === "P1",
+      "capped triage verdict to be persisted",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     // Fix should NOT have been spawned — at cap
     expect(sm.spawn).toHaveBeenCalledTimes(1);
@@ -1252,6 +1341,8 @@ describe("auto-fix spawning", () => {
     const config = make_config();
     const { sm, session_manager, ctx } = await triage_with_verdict(
       '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+      {},
+      2,
     );
 
     expect(sm.spawn).toHaveBeenCalledTimes(2);
@@ -1263,7 +1354,10 @@ describe("auto-fix spawning", () => {
       output_lines: ["Fixed the issue"],
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await wait_for(
+      async () => (await load_triage_state(config)).triages["ISSUE-FIX"]?.fix_status === "fixed",
+      "fix_status to become 'fixed'",
+    );
 
     const state = await load_triage_state(config);
     expect(state.triages["ISSUE-FIX"]!.fix_status).toBe("fixed");
@@ -1273,6 +1367,8 @@ describe("auto-fix spawning", () => {
     const config = make_config();
     const { sm, session_manager, ctx } = await triage_with_verdict(
       '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+      {},
+      2,
     );
 
     expect(sm.spawn).toHaveBeenCalledTimes(2);
@@ -1284,7 +1380,10 @@ describe("auto-fix spawning", () => {
       "tmux crashed",
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await wait_for(
+      async () => (await load_triage_state(config)).triages["ISSUE-FIX"]?.fix_status === "failed",
+      "fix_status to become 'failed'",
+    );
 
     const state = await load_triage_state(config);
     expect(state.triages["ISSUE-FIX"]!.fix_status).toBe("failed");

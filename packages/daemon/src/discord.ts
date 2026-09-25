@@ -553,6 +553,13 @@ export class DiscordBot extends EventEmitter {
       last_detail: string | null;
       tool_count: number;
       agent_name: string;
+      /**
+       * Resolves once the initial `channel.send()` has settled and `message_id`
+       * is final. finalize_status_embed must await this before deciding there is
+       * no message to clean up — otherwise a finalize that lands mid-send drops
+       * the only reference to a message Discord is about to post, orphaning it.
+       */
+      send_settled: Promise<void>;
     }
   >();
   /** Cached #command-center channel ID (resolved lazily from the GLOBAL category). */
@@ -1071,6 +1078,11 @@ export class DiscordBot extends EventEmitter {
     const identity = this.resolve_agent_identity(archetype);
     const now = Date.now();
 
+    let mark_settled!: () => void;
+    const send_settled = new Promise<void>((resolve) => {
+      mark_settled = resolve;
+    });
+
     const entry = {
       message_id: "",
       start_time: now,
@@ -1078,6 +1090,7 @@ export class DiscordBot extends EventEmitter {
       last_detail: null as string | null,
       tool_count: 0,
       agent_name: identity.name,
+      send_settled,
     };
 
     // Claim the slot BEFORE the async send to prevent concurrent calls from
@@ -1099,6 +1112,11 @@ export class DiscordBot extends EventEmitter {
     } catch (err) {
       this.status_embeds.delete(channel_id); // clean up on failure
       console.error(`[discord] Failed to send status embed: ${String(err)}`);
+    } finally {
+      // Unblock any finalize that is waiting on this send, whether it succeeded
+      // or threw. Must run before the function returns so a concurrent
+      // finalize_status_embed can never observe an unsettled promise forever.
+      mark_settled();
     }
   }
 
@@ -1153,8 +1171,14 @@ export class DiscordBot extends EventEmitter {
   async finalize_status_embed(channel_id: string): Promise<void> {
     const entry = this.status_embeds.get(channel_id);
     if (!entry) return;
+    // Claim it first so two concurrent finalizes can't both edit the message.
     this.status_embeds.delete(channel_id);
-    if (!entry.message_id) return; // embed was claimed but never sent — nothing to edit
+    // The send may still be in flight, in which case message_id is not yet
+    // assigned. Returning here would strand a message Discord is about to post
+    // with nothing holding its ID — it would sit on "Working" forever while the
+    // next message posts a second embed beside it.
+    await entry.send_settled;
+    if (!entry.message_id) return; // send genuinely failed — there is nothing to edit
 
     const elapsed = Math.round((Date.now() - entry.start_time) / 1000);
     const duration = this.format_duration(elapsed);
